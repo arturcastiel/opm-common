@@ -378,7 +378,7 @@ namespace Opm {
       vec_size_t get_father_global() const{
         return father_global;
       }
-     void set_hostnum(const std::vector<int>);
+     void set_hostnum(std::vector<int>&);
      void set_lgr_refinement(std::vector<double>,std::vector<double>);                 
     private:
       void init_father_global();
