@@ -54,6 +54,7 @@
 #include <opm/input/eclipse/Parser/ParserKeywords/T.hpp>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <cstddef>
 #include <filesystem>
