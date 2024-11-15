@@ -17,7 +17,7 @@
   along with OPM.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <opm/input/eclipse/EclipseState/Grid/LgrCollection.hpp>
+
 
 #ifndef OPM_PARSER_ECLIPSE_GRID_HPP
 #define OPM_PARSER_ECLIPSE_GRID_HPP
@@ -371,7 +371,7 @@ namespace Opm {
       void set_lgr_global_counter(std::size_t counter){
         lgr_global_counter = counter;
       }
-      vec_size_t get_father_global() const{
+      const vec_size_t& get_father_global() const{
         return father_global;
       }                 
     private:
