@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <vector>
 #include <map>
+#include <opm/io/eclipse/EclOutput.hpp>
 
 namespace Opm {
 
@@ -119,6 +120,8 @@ namespace Opm {
           from an active index to a global index must be implemented
           in the current class.
         */
+        void init_children_host_cells(void);
+
         using GridDims::getGlobalIndex;
         size_t getGlobalIndex(size_t active_index) const;
 
@@ -268,7 +271,11 @@ namespace Opm {
         std::map<std::vector<std::size_t>, std::size_t> num_lgr_children_cells;        
         std::vector<double> m_zcorn;
         std::vector<double> m_coord;
+        std::vector<int> m_actnum;
 
+       // Input grid data.
+        mutable std::optional<std::vector<double>> m_input_zcorn;
+        mutable std::optional<std::vector<double>> m_input_coord;
 
     private:
         std::vector<double> m_minpvVector;
@@ -289,13 +296,7 @@ namespace Opm {
         size_t zcorn_fixed = 0;
         bool m_useActnumFromGdfile = false;
 
-        // Input grid data.
-        mutable std::optional<std::vector<double>> m_input_zcorn;
-        mutable std::optional<std::vector<double>> m_input_coord;
 
-
-
-        std::vector<int> m_actnum;
         std::optional<MapAxes> m_mapaxes;
 
         // Mapping to/from active cells.
@@ -366,9 +367,12 @@ namespace Opm {
       EclipseGridLGR() = default;
       EclipseGridLGR(const std::string& self_label, const std::string& father_label_, 
                      int father_lgr_level, size_t nx, size_t ny, size_t nz, 
-                     vec_size_t father_lgr_index);
+                     vec_size_t father_lgr_index, std::array<int,3> low_fahterIJK_, 
+                     std::array<int,3> up_fahterIJK_);
       ~EclipseGridLGR() = default;
       vec_size_t getFatherGlobalID() const;
+      void save(Opm::EclIO::EclOutput&, const std::vector<Opm::NNCdata>&, const Opm::UnitSystem&) const;
+      void save_nnc(Opm::EclIO::EclOutput&) const;
       void set_lgr_global_counter(std::size_t counter){
         lgr_global_counter = counter;
       }
@@ -381,6 +385,8 @@ namespace Opm {
       std::string father_label;
       // references global on the father label
       vec_size_t father_global;
+      std::array<int,3> low_fahterIJK;
+      std::array<int,3> up_fahterIJK;
     };
 
 
