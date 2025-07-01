@@ -438,6 +438,7 @@ namespace Opm { namespace data {
 
         /// Connection level fracturing statistics.
         ConnectionFracturing fract{};
+        int lgr_grid{0}; // LGR grid index, 0 if not in LGR
 
         bool operator==(const Connection& conn2) const
         {
@@ -454,6 +455,7 @@ namespace Opm { namespace data {
                 && (compact_mult == conn2.compact_mult)
                 && (filtrate == conn2.filtrate)
                 && (this->fract == conn2.fract)
+                && (this->lgr_grid == conn2.lgr_grid)
                 ;
         }
 
@@ -489,7 +491,8 @@ namespace Opm { namespace data {
                 2.0, 3.0, 4.0, 5.0,
                 6.0, 7.0, 8.0, 9.0, 0.987,
                 ConnectionFiltrate::serializationTestObject(),
-                ConnectionFracturing::serializationTestObject()
+                ConnectionFracturing::serializationTestObject(),
+                1 // lgr_grid
             };
         }
     };

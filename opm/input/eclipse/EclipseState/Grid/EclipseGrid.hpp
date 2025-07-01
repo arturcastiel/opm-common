@@ -21,6 +21,7 @@
 
 #ifndef OPM_PARSER_ECLIPSE_GRID_HPP
 #define OPM_PARSER_ECLIPSE_GRID_HPP
+#include <cstddef>
 #include <opm/input/eclipse/EclipseState/Grid/GridDims.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/MapAxes.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/MinpvMode.hpp>
@@ -83,7 +84,7 @@ namespace Opm {
                     const int * actnum = nullptr);
 
         virtual ~EclipseGrid() = default;
-        
+
         /// EclipseGrid ignores ACTNUM in Deck, and therefore needs ACTNUM
         /// explicitly.  If a null pointer is passed, every cell is active.
         explicit EclipseGrid(const Deck& deck, const int * actnum = nullptr);
@@ -112,7 +113,7 @@ namespace Opm {
         }
         const std::vector<std::size_t>& get_print_order_lgr () const {
           return m_print_order_lgr_cells;
-        }       
+        }
 
         size_t getActiveIndex(size_t globalIndex) const {
             return activeIndex(globalIndex);
@@ -127,14 +128,18 @@ namespace Opm {
         {
             return this->all_lgr_labels;
         }
-        
+
         const std::string& get_lgr_tag() const {
             return this->lgr_label;
         }
 
+        size_t get_numCellLGR() const {
+          return this->all_lgr_labels.size() - 1;
+        }
+
         std::vector<GridDims> get_lgr_children_gridim() const;
-      
-        
+
+
         void assertIndexLGR(size_t localIndex) const;
 
         void assertLabelLGR(const std::string& label) const;
@@ -149,7 +154,7 @@ namespace Opm {
         void init_children_host_cells(bool logical = true);
         void init_children_host_cells_logical(void);
         void init_children_host_cells_geometrical(void);
-        std::array<int,3> getCellSubdivisionRatioLGR(const std::string&  lgr_tag, 
+        std::array<int,3> getCellSubdivisionRatioLGR(const std::string&  lgr_tag,
                                                      std::array<int,3>   acum = {1,1,1}) const;
         using GridDims::getGlobalIndex;
         size_t getGlobalIndex(size_t active_index) const;
@@ -230,9 +235,9 @@ namespace Opm {
         std::array<double, 3> getCellDimensions(size_t i, size_t j, size_t k) const {
             return getCellDims(i, j, k);
         }
-        std::array<double,3> getCellDimensionsLGR(const std::size_t  i, 
-                                                  const std::size_t  j, 
-                                                  const std::size_t  k, 
+        std::array<double,3> getCellDimensionsLGR(const std::size_t  i,
+                                                  const std::size_t  j,
+                                                  const std::size_t  k,
                                                   const std::string& lgr_tag) const;
         double getCellDepthLGR(size_t i, size_t j, size_t k, const std::string& lgr_tag) const;
 
@@ -405,7 +410,7 @@ namespace Opm {
                             std::array<double,8>& X,
                             std::array<double,8>& Y,
                             std::array<double,8>& Z) const;
-    
+
     };
 
     /// Specialized Class to describe LGR refined cells.
@@ -437,16 +442,16 @@ namespace Opm {
         get_child_LGR_cell(const std::string& lgr_tag) const;
         std::vector<int> save_hostnum(void) const;
         int get_hostnum(std::size_t global_index) const {return(m_hostnum[global_index]);};
-        
+
         //parsing the father grid allows the global_father references to be given in terms of father_grid
-        std::vector<int> getLGRCell_global_father(const EclipseGrid& father_grid) const;      
-        std::vector<double> getLGRCell_all_depth (const EclipseGrid& father_grid) const;      
+        std::vector<int> getLGRCell_global_father(const EclipseGrid& father_grid) const;
+        std::vector<double> getLGRCell_all_depth (const EclipseGrid& father_grid) const;
 
         void get_label_child_to_top_father(std::vector<std::reference_wrapper<const std::string>>& list) const;
-        void get_global_index_child_to_top_father(std::vector<std::size_t> & list, 
+        void get_global_index_child_to_top_father(std::vector<std::size_t> & list,
                                                   std::size_t i, std::size_t j, std::size_t k) const;
         void get_global_index_child_to_top_father(std::vector<std::size_t> & list, std::size_t global_ind) const;
-  
+
         void set_hostnum(const std::vector<int>&);
         const std::array<int,3>& get_low_fatherIJK() const{
           return low_fatherIJK;

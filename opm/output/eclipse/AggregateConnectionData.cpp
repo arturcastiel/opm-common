@@ -91,9 +91,15 @@ namespace {
             const auto  well_iter = xw.find(wname);
             const auto* wellRes   = (well_iter == xw.end())
                 ? nullptr : &well_iter->second;
+            const auto& well = sched.getWell(wname, sim_step);
+            if (!well.is_lgr_well()) {
+                connectionLoop(grid, well, wellRes, connOp);
+            }
+            else {
+                connectionLoop(grid.getLGRCell(well.get_lgr_well_tag().value()),
+                                     well, wellRes, connOp);
+            }
 
-            connectionLoop(grid, sched.getWell(wname, sim_step),
-                           wellRes, connOp);
         }
     }
 

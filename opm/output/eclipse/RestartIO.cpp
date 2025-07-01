@@ -266,11 +266,10 @@ namespace {
 
         const auto simStep = static_cast<std::size_t>(sim_step);
         const auto udqDims = UDQDims { udqConfig, ih };
-
         // UDQs are active in run.  Write UDQ related data to restart file.
         auto udqData = Helpers::AggregateUDQData(udqDims);
         udqData.captureDeclaredUDQData(schedule, simStep, udq_state, ih);
-        
+
         rstFile.write("ZUDN", udqData.getZUDN());
         rstFile.write("ZUDL", udqData.getZUDL());
         rstFile.write("IUDQ", udqData.getIUDQ());
@@ -357,6 +356,7 @@ namespace {
         rstFile.write("IWLS", wListData.getIWls());
 
         auto connectionData = Helpers::AggregateConnectionData(ih);
+
         connectionData.captureDeclaredConnData(schedule, grid, schedule.getUnits(),
                                                wells, sumState, sim_step);
 

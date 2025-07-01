@@ -664,6 +664,7 @@ if(ENABLE_ECL_OUTPUT)
           tests/test_rst.cpp
           tests/test_rst_netbalan.cpp
           tests/test_Restart.cpp
+          tests/test_RestartLGR.cpp
           tests/test_RFT.cpp
           tests/test_Solution.cpp
           tests/test_Summary.cpp

@@ -74,6 +74,7 @@ namespace Opm {
         using ExtraVector = std::vector<std::pair<RestartKey, std::vector<double>>>;
 
         data::Solution solution{};
+
         data::Wells wells{};
         data::GroupAndNetworkValues grp_nwrk{};
         data::Aquifers aquifer{};

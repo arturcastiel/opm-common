@@ -293,6 +293,10 @@ namespace Opm {
         int m_complnum { -1 };
         CTFProperties ctf_properties_{};
 
+
+
+
+
         std::array<int,3> ijk{};
         int lgr_grid{0};
         CTFKind m_ctfkind { CTFKind::DeckValue };
