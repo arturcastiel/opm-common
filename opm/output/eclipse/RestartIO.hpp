@@ -91,6 +91,20 @@ namespace Opm::RestartIO {
               std::optional<Helpers::AggregateAquiferData>& aquiferData,
               bool                                          write_double = false);
 
+    // Overloaded function to handle grid containing LGR
+    void save(EclIO::OutputStream::Restart&                 rstFile,
+              int                                           report_step,
+              double                                        seconds_elapsed,
+              std::vector<RestartValue>                     value,
+              const EclipseState&                           es,
+              const EclipseGrid&                            grid,
+              const Schedule&                               schedule,
+              const Action::State&                          action_state,
+              const WellTestState&                          wtest_state,
+              const SummaryState&                           sumState,
+              const UDQState&                               udqState,
+              std::optional<Helpers::AggregateAquiferData>& aquiferData,
+              bool                                          write_double = false);
 
     RestartValue load(const std::string&             filename,
                       int                            report_step,

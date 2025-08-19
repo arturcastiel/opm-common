@@ -270,7 +270,7 @@ namespace {
         // UDQs are active in run.  Write UDQ related data to restart file.
         auto udqData = Helpers::AggregateUDQData(udqDims);
         udqData.captureDeclaredUDQData(schedule, simStep, udq_state, ih);
-        
+
         rstFile.write("ZUDN", udqData.getZUDN());
         rstFile.write("ZUDL", udqData.getZUDL());
         rstFile.write("IUDQ", udqData.getIUDQ());
@@ -815,6 +815,68 @@ void save(EclIO::OutputStream::Restart&                 rstFile,
 
     if (! ecl_compatible_rst) {
         writeExtraData(value.extra, rstFile);
+    }
+
+    logRestartOutput(report_step, schedule.size() - 1, inteHD);
+}
+
+
+void save(EclIO::OutputStream::Restart&                 rstFile,
+          int                                           report_step,
+          double                                        seconds_elapsed,
+          std::vector<RestartValue>                     values,
+          const EclipseState&                           es,
+          const EclipseGrid&                            grid,
+          const Schedule&                               schedule,
+          const Action::State&                          action_state,
+          const WellTestState&                          wtest_state,
+          const SummaryState&                           sumState,
+          const UDQState&                               udqState,
+          std::optional<Helpers::AggregateAquiferData>& aquiferData,
+          bool                                          write_double)
+{
+    // number of grids = Global + LGR grids
+    std::size_t num_grids = values.size();
+    //checking Global Grid
+    ::Opm::RestartIO::checkSaveArguments(es, values[0], grid);
+    //checking LGR Grids
+    for (std::size_t i = 1; i < num_grids; ++i) {
+        ::Opm::RestartIO::checkSaveArguments(es, values[i], grid.getLGRCell(i -1));
+    }
+
+    const auto& ioCfg = es.getIOConfig();
+    const auto ecl_compatible_rst = ioCfg.getEclCompatibleRST();
+
+    const auto  sim_step = std::max(report_step - 1, 0);
+    const auto& units    = es.getUnits();
+
+    if (ecl_compatible_rst) {
+    write_double = false;
+    }
+
+    // Convert solution fields and extra values from SI to user units.
+    std::for_each(values.begin(), values.end(),
+                    [&units](RestartValue& value ) { return value.convertFromSI(units); });
+
+
+    // Write GLOBAL RESTART
+    const auto inteHD =
+    writeHeader(report_step, sim_step, nextStepSize(values[0]),
+                seconds_elapsed, schedule, grid, es, rstFile);
+
+    if (report_step > 0) {
+    writeDynamicData(sim_step, grid, es, schedule, values[0].wells,
+                    action_state, wtest_state, sumState, inteHD,
+                    values[0].aquifer, aquiferData, rstFile);
+    }
+
+    writeActionx(report_step, sim_step, schedule, action_state, sumState, rstFile);
+
+    writeSolution(values[0], es, schedule, udqState, report_step, sim_step,
+                ecl_compatible_rst, write_double, inteHD, rstFile);
+
+    if (! ecl_compatible_rst) {
+    writeExtraData(values[0].extra, rstFile);
     }
 
     logRestartOutput(report_step, schedule.size() - 1, inteHD);
