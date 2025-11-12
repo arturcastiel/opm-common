@@ -2316,6 +2316,15 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         // because the standard algorithm is based on topological information
         // it does not need for the refinement information to be parsed.
         init_children_host_cells();
+        // initialize CPG refinement based parents COORD and ZCORN
+        perform_refinement();
+
+    }
+
+    void EclipseGrid::perform_refinement(){
+        for (auto& cell : lgr_children_cells) {
+            cell.perform_refinement(getCOORD(), getZCORN());
+        }
     }
 
     void EclipseGrid::propagateParentIndicesToLGRChildren(int index){
@@ -2791,6 +2800,59 @@ namespace Opm {
     const EclipseGridLGR::vec_size_t& EclipseGridLGR::getFatherGlobalID() const
     {
         return father_global;
+    }
+
+    void EclipseGridLGR::perform_refinement(const std::vector<double>& parent_coord, const std::vector<double>& parent_zcorn)
+    {
+    //     2 ---- 3                          6 ---- 7
+    //     /      /   bottom face            /      /    top face
+    //    0 ---- 1                          4 ---- 5
+        auto finding_bottom_face_corner_elements = [this] (){
+            const std::array<std::array<std::size_t,2>, 4> bottom_face_pattern = {{
+                {{0, 0}},
+                {{1, 0}},
+                {{0, 1}},
+                {{1, 1}}
+            }};
+
+            std::array<std::array<std::size_t,3>, 4> bottom_face{};
+            std::transform(bottom_face_pattern.begin(), bottom_face_pattern.end(), bottom_face.begin(),
+                           [this](const auto& pattern){
+                            std::array<std::size_t,3> node{};
+                            node[0] = pattern[0] == 0 ? low_fatherIJK[0] : up_fatherIJK[0];
+                            node[1] = pattern[1] == 0 ? low_fatherIJK[1] : up_fatherIJK[1];
+                            node[2] = low_fatherIJK[2];
+                            return node;
+                           });
+            return bottom_face;
+        };
+
+
+         auto extracting_ij_pillars = [this, &finding_bottom_face_corner_elements] (){
+            const std::array<std::array<std::size_t,2>, 4> increase_pattern = {{
+                {{0, 0}},
+                {{1, 0}},
+                {{0, 1}},
+                {{1, 1}}
+            }};
+
+            std::array<std::array<std::size_t,3>, 4> pillar_indices{};
+            const std::array<std::array<std::size_t,3>, 4> ij_corner_elements = finding_bottom_face_corner_elements();
+
+
+            for (std::size_t index = 0; index < 4; index++) {
+                const auto& lpattern = increase_pattern[index];
+                pillar_indices[index][0] = ij_corner_elements[index][0] + lpattern[0];
+                pillar_indices[index][1] = ij_corner_elements[index][1] + lpattern[1];
+            }
+            return pillar_indices;
+        };
+
+        auto ij_pillars = extracting_ij_pillars();
+        m_coord = parent_coord;
+        m_zcorn = parent_zcorn;
+
+
     }
 
     void EclipseGridLGR::save(Opm::EclIO::EclOutput& egridfile, const std::vector<Opm::NNCdata>& nnc, const Opm::UnitSystem& units) const {
