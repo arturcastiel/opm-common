@@ -517,12 +517,13 @@ namespace Opm {
         std::array<int, 3> low_fatherIJK {};
         std::array<int, 3> up_fatherIJK {};
         std::vector<int> m_hostnum;
-        std::vector<double> generate_refined_coord(const std::vector<double>& coord,
+
+        std::vector<double> generate_refined_coord(const std::vector<double>& ,
+                                                   const std::array<int,3>&);
+
+        std::vector<double> generate_refined_zcorn(const std::vector<double>& zcorn_h,
                                                    const std::array<int,3>&   parent_nxyz);
 
-        std::vector<double> generate_refined_zcorn(const std::vector<double>& coord,
-                                                   const std::vector<double>& zcorn,
-                                                   const std::array<int,3>&   parent_nxyz);
     };
 
 
