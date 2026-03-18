@@ -199,7 +199,7 @@ public:
     NNC&       getNNC(std::size_t grid1, std::size_t grid2);
 
     bool hasCrossGridNNC(std::size_t grid1, std::size_t grid2) const;
-
+    bool empty() const { return m_sameGridNNCs.empty() && m_diffGridNNCs.empty(); }
     // ---- same-grid access -------------------------------------------------
 
     const NNC& getNNC(std::size_t grid) const;

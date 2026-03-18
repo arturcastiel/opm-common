@@ -22,6 +22,7 @@
 */
 
 #include "config.h"
+#include "opm/input/eclipse/EclipseState/Grid/NNC.hpp"
 
 #include <opm/output/eclipse/EclipseIO.hpp>
 
@@ -331,6 +332,11 @@ public:
                       std::map<std::string, std::vector<int>> int_data,
                       const std::vector<NNCdata>&             nnc) const;
 
+    void writeInitial(std::vector<data::Solution>             simProps,
+                      std::map<std::string, std::vector<int>> int_data,
+                      const NNCCollection&                    nnc_col) const;
+
+
     /// Create summary file output.
     ///
     /// Calls Summary::add_timestep() and Summary::write().
@@ -556,6 +562,10 @@ private:
                        std::map<std::string, std::vector<int>> int_data,
                        const std::vector<NNCdata>&             nnc) const;
 
+    void writeInitFile(std::vector<data::Solution>             simProps,
+                       std::map<std::string, std::vector<int>> int_data,
+                       const NNCCollection&                    nnc) const;
+
     /// Output static geometry to EGRID file.
     ///
     /// \param[in] nnc Run's non-neighbouring connections.  Includes those
@@ -563,6 +573,8 @@ private:
     /// those connections that are explicitly entered using keywords like
     /// NNC, EDITNNC, or EDITNNCR.  This function uses only the cell pairs.
     void writeEGridFile(const std::vector<NNCdata>& nnc) const;
+
+    void writeEGridFile(const NNCCollection& nnc) const;
 
     /// Record a summary file output event.
     ///
@@ -798,6 +810,20 @@ void Opm::EclipseIO::Impl::writeInitial(std::vector<data::Solution>             
     }
 }
 
+void Opm::EclipseIO::Impl::writeInitial(std::vector<data::Solution>             simProps,
+                                        std::map<std::string, std::vector<int>> int_data,
+                                        const NNCCollection&                    nnc_col) const
+{
+    if (this->es_.get().cfg().io().getWriteINITFile()) {
+        this->writeInitFile(std::move(simProps), std::move(int_data), nnc_col);
+    }
+
+    if (this->es_.get().cfg().io().getWriteEGRIDFile()) {
+        this->writeEGridFile(nnc_col);
+    }
+}
+
+
 void Opm::EclipseIO::Impl::writeSummaryFile(const SummaryState&      st,
                                             const int                report_step,
                                             const std::optional<int> time_step,
@@ -946,6 +972,29 @@ void Opm::EclipseIO::Impl::writeInitFile(std::vector<data::Solution>            
 }
 
 
+void Opm::EclipseIO::Impl::writeInitFile(std::vector<data::Solution>             simProps,
+                                         std::map<std::string, std::vector<int>> int_data,
+                                         const NNCCollection&                    nnc_col) const
+{
+    EclIO::OutputStream::Init initFile {
+        EclIO::OutputStream::ResultSet { this->outputDir_, this->baseName_ },
+        EclIO::OutputStream::Formatted { this->es_.get().cfg().io().getFMTOUT() }
+    };
+
+    for (auto& sol : simProps) {
+        sol.convertFromSI(this->es_.get().getUnits());
+    }
+
+    std::vector<std::reference_wrapper<const data::Solution>> simPropsRefs;
+    simPropsRefs.reserve(simProps.size());
+    for (auto& sol : simProps) {
+        simPropsRefs.emplace_back(sol);
+    }
+
+    InitIO::write(this->es_, this->grid_, this->schedule_,
+            simPropsRefs, std::move(int_data), nnc_col, initFile);
+}
+
 void Opm::EclipseIO::Impl::writeEGridFile(const std::vector<NNCdata>& nnc) const
 {
     const auto formatted = this->es_.get().cfg().io().getFMTOUT();
@@ -961,6 +1010,24 @@ void Opm::EclipseIO::Impl::writeEGridFile(const std::vector<NNCdata>& nnc) const
     const auto egridFile = EclIO::OutputStream::outputFileName(rset, ext);
 
     this->grid_.save(egridFile, formatted, nnc, this->es_.get().getDeckUnitSystem());
+}
+
+
+void Opm::EclipseIO::Impl::writeEGridFile(const NNCCollection& nnc_col) const
+{
+    const auto formatted = this->es_.get().cfg().io().getFMTOUT();
+
+    const auto ext = '.'
+        + (formatted ? std::string{"F"} : std::string{})
+        + "EGRID";
+
+    const auto rset = EclIO::OutputStream::ResultSet {
+        this->outputDir_, this->baseName_
+    };
+
+    const auto egridFile = EclIO::OutputStream::outputFileName(rset, ext);
+
+    this->grid_.save(egridFile, formatted, nnc_col, this->es_.get().getDeckUnitSystem());
 }
 
 void Opm::EclipseIO::Impl::recordSummaryOutput(const double secs_elapsed)
@@ -1058,6 +1125,18 @@ void Opm::EclipseIO::writeInitial(std::vector<data::Solution>             simPro
     // new implementation of writeInitial for LGR grids.
     this->impl->writeInitial(std::move(simProps), std::move(int_data), nnc);
 }
+
+void Opm::EclipseIO::writeInitial(std::vector<data::Solution>             simProps,
+                                  std::map<std::string, std::vector<int>> int_data,
+                                  const NNCCollection&                    nnc_col)
+{
+    if (! this->impl->outputEnabled()) {
+        return;
+    }
+    // new implementation of writeInitial for LGR grids.
+    this->impl->writeInitial(std::move(simProps), std::move(int_data), nnc_col);
+}
+
 
 void Opm::EclipseIO::writeTimeStep(const Action::State& action_state,
                                    const WellTestState& wtest_state,

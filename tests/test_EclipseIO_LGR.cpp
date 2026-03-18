@@ -16,6 +16,7 @@
   You should have received a copy of the GNU General Public License
   along with OPM.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "opm/input/eclipse/EclipseState/Grid/NNC.hpp"
 #include <boost/test/tools/old/interface.hpp>
 #include <opm/io/eclipse/EGrid.hpp>
 #include <opm/io/eclipse/EInit.hpp>
@@ -73,6 +74,37 @@
 using namespace Opm;
 
 namespace {
+
+    NNCCollection nnc_collection_opm_lgr_nnc_test()
+    {
+        NNCCollection ncol;
+        // Global NNCS
+        {
+            NNC global_nnc;
+            // the first entry is invalid because the host cell is refined
+            // it should be filtered out
+            global_nnc.addNNC(0, 2, 0.45600000E+01);
+            global_nnc.addNNC(0, 3, 0.12340000E+02);
+            ncol.addNNC(global_nnc);
+
+        }
+
+        // different type NNCs
+        {
+            // grid LGR1 and GLOBAL GRID (1,0)
+
+            //NNC sorts the cell indices, so we can add them in any order
+            // FOR THIS WE REQUIRE SPECIFIC ORDER, HERE IS THE BUG
+            NNCDiffGrid lgr1_nnc;
+            lgr1_nnc.addNNC(0, 1,0.78900000E+03);
+            lgr1_nnc.addNNC(2, 1,0.78900000E+03);
+            lgr1_nnc.addNNC(1, 3,0.78900000E+03);
+            lgr1_nnc.addNNC(3, 3,0.78900000E+03);
+            ncol.addNNC(1, 0, lgr1_nnc);
+
+        }
+    return ncol;
+    }
 
     template<typename Vec>
     void checkVectorsClose(const Vec& obtained, const Vec& expected, double tol, const std::string& context)
@@ -903,7 +935,7 @@ BOOST_AUTO_TEST_CASE(EclipseIOLGR_IntegrationLGR)
     eGridPropsList.emplace_back(createEGridProps(3, 3, 1));
     eGridPropsList.emplace_back(createEGridProps(3, 3, 1));
 
-    eclWriter.writeInitial(eGridPropsList, {});
+    eclWriter.writeInitial(eGridPropsList, {}, std::vector<NNCdata>{});
 
     std::vector<float> expected_tranx_lgr2 =  {0.37468846E+01,   0.56203265E+01,   0.74937692E+01,   0.93672113E+01,
                                                0.11240653E+02,   0.13114096E+02,   0.14987538E+02,   0.16860981E+02,
@@ -916,5 +948,57 @@ BOOST_AUTO_TEST_CASE(EclipseIOLGR_IntegrationLGR)
         std::vector<float> tranx_file = init.get<float>("TRANX");
         checkVectorsClose(tranx_file, expected_tranx_lgr2, 1e-4, "tranx_file");
     }
+
+}
+
+
+BOOST_AUTO_TEST_CASE(EclipseIOLGR_IntegrationNNCLGR)
+{
+    WorkArea test_area("test_EclioseIO_LGR_PROP_full");
+    test_area.copyIn("NNCLGRTEST.DATA");
+
+    const auto deck = msw_sim("NNCLGRTEST.DATA");
+    const auto simCase = SimulationCase{deck};
+    auto es = simCase.es;
+    const auto& eclGrid = es.getInputGrid();
+
+    const Schedule& schedule = simCase.sched;
+    const SummaryConfig summary_config( deck, schedule, es.fieldProps(), es.aquifer());
+    const SummaryState st = sim_stateLGR_example04();
+    es.getIOConfig().setBaseName( "TESTE_LGR_INTEGRATION_PROP" );
+    EclipseIO eclWriter( es, eclGrid , schedule, summary_config);
+
+    using measure = UnitSystem::measure;
+    using TargetType = data::TargetType;
+
+    auto createEGridProps = [](int nx, int ny, int nz) {
+        std::vector<double> tranx(nx * ny * nz);
+        std::vector<double> trany(nx * ny * nz);
+        std::vector<double> tranz(nx * ny * nz);
+        // Fill tranx, trany, tranz with some test data if needed
+        double step = 0.5e-12;
+        std::generate(tranx.begin(), tranx.end(), [n = 1e-12, step]() mutable { double val = n; n += step; return val; });
+        std::generate(trany.begin(), trany.end(), [n = 1e-12, step]() mutable { double val = n; n += step; return val; });
+        std::generate(tranz.begin(), tranz.end(), [n = 1e-12, step]() mutable { double val = n; n += step; return val; });
+
+        return data::Solution {
+            { "TRANX", data::CellData { measure::transmissibility, tranx, TargetType::INIT } },
+            { "TRANY", data::CellData { measure::transmissibility, trany, TargetType::INIT } },
+            { "TRANZ", data::CellData { measure::transmissibility, tranz, TargetType::INIT } },
+        };
+    };
+
+    std::vector<data::Solution> eGridPropsList;
+    eGridPropsList.reserve(4);
+    eGridPropsList.emplace_back(createEGridProps(5, 1, 1));
+    eGridPropsList.emplace_back(createEGridProps(2, 2, 1));
+    eGridPropsList.emplace_back(createEGridProps(2, 2, 1));
+
+
+    auto nnc_col = nnc_collection_opm_lgr_nnc_test();
+    eclWriter.writeInitial(eGridPropsList, {}, nnc_col);
+    auto index = 1.3;
+    index ++;
+
 
 }

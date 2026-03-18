@@ -183,6 +183,11 @@ public:
                       const std::vector<NNCdata>& nnc = {});
 
 
+    void writeInitial(std::vector<data::Solution>,
+                      std::map<std::string, std::vector<int>> int_data = {},
+                      const NNCCollection& nnc_col = {});
+
+
     /// Write reservoir state and summary information to disk.
     ///
     /// Calling this method is only meaningful after the first time step has

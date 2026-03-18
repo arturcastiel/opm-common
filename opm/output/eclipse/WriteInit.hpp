@@ -20,6 +20,7 @@
 #ifndef OPM_WRITE_INIT_HPP
 #define OPM_WRITE_INIT_HPP
 
+#include "opm/input/eclipse/EclipseState/Grid/NNC.hpp"
 #include <map>
 #include <string>
 #include <vector>
@@ -62,6 +63,15 @@ namespace Opm { namespace InitIO {
                std::map<std::string, std::vector<int>>                                int_data,
                const std::vector<::Opm::NNCdata>&                                     nnc,
                ::Opm::EclIO::OutputStream::Init&                                      initFile);
+
+    void write(const ::Opm::EclipseState&                                             es,
+               const ::Opm::EclipseGrid&                                              grid,
+               const ::Opm::Schedule&                                                 schedule,
+               const std::vector<std::reference_wrapper<const ::Opm::data::Solution>> simProps,
+               std::map<std::string, std::vector<int>>                                int_data,
+               const NNCCollection&                                                   nnc_col,
+               ::Opm::EclIO::OutputStream::Init&                                      initFile);
+
 
 }} // namespace Opm::InitIO
 
