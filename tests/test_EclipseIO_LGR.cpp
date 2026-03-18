@@ -75,35 +75,83 @@ using namespace Opm;
 
 namespace {
 
-    NNCCollection nnc_collection_opm_lgr_nnc_test()
+
+    NNCCollection nnc_collection_opm_IntegrationNNCLGR()
     {
+        // Builds the NNCCollection for the NNCLGRTEST case (deck: NNCLGRTEST.DATA).
+        //
+        // Grid layout (all indices 0-based unless noted):
+        //   Global : 5x1x1  — cells 0..4; cells 1 and 2 are LGR host cells
+        //   LGR1   : 2x2x1 (4 cells, 0..3) — refines global cell 1 (1-based: 2,1,1)
+        //   LGR2   : 2x2x1 (4 cells, 0..3) — refines global cell 2 (1-based: 3,1,1)
+        //
+        // NNCCollection grid index convention:
+        //   0 = global,  1 = LGR1,  2 = LGR2
+        //
+        // Expected INIT file NNC section (values in deck native units):
+        //
+        //   TRANNNC  (global same-grid)        : [ 4.56 ]
+        //
+        //   LGR1 block:
+        //     TRANNNC  (internal, none)         : [ ]
+        //     TRANGL   (global <-> LGR1)        : [ 8.527,  8.527 ]
+        //     LGRJOIN  LGR1 <-> LGR2
+        //     TRANLL   (LGR1 <-> LGR2)         : [ 0.197, 12.79, 12.79 ]
+        //
+        //   LGR2 block:
+        //     TRANNNC  (internal, none)         : [ ]
+        //     TRANGL   (global <-> LGR2)        : [ 8.527,  8.527 ]
+
+
+        // NNCLGRTEST.DATA has no explicit unit keyword; OPM defaults to METRIC.
+        // OPM stores all NNC transmissibilities internally in SI [m³/(Pa·s)].
+        // The expected INIT output values above are in METRIC units (cP·m³/(day·bar)).
+        // Convert: SI = output_value * Metric::Transmissibility
+        //   where Metric::Transmissibility = cP·m³/(day·bar) ≈ 1.1574e-13 [SI per metric unit]
+        using namespace Opm::unit;
+        using namespace Opm::prefix;
+        const double toSI = centi * Poise * cubic(meter) / (day * barsa);
+
         NNCCollection ncol;
-        // Global NNCS
+
+        // Global same-grid NNC: cell 0 (1,1,1) <-> cell 4 (5,1,1).
+        // Neither is a host cell, so this connection survives filtering.
         {
             NNC global_nnc;
-            // the first entry is invalid because the host cell is refined
-            // it should be filtered out
-            global_nnc.addNNC(0, 2, 0.45600000E+01);
-            global_nnc.addNNC(0, 3, 0.12340000E+02);
+            global_nnc.addNNC(0, 4, 0.45600000E+01 * toSI);
             ncol.addNNC(global_nnc);
-
         }
 
-        // different type NNCs
+        // Cross-grid: global (grid 0) <-> LGR1 (grid 1) — TRANGL
+        // Global cell 0 connects to the left face of LGR1 (cells 0 and 2 in a 2x2x1).
         {
-            // grid LGR1 and GLOBAL GRID (1,0)
-
-            //NNC sorts the cell indices, so we can add them in any order
-            // FOR THIS WE REQUIRE SPECIFIC ORDER, HERE IS THE BUG
-            NNCDiffGrid lgr1_nnc;
-            lgr1_nnc.addNNC(0, 1,0.78900000E+03);
-            lgr1_nnc.addNNC(2, 1,0.78900000E+03);
-            lgr1_nnc.addNNC(1, 3,0.78900000E+03);
-            lgr1_nnc.addNNC(3, 3,0.78900000E+03);
-            ncol.addNNC(1, 0, lgr1_nnc);
-
+            NNCDiffGrid gl1_nnc;
+            gl1_nnc.addNNC(0, 0, 0.85270205E+01 * toSI);   // global cell 0  <-> LGR1 cell 0 (1,1,1)
+            gl1_nnc.addNNC(0, 2, 0.85270205E+01 * toSI);   // global cell 0  <-> LGR1 cell 2 (1,2,1)
+            ncol.addNNC(0, 1, gl1_nnc);
         }
-    return ncol;
+
+        // Cross-grid: global (grid 0) <-> LGR2 (grid 2) — TRANGL
+        // Global cell 3 connects to the right face of LGR2 (cells 1 and 3 in a 2x2x1).
+        {
+            NNCDiffGrid gl2_nnc;
+            gl2_nnc.addNNC(3, 1, 0.85270205E+01 * toSI);   // global cell 3  <-> LGR2 cell 1 (2,1,1)
+            gl2_nnc.addNNC(3, 3, 0.85270205E+01 * toSI);   // global cell 3  <-> LGR2 cell 3 (2,2,1)
+            ncol.addNNC(0, 2, gl2_nnc);
+        }
+
+        // Cross-grid: LGR1 (grid 1) <-> LGR2 (grid 2) — TRANLL
+        // Right column of LGR1 (cells 1, 3) connects to left column of LGR2 (cells 0, 2).
+        // Insertion order must match the reference output: [0.197, 12.79, 12.79].
+        {
+            NNCDiffGrid l12_nnc;
+            l12_nnc.addNNC(1, 0, 0.19720000E+00 * toSI);   // LGR1 cell 1 (2,1,1) <-> LGR2 cell 0 (1,1,1)
+            l12_nnc.addNNC(1, 2, 0.12790530E+02 * toSI);   // LGR1 cell 1 (2,1,1) <-> LGR2 cell 2 (1,2,1)
+            l12_nnc.addNNC(3, 2, 0.12790530E+02 * toSI);   // LGR1 cell 3 (2,2,1) <-> LGR2 cell 2 (1,2,1)
+            ncol.addNNC(1, 2, l12_nnc);
+        }
+
+        return ncol;
     }
 
     template<typename Vec>
@@ -995,7 +1043,7 @@ BOOST_AUTO_TEST_CASE(EclipseIOLGR_IntegrationNNCLGR)
     eGridPropsList.emplace_back(createEGridProps(2, 2, 1));
 
 
-    auto nnc_col = nnc_collection_opm_lgr_nnc_test();
+    auto nnc_col = nnc_collection_opm_IntegrationNNCLGR();
     eclWriter.writeInitial(eGridPropsList, {}, nnc_col);
     auto index = 1.3;
     index ++;

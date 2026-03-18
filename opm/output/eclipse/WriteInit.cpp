@@ -951,10 +951,13 @@ namespace {
         initFile.write("TRANGL", extractTrans(nnc_col.getNNC(0, lgr_grid_index).input(), units));
     }
 
-    // Write LGRJOIN + TRANLL for all LGR-to-LGR connected pairs.
-    // NNCCollection keys are normalised (min_grid, max_grid); pairs where g1==0 are
-    // global-local connections already handled by TRANGL.
-    void writeLGRTranLL(const ::Opm::NNCCollection&              nnc_col,
+    // Write LGRJOIN + TRANLL for all LGR-to-LGR pairs owned by lgr_grid_index.
+    // Keys in diff_grid_nnc are normalised (min_grid, max_grid), so a pair is "owned"
+    // by the lower-indexed LGR (g1 == lgr_grid_index). This ensures each connection
+    // is written exactly once, in the block of the first LGR in the pair.
+    // Global-local pairs (g1==0) are naturally skipped since 0 != any lgr_grid_index.
+    void writeLGRTranLL(std::size_t                              lgr_grid_index,
+                        const ::Opm::NNCCollection&              nnc_col,
                         const std::vector<std::string>&          all_lgr_tag,
                         const ::Opm::UnitSystem&                 units,
                         ::Opm::EclIO::OutputStream::Init&        initFile)
@@ -962,7 +965,7 @@ namespace {
         using PaddedString = Opm::EclIO::PaddedOutputString<8>;
         for (const auto& [key, nnc_diff] : nnc_col.diff_grid_nnc()) {
             const auto [g1, g2] = key;
-            if (g1 == 0) continue;
+            if (g1 != lgr_grid_index) continue;
             initFile.write("LGRJOIN", std::vector<PaddedString>{
                 PaddedString{all_lgr_tag[g1 - 1]},
                 PaddedString{all_lgr_tag[g2 - 1]}
@@ -983,7 +986,8 @@ namespace {
         const auto& units = es.getUnits();
         const std::vector<std::string> all_lgr_tag = grid.get_all_lgr_labels();
 
-        // Pass 1: per-LGR — LGRHEADI/Q/D, TRANNNC, TRANGL
+        // Single pass: for each LGR write its NNC block in order:
+        //   LGRHEADI/Q/D  ->  TRANNNC  ->  TRANGL  ->  LGRJOIN+TRANLL (if this LGR owns any pairs)
         for (std::size_t index : grid.get_print_order_lgr()) {
             const auto lgr_label = all_lgr_tag[index];
             const Opm::EclipseGridLGR& lgr_grid = grid.getLGRCell(lgr_label);
@@ -992,10 +996,8 @@ namespace {
             writeInitFileHeaderLGRCell(es, lgr_grid, schedule, initFile, lgr_grid_index, false);
             writeLGRTranNNC(lgr_grid_index, nnc_col, units, initFile);
             writeLGRTranGL (lgr_grid_index, nnc_col, units, initFile);
+            writeLGRTranLL (lgr_grid_index, nnc_col, all_lgr_tag, units, initFile);
         }
-
-        // Pass 2: LGR-to-LGR pairs — LGRJOIN + TRANLL
-        writeLGRTranLL(nnc_col, all_lgr_tag, units, initFile);
 
         initFile.message("LGRSGONE");
     }
