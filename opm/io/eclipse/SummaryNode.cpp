@@ -226,6 +226,16 @@ Opm::EclIO::SummaryNode::category_from_keyword(const std::string& keyword)
     case 'C': return distinguish_connection_from_completion(keyword);
     case 'F': return Category::Field;
     case 'G': return distinguish_group_from_node(keyword);
+    case 'L':
+        if (keyword.size() >= 2) {
+            switch (keyword[1]) {
+            case 'W': return distinguish_well_from_completion(keyword);
+            case 'C': return distinguish_connection_from_completion(keyword);
+            case 'B': return Category::Block;
+            default:  break;
+            }
+        }
+        return Category::Miscellaneous;
     case 'R': return Category::Region;
     case 'S': return Category::Segment;
     case 'W': return distinguish_well_from_completion(keyword);

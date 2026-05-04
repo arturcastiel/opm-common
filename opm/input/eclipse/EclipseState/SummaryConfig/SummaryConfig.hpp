@@ -141,6 +141,16 @@ namespace Opm {
         /// Retrieve summary vector's associated region.
         const std::string& fip_region() const { return *this->fip_region_ ; }
 
+        /// Retrieve LGR identity for this summary vector.
+        const std::optional<Opm::EclIO::lgr_info>& lgr() const
+        { return this->lgr_; }
+
+        /// Assign LGR identity for this summary vector.
+        ///
+        /// \return \code *this \endcode
+        SummaryConfigNode& lgr(const Opm::EclIO::lgr_info& info)
+        { this->lgr_ = info; return *this; }
+
         /// Retrieve a unique distinguishing identifier for this summary vector.
         std::string uniqueNodeKey() const;
 
@@ -159,7 +169,7 @@ namespace Opm {
                 /* wgname = */     this->name_,
                 /* number = */     this->number_,
                 /* fip_region = */ this->fip_region_,
-                /* lgr = */        {} // std::optional<>
+                /* lgr = */        this->lgr_
             };
         }
 
@@ -179,6 +189,7 @@ namespace Opm {
             serializer(number_);
             serializer(fip_region_);
             serializer(userDefined_);
+            serializer(lgr_);
         }
 
     private:
@@ -210,6 +221,10 @@ namespace Opm {
         ///
         /// Mostly for diagnostic purposes.
         KeywordLocation loc{};
+
+        /// LGR identity for LGR-level summary vectors (LW*, LC*, LB*).
+        /// Empty optional for all non-LGR vectors.
+        std::optional<Opm::EclIO::lgr_info> lgr_{};
     };
 
     /// Infer summary vector level from keyword name.

@@ -125,3 +125,89 @@ BOOST_AUTO_TEST_SUITE_END()     // Total
 BOOST_AUTO_TEST_SUITE_END()     // Type
 
 BOOST_AUTO_TEST_SUITE_END()     // ParseKeywords
+
+// =====================================================================
+
+BOOST_AUTO_TEST_SUITE(LGR)
+
+BOOST_AUTO_TEST_CASE(lgr_field_roundtrip)
+{
+    using Node = Opm::SummaryConfigNode;
+    using Cat  = Opm::SummaryConfigNode::Category;
+
+    // Build a node and attach LGR info
+    auto node = Node("LWOPR", Cat::Well, Opm::KeywordLocation{});
+    node.lgr(Opm::EclIO::lgr_info{ "LGR1", {0, 0, 0} });
+
+    BOOST_CHECK(node.lgr().has_value());
+    BOOST_CHECK_EQUAL(node.lgr()->name,   "LGR1");
+    BOOST_CHECK_EQUAL(node.lgr()->ijk[0], 0);
+    BOOST_CHECK_EQUAL(node.lgr()->ijk[1], 0);
+    BOOST_CHECK_EQUAL(node.lgr()->ijk[2], 0);
+
+    // Conversion to EclIO::SummaryNode preserves lgr
+    Opm::EclIO::SummaryNode sn = node;
+    BOOST_CHECK(sn.lgr.has_value());
+    BOOST_CHECK_EQUAL(sn.lgr->name,   "LGR1");
+    BOOST_CHECK_EQUAL(sn.lgr->ijk[0], 0);
+
+    // Non-LGR node has empty optional
+    auto global = Node("WOPR", Cat::Well, Opm::KeywordLocation{});
+    BOOST_CHECK(!global.lgr().has_value());
+    Opm::EclIO::SummaryNode sn2 = global;
+    BOOST_CHECK(!sn2.lgr.has_value());
+
+    // LB* node with specific ijk
+    auto blk = Node("LBPR", Cat::Block, Opm::KeywordLocation{});
+    blk.lgr(Opm::EclIO::lgr_info{ "LGR1", {2, 3, 4} });
+    Opm::EclIO::SummaryNode sn3 = blk;
+    BOOST_CHECK_EQUAL(sn3.lgr->ijk[0], 2);
+    BOOST_CHECK_EQUAL(sn3.lgr->ijk[1], 3);
+    BOOST_CHECK_EQUAL(sn3.lgr->ijk[2], 4);
+}
+
+BOOST_AUTO_TEST_CASE(lgr_dedup_distinct_lgrs)
+{
+    // Regression: two nodes with same keyword+well but different LGRs
+    // must NOT compare equal (silent dedup drop prevention)
+    using Node = Opm::SummaryConfigNode;
+    using Cat  = Opm::SummaryConfigNode::Category;
+
+    auto n1 = Node("LWOPR", Cat::Well, Opm::KeywordLocation{});
+    n1.namedEntity("PROD1");
+    n1.lgr(Opm::EclIO::lgr_info{ "LGR1", {0, 0, 0} });
+
+    auto n2 = Node("LWOPR", Cat::Well, Opm::KeywordLocation{});
+    n2.namedEntity("PROD1");
+    n2.lgr(Opm::EclIO::lgr_info{ "LGR2", {0, 0, 0} });
+
+    BOOST_CHECK(n1 != n2);
+    BOOST_CHECK(n1 < n2 || n2 < n1); // strict weak ordering holds
+
+    // Same LGR — must be equal
+    auto n3 = Node("LWOPR", Cat::Well, Opm::KeywordLocation{});
+    n3.namedEntity("PROD1");
+    n3.lgr(Opm::EclIO::lgr_info{ "LGR1", {0, 0, 0} });
+
+    BOOST_CHECK(n1 == n3);
+    BOOST_CHECK(!(n1 < n3) && !(n3 < n1));
+}
+
+BOOST_AUTO_TEST_CASE(lgr_no_lgr_sorts_before_lgr)
+{
+    // non-LGR node sorts before LGR node with same keyword+entity
+    using Node = Opm::SummaryConfigNode;
+    using Cat  = Opm::SummaryConfigNode::Category;
+
+    auto global = Node("WOPR", Cat::Well, Opm::KeywordLocation{});
+    global.namedEntity("PROD1");
+
+    auto lgr = Node("WOPR", Cat::Well, Opm::KeywordLocation{});
+    lgr.namedEntity("PROD1");
+    lgr.lgr(Opm::EclIO::lgr_info{ "LGR1", {0, 0, 0} });
+
+    BOOST_CHECK(global < lgr);
+    BOOST_CHECK(!(lgr < global));
+}
+
+BOOST_AUTO_TEST_SUITE_END() // LGR

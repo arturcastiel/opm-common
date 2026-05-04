@@ -187,4 +187,23 @@ BOOST_AUTO_TEST_CASE(Completion)
     }
 }
 
+BOOST_AUTO_TEST_CASE(LGR_category_routing)
+{
+    using Cat = Opm::EclIO::SummaryNode::Category;
+    using Opm::EclIO::SummaryNode;
+
+    BOOST_CHECK(SummaryNode::category_from_keyword("LWOPR")    == Cat::Well);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LWBHP")    == Cat::Well);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LCOFR")    == Cat::Connection);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LCWFR")    == Cat::Connection);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LBPR")     == Cat::Block);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LBSOIL")   == Cat::Block);
+    BOOST_CHECK(SummaryNode::category_from_keyword("LLINEARS") == Cat::Miscellaneous);
+
+    // Regression: existing keywords unchanged
+    BOOST_CHECK(SummaryNode::category_from_keyword("WOPR") == Cat::Well);
+    BOOST_CHECK(SummaryNode::category_from_keyword("BPR")  == Cat::Block);
+    BOOST_CHECK(SummaryNode::category_from_keyword("COFR") == Cat::Connection);
+}
+
 BOOST_AUTO_TEST_SUITE_END() // Category

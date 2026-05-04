@@ -31,6 +31,15 @@ namespace Opm { namespace EclIO {
     struct lgr_info {
         std::string name {};
         std::array<int, 3> ijk {};
+
+        bool operator==(const lgr_info&) const = default;
+
+        template<class Serializer>
+        void serializeOp(Serializer& s)
+        {
+            s(name);
+            s(ijk);
+        }
     };
 
 struct SummaryNode {
