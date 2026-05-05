@@ -22,10 +22,19 @@
 #include <boost/test/unit_test.hpp>
 
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
+#include <opm/input/eclipse/EclipseState/EclipseState.hpp>
+
+#include <opm/input/eclipse/Python/Python.hpp>
+
+#include <opm/input/eclipse/Schedule/Schedule.hpp>
+
+#include <opm/input/eclipse/Deck/Deck.hpp>
+#include <opm/input/eclipse/Parser/Parser.hpp>
 
 #include <opm/io/eclipse/SummaryNode.hpp>
 
 #include <initializer_list>
+#include <memory>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -267,3 +276,291 @@ BOOST_AUTO_TEST_CASE(serialization_test_object_sets_flag)
 }
 
 BOOST_AUTO_TEST_SUITE_END() // NoSumLgr
+
+// =====================================================================
+// Deck-parsing integration tests using the two LGR .DATA files.
+// Exercises keywordLW / keywordLC / keywordLB + handleKW L-prefix dispatch
+// added in PR01. Tests that SummaryConfig correctly populates lgr_ on nodes
+// produced from real deck keywords.
+// =====================================================================
+
+BOOST_AUTO_TEST_SUITE(LGR_SummaryConfig_Deck)
+
+namespace {
+
+Opm::SummaryConfig makeSummaryConfig(const std::string& path)
+{
+    const auto deck  = Opm::Parser{}.parseFile(path);
+    const auto es    = Opm::EclipseState { deck };
+    const auto sched = Opm::Schedule { deck, es, std::make_shared<Opm::Python>() };
+    return Opm::SummaryConfig { deck, sched, es.fieldProps(), es.aquifer() };
+}
+
+} // anonymous namespace
+
+// --- 1LGR deck: INJ in LGR1, PROD in global grid ---
+
+BOOST_AUTO_TEST_CASE(lgr_1lgr_lw_node_populated)
+{
+    // LWBHP 'LGR1' 'INJ' / — should produce one Well node with lgr_.name=="LGR1"
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-1LGR.DATA");
+    const auto hits = cfg.keywords("LWBHP");
+
+    BOOST_REQUIRE_EQUAL(hits.size(), 1U);
+    BOOST_REQUIRE(hits[0].lgr().has_value());
+    BOOST_CHECK_EQUAL(hits[0].lgr()->name,   "LGR1");
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[0], 0);   // LW* sentinel: whole well
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[1], 0);
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[2], 0);
+    BOOST_CHECK_EQUAL(hits[0].namedEntity(), "INJ");
+    BOOST_CHECK(hits[0].category() == Opm::SummaryConfigNode::Category::Well);
+}
+
+BOOST_AUTO_TEST_CASE(lgr_1lgr_lc_node_populated)
+{
+    // LCGFR 'LGR1' 'INJ' 2 2 1 / — should produce one Connection node
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-1LGR.DATA");
+    const auto hits = cfg.keywords("LCGFR");
+
+    BOOST_REQUIRE_EQUAL(hits.size(), 1U);
+    BOOST_REQUIRE(hits[0].lgr().has_value());
+    BOOST_CHECK_EQUAL(hits[0].lgr()->name,   "LGR1");
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[0], 2);   // explicit coords from deck
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[1], 2);
+    BOOST_CHECK_EQUAL(hits[0].lgr()->ijk[2], 1);
+    BOOST_CHECK_EQUAL(hits[0].namedEntity(), "INJ");
+    BOOST_CHECK(hits[0].category() == Opm::SummaryConfigNode::Category::Connection);
+}
+
+BOOST_AUTO_TEST_CASE(lgr_1lgr_lb_node_populated)
+{
+    // LBPR 'LGR1' 2 2 1 / — should produce one Block node
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-1LGR.DATA");
+    const auto hits = cfg.keywords("LBPR");
+
+    // 1LGR deck requests LBPR for multiple cells; at minimum one at (2,2,1)
+    BOOST_CHECK(!hits.empty());
+    const auto it = std::find_if(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.lgr().has_value()
+                && n.lgr()->name   == "LGR1"
+                && n.lgr()->ijk[0] == 2
+                && n.lgr()->ijk[1] == 2
+                && n.lgr()->ijk[2] == 1;
+        });
+    BOOST_CHECK(it != hits.end());
+    BOOST_CHECK(it->category() == Opm::SummaryConfigNode::Category::Block);
+}
+
+BOOST_AUTO_TEST_CASE(lgr_1lgr_global_well_has_no_lgr)
+{
+    // PROD is on the global grid — its WOPR node must have no lgr (regression)
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-1LGR.DATA");
+    const auto hits = cfg.keywords("WOPR");
+
+    const auto it = std::find_if(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.namedEntity() == "PROD";
+        });
+    BOOST_REQUIRE(it != hits.end());
+    BOOST_CHECK(!it->lgr().has_value());
+}
+
+// --- 2LGR deck: INJ in LGR1, PROD in LGR2 — Fix4 dedup stress ---
+
+BOOST_AUTO_TEST_CASE(lgr_2lgr_lw_two_nodes_not_deduped)
+{
+    // LWBHP has 'LGR1'/'INJ' AND 'LGR2'/'PROD' — must produce 2 distinct nodes
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-2LGR.DATA");
+    const auto hits = cfg.keywords("LWBHP");
+
+    BOOST_REQUIRE_EQUAL(hits.size(), 2U);
+    BOOST_CHECK(hits[0] != hits[1]);
+
+    // One for each LGR
+    const bool has_lgr1 = std::any_of(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.lgr().has_value() && n.lgr()->name == "LGR1"
+                && n.namedEntity() == "INJ";
+        });
+    const bool has_lgr2 = std::any_of(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.lgr().has_value() && n.lgr()->name == "LGR2"
+                && n.namedEntity() == "PROD";
+        });
+    BOOST_CHECK(has_lgr1);
+    BOOST_CHECK(has_lgr2);
+}
+
+BOOST_AUTO_TEST_CASE(lgr_2lgr_lb_dedup_by_lgr_name)
+{
+    // LBPR 'LGR1' 2 2 1 / AND 'LGR2' 2 2 1 /
+    // Same keyword + same ijk — ONLY lgr_.name differs.
+    // Without lgr_ in Block operator==, second node is silently dropped.
+    const auto cfg  = makeSummaryConfig("LGR-WELL-3X3-2LGR.DATA");
+    const auto hits = cfg.keywords("LBPR");
+
+    // Expect at least the two (2,2,1) nodes — one per LGR
+    const auto lgr1_221 = std::count_if(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.lgr().has_value() && n.lgr()->name == "LGR1"
+                && n.lgr()->ijk[0] == 2 && n.lgr()->ijk[1] == 2 && n.lgr()->ijk[2] == 1;
+        });
+    const auto lgr2_221 = std::count_if(hits.begin(), hits.end(),
+        [](const Opm::SummaryConfigNode& n) {
+            return n.lgr().has_value() && n.lgr()->name == "LGR2"
+                && n.lgr()->ijk[0] == 2 && n.lgr()->ijk[1] == 2 && n.lgr()->ijk[2] == 1;
+        });
+    BOOST_CHECK_EQUAL(lgr1_221, 1);
+    BOOST_CHECK_EQUAL(lgr2_221, 1);
+}
+
+BOOST_AUTO_TEST_SUITE_END() // LGR_SummaryConfig_Deck
+
+// =====================================================================
+// Inline schema tests — parse LW*/LC*/LB* from a minimal string deck.
+// These catch schema bugs (wrong "size", missing items, bad regex) without
+// needing .DATA files on disk. Any keyword-recognition or record-format
+// regression shows up here before Jenkins.
+// =====================================================================
+
+BOOST_AUTO_TEST_SUITE(LGR_Schema_Inline)
+
+namespace {
+
+// Parse a minimal complete deck from an inline string and return SummaryConfig.
+// The RUNSPEC/GRID/PROPS/SCHEDULE sections are minimal stubs so EclipseState
+// can be constructed without needing any external files.
+Opm::SummaryConfig parseSummarySection(const std::string& summary_body)
+{
+    const std::string deck_str =
+        "RUNSPEC\n"
+        "TITLE\n"
+        " LGR_SCHEMA_TEST /\n"
+        "DIMENS\n"
+        " 3 3 1 /\n"
+        "WELLDIMS\n"
+        " 4 1 1 4 /\n"
+        "START\n"
+        " 1 JAN 2020 /\n"
+        "GRID\n"
+        "DXV\n"
+        " 3*100.0 /\n"
+        "DYV\n"
+        " 3*100.0 /\n"
+        "DZV\n"
+        " 1*10.0 /\n"
+        "DEPTHZ\n"
+        " 16*2000.0 /\n"
+        "PORO\n"
+        " 9*0.3 /\n"
+        "PROPS\n"
+        "SOLUTION\n"
+        "SUMMARY\n"
+        + summary_body +
+        "\nSCHEDULE\n"
+        // WELSPECL: WELL GROUP LGR I J DEPTH PHASE ...
+        "WELSPECL\n"
+        " 'WELL1'  'G'  'LGR1'  2 2  2000.0  'OIL' /\n"
+        " 'WELL2'  'G'  'LGR2'  3 3  2000.0  'OIL' /\n"
+        " 'INJ'    'G'  'LGR1'  1 1  2000.0  'WAT' /\n"
+        " 'PROD'   'G'  'LGR2'  3 3  2000.0  'OIL' /\n"
+        "/\n"
+        "DATES\n"
+        " 1 FEB 2020 /\n"
+        "/\n"
+        "END\n";
+
+    const auto deck  = Opm::Parser{}.parseString(deck_str);
+    const auto es    = Opm::EclipseState { deck };
+    const auto sched = Opm::Schedule { deck, es, std::make_shared<Opm::Python>() };
+    return Opm::SummaryConfig { deck, sched, es.fieldProps(), es.aquifer() };
+}
+
+} // anonymous namespace
+
+BOOST_AUTO_TEST_CASE(lw_single_record_produces_node)
+{
+    // Verify that LWBHP with one LGR/well record produces exactly one node.
+    // Catches: "size":1 regression (would throw before reaching keywordLW),
+    // AND the lgr_well_tag matching (would silently produce zero nodes).
+    const auto cfg = parseSummarySection(
+        "LWBHP\n"
+        " 'LGR1'  'WELL1' /\n"
+        "/\n"
+    );
+
+    const auto nodes = cfg.keywords("LWBHP");
+    BOOST_REQUIRE_EQUAL(nodes.size(), 1u);
+    BOOST_CHECK_EQUAL(nodes[0].namedEntity(), "WELL1");
+    BOOST_REQUIRE(nodes[0].lgr().has_value());
+    BOOST_CHECK_EQUAL(nodes[0].lgr()->name, "LGR1");
+}
+
+BOOST_AUTO_TEST_CASE(lw_multi_record_produces_two_nodes)
+{
+    // Verify that LWBHP with two records (LGR1/WELL1, LGR2/WELL2) produces two nodes.
+    // Catches: "size":1 bug — schema must be table format (no "size" field).
+    const auto cfg = parseSummarySection(
+        "LWBHP\n"
+        " 'LGR1'  'WELL1' /\n"
+        " 'LGR2'  'WELL2' /\n"
+        "/\n"
+    );
+
+    const auto nodes = cfg.keywords("LWBHP");
+    BOOST_REQUIRE_EQUAL(nodes.size(), 2u);
+    BOOST_CHECK_EQUAL(nodes[0].lgr()->name, "LGR1");
+    BOOST_CHECK_EQUAL(nodes[1].lgr()->name, "LGR2");
+}
+
+BOOST_AUTO_TEST_CASE(lc_multi_record_produces_nodes)
+{
+    // Verify that LCOFR with multiple records (LGR + well + I J K) produces nodes.
+    const auto cfg = parseSummarySection(
+        "LCOFR\n"
+        " 'LGR1'  'WELL1'  1 1 1 /\n"
+        " 'LGR1'  'WELL1'  2 1 1 /\n"
+        "/\n"
+    );
+
+    const auto nodes = cfg.keywords("LCOFR");
+    BOOST_CHECK_EQUAL(nodes.size(), 2u);
+    for (const auto& node : nodes) {
+        BOOST_CHECK(node.lgr().has_value());
+        BOOST_CHECK_EQUAL(node.lgr()->name, "LGR1");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(lb_multi_record_produces_nodes)
+{
+    // Verify that LBPR with multiple records (LGR + I J K) produces nodes.
+    // keywordLB has no well lookup — tests pure schema parsing.
+    const auto cfg = parseSummarySection(
+        "LBPR\n"
+        " 'LGR1'  1 1 1 /\n"
+        " 'LGR1'  2 2 1 /\n"
+        "/\n"
+    );
+
+    const auto nodes = cfg.keywords("LBPR");
+    BOOST_REQUIRE_EQUAL(nodes.size(), 2u);
+    BOOST_CHECK(nodes[0].lgr().has_value());
+    BOOST_CHECK_EQUAL(nodes[0].lgr()->name, "LGR1");
+}
+
+BOOST_AUTO_TEST_CASE(lw_regex_matches_lwstat)
+{
+    // Verify the LW.+ regex covers LWSTAT and produces a node.
+    const auto cfg = parseSummarySection(
+        "LWSTAT\n"
+        " 'LGR1'  'INJ' /\n"
+        "/\n"
+    );
+
+    const auto nodes = cfg.keywords("LWSTAT");
+    BOOST_REQUIRE_EQUAL(nodes.size(), 1u);
+    BOOST_CHECK_EQUAL(nodes[0].lgr()->name, "LGR1");
+}
+
+BOOST_AUTO_TEST_SUITE_END() // LGR_Schema_Inline
