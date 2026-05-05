@@ -124,6 +124,42 @@ BOOST_AUTO_TEST_SUITE_END()     // Total
 
 BOOST_AUTO_TEST_SUITE_END()     // Type
 
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_SUITE(Category)
+
+BOOST_AUTO_TEST_CASE(LWOPR_is_Well)
+{
+    using Cat = Opm::SummaryConfigNode::Category;
+    BOOST_CHECK(Opm::parseKeywordCategory("LWOPR") == Cat::Well);
+}
+
+BOOST_AUTO_TEST_CASE(LCOFR_is_Connection)
+{
+    using Cat = Opm::SummaryConfigNode::Category;
+    BOOST_CHECK(Opm::parseKeywordCategory("LCOFR") == Cat::Connection);
+}
+
+BOOST_AUTO_TEST_CASE(LBPR_is_Block)
+{
+    using Cat = Opm::SummaryConfigNode::Category;
+    BOOST_CHECK(Opm::parseKeywordCategory("LBPR") == Cat::Block);
+}
+
+BOOST_AUTO_TEST_CASE(WOPR_is_Well)
+{
+    using Cat = Opm::SummaryConfigNode::Category;
+    BOOST_CHECK(Opm::parseKeywordCategory("WOPR") == Cat::Well);
+}
+
+BOOST_AUTO_TEST_CASE(unknown_L_is_Misc)
+{
+    using Cat = Opm::SummaryConfigNode::Category;
+    BOOST_CHECK(Opm::parseKeywordCategory("LXYZ") == Cat::Miscellaneous);
+}
+
+BOOST_AUTO_TEST_SUITE_END()     // Category
+
 BOOST_AUTO_TEST_SUITE_END()     // ParseKeywords
 
 // =====================================================================
@@ -211,3 +247,23 @@ BOOST_AUTO_TEST_CASE(lgr_no_lgr_sorts_before_lgr)
 }
 
 BOOST_AUTO_TEST_SUITE_END() // LGR
+
+// =====================================================================
+
+BOOST_AUTO_TEST_SUITE(NoSumLgr)
+
+BOOST_AUTO_TEST_CASE(default_is_false)
+{
+    // A default-constructed SummaryConfig has noSumLgr_ == false
+    Opm::SummaryConfig sc;
+    BOOST_CHECK(!sc.noSumLgr());
+}
+
+BOOST_AUTO_TEST_CASE(serialization_test_object_sets_flag)
+{
+    // serializationTestObject() sets noSumLgr_ = true to exercise serialization
+    const auto sc = Opm::SummaryConfig::serializationTestObject();
+    BOOST_CHECK(sc.noSumLgr());
+}
+
+BOOST_AUTO_TEST_SUITE_END() // NoSumLgr
