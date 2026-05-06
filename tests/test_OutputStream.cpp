@@ -2546,4 +2546,169 @@ BOOST_AUTO_TEST_CASE(Formatted_Restarted)
     }
 }
 
+BOOST_AUTO_TEST_CASE(LGR_Arrays_Written_When_LGR_Vectors_Present)
+{
+    // Verify that LGRS/NUMLX/NUMLY/NUMLZ appear after NUMS and before UNITS,
+    // and that LGRNAMES/LGRVEC/LGRTIMES are written after STARTDAT, when
+    // at least one LGR vector is present.
+
+    using SMSpec   = ::Opm::EclIO::OutputStream::SummarySpecification;
+    using LgrInfo  = ::Opm::EclIO::lgr_info;
+
+    const auto rset     = RSet("LGR_CASE");
+    const auto fmt      = ::Opm::EclIO::OutputStream::Formatted{ false };
+    const auto cartDims = std::array<int,3>{ 10, 10, 5 };
+
+    // Mix of non-LGR and LGR vectors. Use 5-arg add() for ALL entries so
+    // lgrs/numlx/numly/numlz stay parallel to keywords.
+    auto prm = SMSpec::Parameters{};
+    prm.add("TIME",  noWGName(), noNum(),  "DAYS",  std::nullopt);
+    prm.add("WBHP",  "PROD01",  noNum(),  "BARSA", std::nullopt);
+    prm.add("LWBHP", "PROD01",  noNum(),  "BARSA",
+            LgrInfo{"LGR1", {2, 3, 4}});
+    prm.add("LWBHP", "PROD02",  noNum(),  "BARSA",
+            LgrInfo{"LGR1", {5, 6, 7}});
+
+    // Two LGR vectors in "LGR1", zero in anything else.
+    // LGRVEC("LGR1") = 2 (TIME+YEARS in ROOT.LGR) + 2 (appearances) = 4.
+
+    {
+        auto smspec = SMSpec{
+            rset, fmt, SMSpec::UnitConvention::Metric, cartDims, noRestart(),
+            start(2025, 1, 1, 0, 0, 0),
+            start(2025, 1, 1, 0, 0, 0)
+        };
+
+        smspec.write(prm, /* simulationFinished = */ false,
+                     /* currentStep = */ 5, /* rprtrst_basic = */ 0);
+    }
+
+    const auto fname = ::Opm::EclIO::OutputStream::outputFileName(rset, "SMSPEC");
+    auto smspec = ::Opm::EclIO::EclFile{fname};
+
+    // ── Array order ──────────────────────────────────────────────────────────
+    // Eclipse reference: NUMS → LGRS → NUMLX → NUMLY → NUMLZ → UNITS → STARTDAT
+    //                    → LGRNAMES → LGRVEC → LGRTIMES → RUNTIMEI
+    {
+        const auto vectors = smspec.getList();
+        const auto expect_vectors = std::vector<Opm::EclIO::EclFile::EclEntry>{
+            Opm::EclIO::EclFile::EclEntry{"INTEHEAD", Opm::EclIO::eclArrType::INTE, 2},
+            Opm::EclIO::EclFile::EclEntry{"RESTART",  Opm::EclIO::eclArrType::CHAR, 9},
+            Opm::EclIO::EclFile::EclEntry{"DIMENS",   Opm::EclIO::eclArrType::INTE, 6},
+            Opm::EclIO::EclFile::EclEntry{"KEYWORDS", Opm::EclIO::eclArrType::CHAR, 4},
+            Opm::EclIO::EclFile::EclEntry{"WGNAMES",  Opm::EclIO::eclArrType::CHAR, 4},
+            Opm::EclIO::EclFile::EclEntry{"NUMS",     Opm::EclIO::eclArrType::INTE, 4},
+            Opm::EclIO::EclFile::EclEntry{"LGRS",     Opm::EclIO::eclArrType::CHAR, 4},
+            Opm::EclIO::EclFile::EclEntry{"NUMLX",    Opm::EclIO::eclArrType::INTE, 4},
+            Opm::EclIO::EclFile::EclEntry{"NUMLY",    Opm::EclIO::eclArrType::INTE, 4},
+            Opm::EclIO::EclFile::EclEntry{"NUMLZ",    Opm::EclIO::eclArrType::INTE, 4},
+            Opm::EclIO::EclFile::EclEntry{"UNITS",    Opm::EclIO::eclArrType::CHAR, 4},
+            Opm::EclIO::EclFile::EclEntry{"STARTDAT", Opm::EclIO::eclArrType::INTE, 6},
+            Opm::EclIO::EclFile::EclEntry{"LGRNAMES", Opm::EclIO::eclArrType::CHAR, 1},
+            Opm::EclIO::EclFile::EclEntry{"LGRVEC",   Opm::EclIO::eclArrType::INTE, 1},
+            Opm::EclIO::EclFile::EclEntry{"LGRTIMES", Opm::EclIO::eclArrType::INTE, 1},
+            Opm::EclIO::EclFile::EclEntry{"RUNTIMEI", Opm::EclIO::eclArrType::INTE, 50},
+        };
+
+        BOOST_CHECK_EQUAL_COLLECTIONS(vectors.begin(), vectors.end(),
+                                      expect_vectors.begin(), expect_vectors.end());
+    }
+
+    smspec.loadData();
+
+    // ── LGRS: blanks for non-LGR, "LGR1" for LGR vectors ────────────────────
+    {
+        const auto& lgrs   = smspec.get<std::string>("LGRS");
+        const auto  expect = std::vector<std::string>{ "", "", "LGR1", "LGR1" };
+        BOOST_CHECK_EQUAL_COLLECTIONS(lgrs.begin(), lgrs.end(),
+                                      expect.begin(), expect.end());
+    }
+
+    // ── NUMLX/NUMLY/NUMLZ: zeros for non-LGR, ijk for LGR ───────────────────
+    {
+        const auto& numlx  = smspec.get<int>("NUMLX");
+        const auto  expect = std::vector<int>{ 0, 0, 2, 5 };
+        BOOST_CHECK_EQUAL_COLLECTIONS(numlx.begin(), numlx.end(),
+                                      expect.begin(), expect.end());
+    }
+    {
+        const auto& numly  = smspec.get<int>("NUMLY");
+        const auto  expect = std::vector<int>{ 0, 0, 3, 6 };
+        BOOST_CHECK_EQUAL_COLLECTIONS(numly.begin(), numly.end(),
+                                      expect.begin(), expect.end());
+    }
+    {
+        const auto& numlz  = smspec.get<int>("NUMLZ");
+        const auto  expect = std::vector<int>{ 0, 0, 4, 7 };
+        BOOST_CHECK_EQUAL_COLLECTIONS(numlz.begin(), numlz.end(),
+                                      expect.begin(), expect.end());
+    }
+
+    // ── LGRNAMES: unique sorted LGR names ────────────────────────────────────
+    {
+        const auto& lgrnames = smspec.get<std::string>("LGRNAMES");
+        const auto  expect   = std::vector<std::string>{ "LGR1" };
+        BOOST_CHECK_EQUAL_COLLECTIONS(lgrnames.begin(), lgrnames.end(),
+                                      expect.begin(), expect.end());
+    }
+
+    // ── LGRVEC: 2 (TIME+YEARS in ROOT.LGR) + 2 (appearances of LGR1) = 4 ───
+    {
+        const auto& lgrvec = smspec.get<int>("LGRVEC");
+        const auto  expect = std::vector<int>{ 4 };
+        BOOST_CHECK_EQUAL_COLLECTIONS(lgrvec.begin(), lgrvec.end(),
+                                      expect.begin(), expect.end());
+    }
+
+    // ── LGRTIMES: currentStep for each LGR ───────────────────────────────────
+    {
+        const auto& lgrtimes = smspec.get<int>("LGRTIMES");
+        const auto  expect   = std::vector<int>{ 5 };
+        BOOST_CHECK_EQUAL_COLLECTIONS(lgrtimes.begin(), lgrtimes.end(),
+                                      expect.begin(), expect.end());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(LGR_Arrays_Absent_When_No_LGR_Vectors)
+{
+    // Guard: when all vectors are non-LGR (4-arg add only), the 7 new LGR
+    // arrays must be completely absent from the SMSPEC file.
+
+    using SMSpec = ::Opm::EclIO::OutputStream::SummarySpecification;
+
+    const auto rset     = RSet("NOLGR_CASE");
+    const auto fmt      = ::Opm::EclIO::OutputStream::Formatted{ false };
+    const auto cartDims = std::array<int,3>{ 10, 10, 5 };
+
+    {
+        auto smspec = SMSpec{
+            rset, fmt, SMSpec::UnitConvention::Metric, cartDims, noRestart(),
+            start(2025, 1, 1, 0, 0, 0),
+            start(2025, 1, 1, 0, 0, 0)
+        };
+
+        smspec.write(summaryParameters(), false, 0, 0);
+    }
+
+    const auto fname = ::Opm::EclIO::OutputStream::outputFileName(rset, "SMSPEC");
+    auto smspec = ::Opm::EclIO::EclFile{fname};
+
+    const auto vectors = smspec.getList();
+
+    const auto hasKey = [&vectors](const std::string& key) {
+        return std::any_of(vectors.begin(), vectors.end(),
+                           [&key](const Opm::EclIO::EclFile::EclEntry& e) {
+                               return std::get<0>(e) == key;
+                           });
+    };
+
+    BOOST_CHECK_MESSAGE(! hasKey("LGRS"),     "LGRS must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("NUMLX"),    "NUMLX must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("NUMLY"),    "NUMLY must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("NUMLZ"),    "NUMLZ must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("LGRNAMES"), "LGRNAMES must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("LGRVEC"),   "LGRVEC must be absent when no LGR vectors present");
+    BOOST_CHECK_MESSAGE(! hasKey("LGRTIMES"), "LGRTIMES must be absent when no LGR vectors present");
+}
+
 BOOST_AUTO_TEST_SUITE_END() // Class_SummarySpecification

@@ -753,6 +753,29 @@ Parameters::add(const std::string& keyword,
     this->units   .emplace_back(unit);
 }
 
+void
+Opm::EclIO::OutputStream::SummarySpecification::
+Parameters::add(const std::string&                          keyword,
+                const std::string&                          wgname,
+                const int                                   num,
+                const std::string&                          unit,
+                const std::optional<Opm::EclIO::lgr_info>& lgr)
+{
+    this->add(keyword, wgname, num, unit);
+
+    if (lgr.has_value()) {
+        this->lgrs.emplace_back(lgr->name);
+        this->numlx.push_back(lgr->ijk[0]);
+        this->numly.push_back(lgr->ijk[1]);
+        this->numlz.push_back(lgr->ijk[2]);
+    } else {
+        this->lgrs.emplace_back();  // 8-space default via PaddedOutputString<8>
+        this->numlx.push_back(0);
+        this->numly.push_back(0);
+        this->numlz.push_back(0);
+    }
+}
+
 Opm::EclIO::OutputStream::SummarySpecification::
 SummarySpecification(const ResultSet&            rset,
                      const Formatted&            fmt,
@@ -824,9 +847,60 @@ SummarySpecification::write(const Parameters& params,
     smspec.write("KEYWORDS", params.keywords);
     smspec.write("WGNAMES",  params.wgnames);
     smspec.write("NUMS",     params.nums);
+
+    // LGR metadata arrays — written only when at least one LGR vector is present
+    // Eclipse reference order: NUMS → LGRS → NUMLX → NUMLY → NUMLZ → UNITS → STARTDAT
+    const bool has_lgr = !params.lgrs.empty() &&
+        std::any_of(params.lgrs.begin(), params.lgrs.end(),
+                    [](const PaddedOutputString<8>& s) {
+                        return std::string(s.c_str()) != "        ";
+                    });
+
+    auto lgrnames = std::vector<PaddedOutputString<8>>{};
+    if (has_lgr) {
+        smspec.write("LGRS",  params.lgrs);
+        smspec.write("NUMLX", params.numlx);
+        smspec.write("NUMLY", params.numly);
+        smspec.write("NUMLZ", params.numlz);
+    }
+
     smspec.write("UNITS",    params.units);
 
     smspec.write("STARTDAT", makeStartDate(this->startDate_));
+
+    if (has_lgr) {
+        // LGRNAMES: sorted unique non-blank LGR names
+        // Collect as std::string (PaddedOutputString has no operator< or operator==)
+        auto lgrname_strs = std::vector<std::string>{};
+        for (const auto& s : params.lgrs) {
+            const auto name = std::string(s.c_str());
+            if (name != "        ") {
+                lgrname_strs.push_back(name);
+            }
+        }
+        std::sort(lgrname_strs.begin(), lgrname_strs.end());
+        lgrname_strs.erase(std::unique(lgrname_strs.begin(), lgrname_strs.end()),
+                           lgrname_strs.end());
+
+        for (const auto& name : lgrname_strs) {
+            lgrnames.emplace_back(name);
+        }
+        smspec.write("LGRNAMES", lgrnames);
+
+        // LGRVEC: per-LGR vector count = 2 (TIME+YEARS in ROOT.LGR) + count of this LGR in params.lgrs
+        auto lgrvec = std::vector<int>{};
+        for (const auto& lgr_name : lgrname_strs) {
+            int count = 2;
+            for (const auto& s : params.lgrs) {
+                if (std::string(s.c_str()) == lgr_name) { ++count; }
+            }
+            lgrvec.push_back(count);
+        }
+        smspec.write("LGRVEC", lgrvec);
+
+        // LGRTIMES: per-LGR current step (approximation; exact per-LGR tracking deferred)
+        smspec.write("LGRTIMES", std::vector<int>(lgrname_strs.size(), currentStep));
+    }
 
     // Create and write RUNTIMEI
     smspec.write("RUNTIMEI", makeRuntimei(simulationFinished, this->restartStep_,
