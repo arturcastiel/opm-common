@@ -65,10 +65,33 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
 namespace Opm {
 
 //! Which enthalpy model the P-H stack evaluates.
 enum class EnthalpyModel { caloric, eos_departure };
+
+//! Parse an enthalpy-model name ("caloric" / "eos_departure"); throws
+//! std::runtime_error on anything else. Lives beside the enum so every
+//! runtime-parameter consumer shares one parser.
+inline EnthalpyModel enthalpyModelFromString(const std::string_view name)
+{
+    if (name == "caloric")
+        return EnthalpyModel::caloric;
+    if (name == "eos_departure" || name == "eos-departure")
+        return EnthalpyModel::eos_departure;
+    throw std::runtime_error("unknown enthalpy model '" + std::string(name)
+                             + "' (valid: caloric, eos_departure)");
+}
+
+//! The canonical name of an enthalpy model (inverse of enthalpyModelFromString).
+inline std::string enthalpyModelToString(const EnthalpyModel model)
+{
+    return model == EnthalpyModel::caloric ? "caloric" : "eos_departure";
+}
 
 /*!
  * \brief Molar mixture enthalpy of a flashed compositional state, under the

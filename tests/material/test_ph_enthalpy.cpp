@@ -38,6 +38,7 @@
 
 #include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
+#include <opm/material/fluidsystems/GenericOilGasWaterFluidSystem.hpp>
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
@@ -277,3 +278,120 @@ BOOST_AUTO_TEST_CASE(CaloricSeamUnchanged)
 }
 
 BOOST_AUTO_TEST_SUITE_END() // DepartureModel
+
+// ────────────────────────────────────────────────────────────────────────────
+// The fluid-system enthalpy bridge: GenericOilGasWaterFluidSystem::enthalpy()
+// exposes the caloric model as SPECIFIC enthalpy [J/kg] through the energy
+// module's duck contract. The bridge divides the molar enthalpy by the phase
+// average molar mass; component molar masses are stored in g/mol (kg/kmol),
+// consistent with the fluid system's m^3/kmol EoS volume basis.
+// ────────────────────────────────────────────────────────────────────────────
+BOOST_AUTO_TEST_SUITE(FluidSystemBridge)
+
+namespace {
+
+using EOSTypeB = Opm::CompositionalConfig::EOSType;
+using FluidSystemGeneric = Opm::GenericOilGasWaterFluidSystem<Scalar, 2, false>;
+
+// idempotent per-case setup: register the F1 components on the generic fluid
+// system (its own conventions: molar mass g/mol, Vc m^3/kmol) and enable the
+// enthalpy support from the component-name presets
+void setupGenericF1()
+{
+    using FS = FluidSystemGeneric;
+    static bool done = false;
+    if (!done) {
+        FS::init();
+        FS::addComponent(FS::ComponentParam{"C1", 16.043, 190.6, 4.60e6, 9.863e-2, 0.011});
+        FS::addComponent(FS::ComponentParam{"C10", 142.28, 617.7, 2.11e6, 6.098e-1, 0.489});
+        done = true;
+    }
+    FS::initEnthalpyFromComponentNames(); // exercises the preset name mapping
+}
+
+} // anonymous namespace
+
+// bridge value: specific enthalpy equals the hand-computed molar cp-integral
+// sum divided by the phase average molar mass (in kg/mol)
+BOOST_AUTO_TEST_CASE(SpecificEnthalpyMatchesHandComputation)
+{
+    using FS = FluidSystemGeneric;
+    setupGenericF1();
+
+    constexpr double T = 340.;
+    Opm::CompositionalFluidState<double, FS> fs;
+    fs.setTemperature(T);
+    // an arbitrary (non-equilibrium) two-phase composition: the bridge is a
+    // property evaluation; no flash is involved
+    fs.setMoleFraction(FS::oilPhaseIdx, 0, 0.30);
+    fs.setMoleFraction(FS::oilPhaseIdx, 1, 0.70);
+    fs.setMoleFraction(FS::gasPhaseIdx, 0, 0.95);
+    fs.setMoleFraction(FS::gasPhaseIdx, 1, 0.05);
+
+    FS::ParameterCache<double> paramCache(EOSTypeB::PR); // unused by the caloric bridge
+
+    const auto cpTable = Opm::PhMvpTest::f1CpTable(); // same presets, independent path
+    for (unsigned phaseIdx : {static_cast<unsigned>(FS::oilPhaseIdx),
+                              static_cast<unsigned>(FS::gasPhaseIdx)}) {
+        double hMolar = 0., mwKgPerMol = 0.;
+        for (int compIdx = 0; compIdx < 2; ++compIdx) {
+            const double w = Opm::getValue(fs.moleFraction(phaseIdx, compIdx));
+            hMolar += w * cpTable[compIdx].enthalpyIntegral(T, T0);
+            mwKgPerMol += w * FS::molarMass(compIdx) * 1e-3; // g/mol -> kg/mol
+        }
+        BOOST_CHECK_CLOSE(FS::enthalpy(fs, paramCache, phaseIdx), hMolar / mwKgPerMol, 1e-9); // [%]
+    }
+}
+
+// the datum survives the molar->specific conversion: h(T0) = 0 exactly
+BOOST_AUTO_TEST_CASE(BridgeDatum)
+{
+    using FS = FluidSystemGeneric;
+    setupGenericF1();
+
+    Opm::CompositionalFluidState<double, FS> fs;
+    fs.setTemperature(T0);
+    fs.setMoleFraction(FS::oilPhaseIdx, 0, 0.5);
+    fs.setMoleFraction(FS::oilPhaseIdx, 1, 0.5);
+    fs.setMoleFraction(FS::gasPhaseIdx, 0, 0.5);
+    fs.setMoleFraction(FS::gasPhaseIdx, 1, 0.5);
+
+    FS::ParameterCache<double> paramCache(EOSTypeB::PR);
+    BOOST_CHECK_SMALL(FS::enthalpy(fs, paramCache, FS::oilPhaseIdx), 1e-12);
+    BOOST_CHECK_SMALL(FS::enthalpy(fs, paramCache, FS::gasPhaseIdx), 1e-12);
+}
+
+// guards fail loudly: unknown component preset, and enthalpy() before the
+// data was set (probed on a separate template instantiation whose statics
+// are untouched by the other cases)
+BOOST_AUTO_TEST_CASE(GuardsFailLoudly)
+{
+    BOOST_CHECK_THROW(Opm::IdealGasCaloricData<double>::byName("XYZ"), std::runtime_error);
+
+    using FS3 = Opm::GenericOilGasWaterFluidSystem<Scalar, 3, false>;
+    FS3::init();
+    FS3::addComponent(FS3::ComponentParam{"A", 16., 190., 4.6e6, 9.9e-2, 0.01});
+    FS3::addComponent(FS3::ComponentParam{"B", 44., 304., 7.4e6, 9.4e-2, 0.22});
+    FS3::addComponent(FS3::ComponentParam{"C", 142., 617., 2.1e6, 6.1e-1, 0.49});
+
+    Opm::CompositionalFluidState<double, FS3> fs;
+    fs.setTemperature(300.);
+    for (int compIdx = 0; compIdx < 3; ++compIdx) {
+        fs.setMoleFraction(FS3::oilPhaseIdx, compIdx, 1./3.);
+        fs.setMoleFraction(FS3::gasPhaseIdx, compIdx, 1./3.);
+    }
+    FS3::ParameterCache<double> paramCache(EOSTypeB::PR);
+    BOOST_CHECK_THROW(FS3::enthalpy(fs, paramCache, FS3::oilPhaseIdx), std::runtime_error);
+}
+
+// the shared enthalpy-model parser: round-trips and loud failure
+BOOST_AUTO_TEST_CASE(EnthalpyModelStrings)
+{
+    BOOST_CHECK(Opm::enthalpyModelFromString("caloric") == Opm::EnthalpyModel::caloric);
+    BOOST_CHECK(Opm::enthalpyModelFromString("eos_departure") == Opm::EnthalpyModel::eos_departure);
+    BOOST_CHECK_EQUAL(Opm::enthalpyModelToString(Opm::EnthalpyModel::caloric), "caloric");
+    BOOST_CHECK_EQUAL(Opm::enthalpyModelToString(Opm::EnthalpyModel::eos_departure), "eos_departure");
+    BOOST_CHECK_THROW(Opm::enthalpyModelFromString("nonsense"), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_SUITE_END() // FluidSystemBridge

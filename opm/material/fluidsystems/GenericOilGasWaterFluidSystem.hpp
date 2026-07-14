@@ -31,6 +31,8 @@
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/Schedule/Schedule.hpp>
 
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
+#include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/eos/CubicEOS.hpp>
 #include <opm/material/fluidsystems/blackoilpvt/WaterPvtMultiplexer.hpp>
 #include <opm/material/fluidsystems/BaseFluidSystem.hpp>
@@ -41,6 +43,7 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -317,6 +320,84 @@ namespace Opm {
             return {};
         }
 
+        /*!
+         * \brief Enable enthalpy evaluation by supplying the ideal-gas
+         *        heat-capacity data (caloric model).
+         *
+         * This is what makes enthalpy() — and thereby the energy module's
+         * duck contract — usable on the compositional path. The EoS-departure
+         * extension is introduced with the P-H model wiring, where the EoS
+         * type becomes reachable from the evaluation context.
+         */
+        static void setEnthalpyData(const CpTable<Scalar, NumComp>& cpTable,
+                                    const Scalar refTemperature =
+                                        IdealGasCaloricData<Scalar>::referenceTemperature())
+        {
+            cp_table_ = cpTable;
+            enthalpy_ref_temperature_ = refTemperature;
+            enthalpy_data_set_ = true;
+        }
+
+        /*!
+         * \brief Convenience: build the heat-capacity table from the
+         *        registered component names via the IdealGasCaloricData
+         *        presets. Throws (naming the component) when no preset exists
+         *        — never a silent fallback.
+         */
+        static void initEnthalpyFromComponentNames()
+        {
+            assert(isConsistent());
+            CpTable<Scalar, NumComp> table;
+            for (int compIdx = 0; compIdx < NumComp; ++compIdx)
+                table[compIdx] = IdealGasCaloricData<Scalar>::byName(component_param_[compIdx].name);
+            setEnthalpyData(table);
+        }
+
+        //! whether setEnthalpyData()/initEnthalpyFromComponentNames() has run
+        static bool enthalpyDataIsSet()
+        { return enthalpy_data_set_; }
+
+        /*!
+         * \copydoc BaseFluidSystem::enthalpy
+         *
+         * SPECIFIC enthalpy [J/kg] of an oil/gas phase under the caloric
+         * model, zero at the configured reference temperature. Requires
+         * setEnthalpyData()/initEnthalpyFromComponentNames() to have run;
+         * throws otherwise (and for the water phase, which carries no
+         * compositional enthalpy model yet).
+         *
+         * The molar->specific conversion divides by the phase average molar
+         * mass; component molar masses are stored in g/mol (kg/kmol),
+         * consistent with the m^3/kmol volume basis of the EoS, hence the
+         * 1e-3 factor to kg/mol. This is the same enthalpy (per mole) that
+         * the isenthalpic flash inverts — flash and energy path agree by
+         * construction.
+         */
+        template <class FluidState, class LhsEval = typename FluidState::ValueType, class ParamCacheEval = LhsEval>
+        static LhsEval enthalpy(const FluidState& fluidState,
+                                const ParameterCache<ParamCacheEval>& /*paramCache*/,
+                                unsigned phaseIdx)
+        {
+            assert(isConsistent());
+            assert(phaseIdx < numPhases);
+
+            if (!enthalpy_data_set_) {
+                throw std::runtime_error("GenericOilGasWaterFluidSystem::enthalpy(): enthalpy data "
+                                         "not initialized - call setEnthalpyData() or "
+                                         "initEnthalpyFromComponentNames() first");
+            }
+            if (phaseIdx == oilPhaseIdx || phaseIdx == gasPhaseIdx) {
+                using ThisType = GenericOilGasWaterFluidSystem<Scalar, NumComp, enableWater>;
+                const auto hMolar = MixtureEnthalpy<Scalar, ThisType>::phaseEnthalpy(
+                    fluidState, phaseIdx, cp_table_, enthalpy_ref_temperature_); // [J/mol]
+                const LhsEval mwKgPerMol =
+                    decay<LhsEval>(fluidState.averageMolarMass(phaseIdx)) * 1e-3; // g/mol -> kg/mol
+                return decay<LhsEval>(hMolar) / mwKgPerMol;
+            }
+            throw std::runtime_error("GenericOilGasWaterFluidSystem::enthalpy(): the water phase "
+                                     "carries no compositional enthalpy model yet");
+        }
+
         //! \copydoc BaseFluidSystem::viscosity
         template <class FluidState, class LhsEval = typename FluidState::ValueType, class ParamCacheEval = LhsEval>
         static LhsEval viscosity(const FluidState& fluidState,
@@ -465,6 +546,10 @@ namespace Opm {
         static std::vector<Scalar> interaction_coefficients_;
         static std::array<Scalar, 5> lbc_coefficients_;
         static std::shared_ptr<WaterPvt> waterPvt_;
+        // caloric enthalpy support (see setEnthalpyData/enthalpy)
+        static CpTable<Scalar, NumComp> cp_table_;
+        static Scalar enthalpy_ref_temperature_;
+        static bool enthalpy_data_set_;
 
     public:
         static std::string printComponentParams() {
@@ -498,6 +583,19 @@ namespace Opm {
     template <class Scalar, int NumComp, bool enableWater>
     std::shared_ptr<WaterPvtMultiplexer<Scalar> >
     GenericOilGasWaterFluidSystem<Scalar, NumComp, enableWater>::waterPvt_;
+
+    template <class Scalar, int NumComp, bool enableWater>
+    CpTable<Scalar, NumComp>
+    GenericOilGasWaterFluidSystem<Scalar, NumComp, enableWater>::cp_table_{};
+
+    template <class Scalar, int NumComp, bool enableWater>
+    Scalar
+    GenericOilGasWaterFluidSystem<Scalar, NumComp, enableWater>::enthalpy_ref_temperature_ =
+        IdealGasCaloricData<Scalar>::referenceTemperature();
+
+    template <class Scalar, int NumComp, bool enableWater>
+    bool
+    GenericOilGasWaterFluidSystem<Scalar, NumComp, enableWater>::enthalpy_data_set_ = false;
 
 }
 #endif // OPM_GENERIC_OIL_GAS_WATER_FLUIDSYSTEM_HPP

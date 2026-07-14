@@ -36,6 +36,10 @@
 #define OPM_IDEAL_GAS_CALORIC_DATA_HPP
 
 #include <array>
+#include <cctype>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace Opm {
 
@@ -109,6 +113,32 @@ struct IdealGasCaloricData {
     //! carbon dioxide (CO2) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> carbonDioxide()
     { return {19.80, 7.344e-2, -5.602e-5, 1.715e-8}; }
+
+    /*!
+     * \brief Preset lookup by component name (deck-style aliases,
+     *        case-insensitive).
+     *
+     * Throws std::runtime_error naming the component when no preset exists:
+     * there is deliberately NO silent fallback — an unknown component must
+     * fail loudly rather than receive somebody else's heat capacity.
+     */
+    static ComponentCp<Scalar> byName(const std::string_view name)
+    {
+        std::string n(name);
+        for (auto& c : n)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+        if (n == "C1" || n == "CH4" || n == "METHANE")
+            return methane();
+        if (n == "C10" || n == "NC10" || n == "DECANE" || n == "N-DECANE")
+            return decane();
+        if (n == "CO2" || n == "CARBONDIOXIDE" || n == "CARBON-DIOXIDE" || n == "CARBON DIOXIDE")
+            return carbonDioxide();
+
+        throw std::runtime_error(
+            "IdealGasCaloricData: no ideal-gas heat-capacity preset for component '"
+            + std::string(name) + "' — supply coefficients explicitly");
+    }
 };
 
 } // namespace Opm
