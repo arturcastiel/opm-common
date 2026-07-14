@@ -31,6 +31,11 @@
  *        known temperature must be recovered. Fully synthetic: the target
  *        enthalpy is manufactured from the same model that is inverted, so
  *        every test carries its own ground truth.
+ *
+ * Circularity limit of the trick: a self-consistent error in the enthalpy
+ * model would cancel in the round-trip. The model's own correctness is
+ * established independently in test_ph_enthalpy.cpp (finite-difference,
+ * decomposition and ideal-gas-limit checks); this file tests the INVERSION.
  */
 #include "config.h"
 
@@ -79,8 +84,8 @@ namespace {
 
 const Scalar T0 = Opm::MvpCpData<Scalar>::referenceTemperature();
 
-constexpr double PT_TOLERANCE = 1.e-8;
-constexpr double ROUNDTRIP_TOLERANCE = 1.e-3; // [K] on the recovered temperature
+constexpr double PT_TOLERANCE = 1.e-8;        // inner isothermal flash: fugacity-ratio residual
+constexpr double ROUNDTRIP_TOLERANCE = 1.e-3; // [K] outer acceptance bound on the recovered temperature
 
 PhFlashF1::Config makeConfigF1(const EnthalpyModel model)
 {
@@ -135,7 +140,9 @@ BOOST_AUTO_TEST_CASE(RoundTripCaloricF1)
 // inner flash irrelevant to the residual).
 BOOST_AUTO_TEST_CASE(RoundTripDepartureF1)
 {
-    for (const double Tstar : {260., 300., 340., 380.}) {
+    // same point spread as the caloric case, including the 200 K single-phase
+    // liquid point — the departure term is largest exactly there
+    for (const double Tstar : {200., 260., 300., 340., 380.}) {
         const double hSpec = manufactureHspecF1(f1Pressure, Tstar, EnthalpyModel::eos_departure);
         const double T = recoverTemperatureF1(f1Pressure, hSpec, EnthalpyModel::eos_departure);
         BOOST_CHECK_MESSAGE(std::abs(T - Tstar) < ROUNDTRIP_TOLERANCE,
@@ -148,14 +155,10 @@ BOOST_AUTO_TEST_CASE(RoundTripDepartureF1)
 BOOST_AUTO_TEST_CASE(RoundTripTernaryF2)
 {
     PhFlashF2::Config cfg;
-    // component order of ThreeComponentFluidSystem: Comp0 = CO2, Comp1 = C1,
-    // Comp2 = nC10
-    cfg.cpTable = {Opm::MvpCpData<Scalar>::carbonDioxide(),
-                   Opm::MvpCpData<Scalar>::methane(),
-                   Opm::MvpCpData<Scalar>::decane()};
-    // tighter bracket around the known solution: the bounds are full inner
-    // flashes, and this ternary/pressure combination is only exercised near
-    // its canonical point
+    cfg.cpTable = Opm::PhMvpTest::f2CpTable(); // component order compile-time asserted
+    // tighter bracket around the known solution — a precaution, not a
+    // measured necessity: the bounds are full inner flashes, and this
+    // ternary/pressure combination is only exercised near its canonical point
     cfg.tempMin = 250.;
     cfg.tempMax = 500.;
 

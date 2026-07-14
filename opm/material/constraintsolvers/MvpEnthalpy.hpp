@@ -70,6 +70,14 @@ namespace Opm {
 //! Which enthalpy model the P-H stack evaluates.
 enum class EnthalpyModel { caloric, eos_departure };
 
+/*!
+ * \brief Molar mixture enthalpy of a flashed compositional state, under the
+ *        caloric (ideal-gas) or EoS-consistent departure model — the property
+ *        the isenthalpic (P-H) flash inverts for temperature.
+ *
+ * See the file documentation for the model definitions, the caloric
+ * split-cancellation property, and the unit/datum conventions.
+ */
 template <class Scalar, class FluidSystem>
 struct MvpEnthalpy {
     static constexpr int numComponents = FluidSystem::numComponents;

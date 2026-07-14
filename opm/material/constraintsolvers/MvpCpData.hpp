@@ -92,10 +92,11 @@ struct MvpCpData {
     // The coefficients below follow the standard ideal-gas heat-capacity
     // polynomial tabulations cp = c0 + c1*T + c2*T^2 + c3*T^3 (cf. Poling,
     // Prausnitz & O'Connell, "The Properties of Gases and Liquids"), with a
-    // nominal fit validity of roughly 273-1500 K. Within this module they are
-    // used for the INTERNAL CONSISTENCY of the P-H stack (the isenthalpic
-    // round-trip manufactures its target enthalpy from the same table);
-    // verify against a primary source before any quantitative external use.
+    // nominal fit validity of roughly 273-1500 K. Within the P-H stack they
+    // are self-consistent by construction (the isenthalpic round-trip
+    // manufactures its target enthalpy from the same table); for studies
+    // where absolute enthalpy values matter, confirm the coefficients
+    // against the cited tabulations.
 
     //! methane (C1) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> methane()

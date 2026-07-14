@@ -40,8 +40,10 @@
 
 #include <opm/material/eos/CubicEOS.hpp>
 #include <opm/material/fluidsystems/BaseFluidSystem.hpp>
+#include <opm/material/fluidsystems/ThreeComponentFluidSystem.hh>
 #include <opm/material/components/C10.hpp>
 #include <opm/material/components/C1.hpp>
+#include <opm/material/components/SimpleCO2.hpp>
 
 #include <opm/material/constraintsolvers/MvpCpData.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
@@ -290,6 +292,24 @@ inline CpTable<double, 2> f1CpTable()
     static_assert(std::is_same_v<typename FS::Comp1, C10<double>>,
                   "F1 cp table assumes Comp1 = nC10 (decane)");
     return {MvpCpData<double>::methane(), MvpCpData<double>::decane()};
+}
+
+/*!
+ * \brief The cp table for the F2 fixture (ThreeComponentFluidSystem), in the
+ *        fluid system's component order (asserted at compile time).
+ */
+inline CpTable<double, 3> f2CpTable()
+{
+    using FS = Opm::ThreeComponentFluidSystem<double>;
+    static_assert(std::is_same_v<typename FS::Comp0, SimpleCO2<double>>,
+                  "F2 cp table assumes Comp0 = CO2");
+    static_assert(std::is_same_v<typename FS::Comp1, C1<double>>,
+                  "F2 cp table assumes Comp1 = C1 (methane)");
+    static_assert(std::is_same_v<typename FS::Comp2, C10<double>>,
+                  "F2 cp table assumes Comp2 = nC10 (decane)");
+    return {MvpCpData<double>::carbonDioxide(),
+            MvpCpData<double>::methane(),
+            MvpCpData<double>::decane()};
 }
 
 /*!

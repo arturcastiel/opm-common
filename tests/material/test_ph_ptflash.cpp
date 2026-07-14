@@ -169,14 +169,28 @@ void checkTwoPhaseInvariants(const FluidState& fluid_state,
 
 } // anonymous namespace
 
-// LEARN case: run one flash verbosely and print the resulting state — a
-// human-readable record of how the inner flash is operated and behaves
-// (consumed by the suite's runner script; the printout is intentional).
+namespace {
+
+// scope the PTFlash debug-output backend to one test case, exception-safely:
+// a leaked backend would make later cases' output order-dependent
+struct DebugLogGuard {
+    DebugLogGuard()
+    {
+        auto debugLog = std::make_shared<Opm::StreamLog>(std::cout, Opm::Log::MessageType::Debug);
+        Opm::OpmLog::addBackend("DEBUGLOG", debugLog);
+    }
+    ~DebugLogGuard() { Opm::OpmLog::removeBackend("DEBUGLOG"); }
+};
+
+} // anonymous namespace
+
+// LEARN case: run one flash verbosely and print the resulting state — an
+// intentional, human-readable record of how the inner flash is operated and
+// behaves.
 BOOST_AUTO_TEST_CASE(LearnPtFlashF1)
 {
     // route PTFlash's OpmLog::debug() output to stdout for this case only
-    auto debugLog = std::make_shared<Opm::StreamLog>(std::cout, Opm::Log::MessageType::Debug);
-    Opm::OpmLog::addBackend("DEBUGLOG", debugLog);
+    const DebugLogGuard debugLogGuard;
 
     FlashCase<numComponentsF1> testCase{"LEARN two-phase F1", f1Pressure, f1Temperature, f1Z};
     testCase.verbosity = 3;
@@ -202,10 +216,6 @@ BOOST_AUTO_TEST_CASE(LearnPtFlashF1)
     // the light component (C1) concentrates in the vapor; the feed sits in between
     BOOST_CHECK_MESSAGE(r.x[0] < testCase.z[0] && testCase.z[0] < r.y[0],
                         "expected x_C1 < z_C1 < y_C1, got x = " << r.x[0] << ", y = " << r.y[0]);
-
-    // keep later test cases hermetic: the backend would otherwise persist
-    // for the rest of the process and make their output order-dependent
-    Opm::OpmLog::removeBackend("DEBUGLOG");
 }
 
 // Baseline pressure, low temperature -> single-phase, labeled liquid (L = 1).

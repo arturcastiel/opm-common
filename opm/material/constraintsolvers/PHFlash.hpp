@@ -64,6 +64,7 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -83,9 +84,18 @@ namespace Opm {
  */
 template <class Scalar, int numComponents>
 struct PhFlashConfig {
+    //! per-component heat-capacity polynomials. MUST be populated by the
+    //! caller: the default-constructed table is all-zero and unusable —
+    //! solve() rejects it (returns false) rather than "solving" H = 0.
     CpTable<Scalar, numComponents> cpTable{};
+    //! enthalpy reference datum [K]. The specified enthalpy handed to
+    //! solve() MUST be expressed against this same datum — a mismatch
+    //! produces a systematically wrong temperature, not a solver failure.
     Scalar refTemperature = MvpCpData<Scalar>::referenceTemperature();
-    Scalar tempMin = 200.0;   // [K] lower bracket bound
+    //! [K] lower bracket bound. Note this default extrapolates the cp
+    //! correlations slightly below their nominal validity (~273 K) — accepted
+    //! for the synthetic self-consistent use; narrow for quantitative work.
+    Scalar tempMin = 200.0;
     Scalar tempMax = 600.0;   // [K] upper bracket bound
     //! convergence tolerance of the bracketing solver — applied to both the
     //! temperature interval [K] and the enthalpy residual [J/mol]
@@ -94,12 +104,20 @@ struct PhFlashConfig {
     EnthalpyModel model = EnthalpyModel::caloric;
 };
 
+/*!
+ * \brief The isenthalpic (P-H) flash: solves H(p, T, z) = hSpec for the
+ *        temperature by a bracketed root-find over the unmodified isothermal
+ *        flash, using the mixture-enthalpy model selected in the config.
+ *
+ * The EnthalpyCalc template parameter is the enthalpy-provider seam; any
+ * substitute must supply a static mixtureEnthalpy(fluidState, cpTable,
+ * refTemperature, eosType, model) with MvpEnthalpy's semantics (molar
+ * enthalpy of a flashed, L-consistent state).
+ */
 template <class Scalar, class FluidSystem,
           class EnthalpyCalc = MvpEnthalpy<Scalar, FluidSystem>>
 struct PHFlash {
     static constexpr int numComponents = FluidSystem::numComponents;
-    //! solver-kind trait: this flash specifies enthalpy, not temperature
-    static constexpr bool isenthalpic = true;
 
     using EOSType = CompositionalConfig::EOSType;
     using Config = PhFlashConfig<Scalar, numComponents>;
@@ -114,9 +132,27 @@ struct PHFlash {
      *        and L seeding) is applied internally at every trial temperature.
      * \param hSpec specified molar mixture enthalpy [J/mol] against the
      *        config's reference datum
-     * \return true on success; false when hSpec lies outside the enthalpy
-     *         range attainable on the temperature bracket (the state is then
-     *         left at the last trial evaluated — treat it as invalid).
+     * \param cfg the enthalpy model and temperature-search configuration
+     * \param twoPhaseMethod inner isothermal flash iteration scheme ("ssi",
+     *        "newton" or "ssi+newton" — passed through verbatim)
+     * \param ptTolerance convergence tolerance of the inner isothermal flash
+     *        (its fugacity-ratio residual)
+     * \param eosType cubic equation-of-state variant for the inner flash and
+     *        the departure enthalpy
+     * \param verbosity inner-flash verbosity (passed through)
+     * \return true on success; false when no solution is found on the
+     *         bracket: hSpec outside the attainable enthalpy range, an
+     *         unpopulated cp table, an inner-flash convergence failure on the
+     *         sweep, or root-finder iteration exhaustion (possible where the
+     *         departure-model enthalpy jumps at a phase-label flip). On
+     *         false, the state is left at the last trial evaluated — treat
+     *         it as invalid.
+     *
+     * \note std::logic_error (e.g. an unknown twoPhaseMethod string) is
+     *       deliberately NOT caught: programmer errors stay loud.
+     * \note The inner-flash knobs are separate arguments rather than config
+     *       fields by design: they mirror the isothermal flash's own solve()
+     *       signature one-to-one.
      */
     template <class FluidState>
     static bool solve(FluidState& fluidState,
@@ -130,10 +166,21 @@ struct PHFlash {
         using Flash = Opm::PTFlash<Scalar, FluidSystem, true>;
         using ValueType = typename FluidState::ValueType;
 
+        // reject an unpopulated cp table: all-zero polynomials make
+        // H(T) identically zero, which would let hSpec = 0 "succeed" at an
+        // arbitrary bracket bound
+        Scalar cpMagnitude = 0.0;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const auto& c = cfg.cpTable[compIdx];
+            cpMagnitude += std::abs(c.c0) + std::abs(c.c1) + std::abs(c.c2) + std::abs(c.c3);
+        }
+        if (!(cpMagnitude > 0.0))
+            return false;
+
         // residual r(T) = H(p, T, z) - hSpec; evaluating it flashes the state
         // at the trial temperature (Wilson-K + L re-seeded each trial — the
         // isothermal flash's input contract; fs.K() is an input, not output)
-        auto residual = [&](const double T) -> double {
+        auto residual = [&](const Scalar T) -> Scalar {
             fluidState.setTemperature(ValueType(T));
             for (int compIdx = 0; compIdx < numComponents; ++compIdx)
                 fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
@@ -143,32 +190,40 @@ struct PHFlash {
                 fluidState, cfg.cpTable, cfg.refTemperature, eosType, cfg.model));
             return h - hSpec;
         };
+        // the root finder's API is double-typed; bridge explicitly
+        auto residualAsDouble = [&](const double T) -> double {
+            return static_cast<double>(residual(static_cast<Scalar>(T)));
+        };
 
-        // bracket check: monotone H(T) means a sign change iff the root exists.
-        // This also keeps the ThrowOnError policy of the root finder
-        // unreachable by construction. An inner-flash convergence failure AT A
-        // BOUND means the bracket reaches outside the flash's operating
-        // envelope — reported as infeasible (false), not as a crash; failures
-        // BETWEEN two convergent bounds stay loud.
-        double rMin, rMax;
+        // Everything below reports failure as `false` per the contract:
+        // an inner-flash convergence failure anywhere on the sweep, a
+        // bracket without a sign change (hSpec unattainable — the bracket
+        // pre-check also keeps the root finder's bracketing-failure throw
+        // unreachable), or root-finder iteration exhaustion (which CAN
+        // happen despite a sign change where the departure-model enthalpy
+        // jumps at a single-phase label flip: a sign change then need not
+        // enclose a smooth root).
         try {
-            rMin = residual(cfg.tempMin);
-            rMax = residual(cfg.tempMax);
+            const Scalar rMin = residual(cfg.tempMin);
+            const Scalar rMax = residual(cfg.tempMax);
+            if (rMin * rMax > 0.0)
+                return false; // hSpec unattainable on the bracket
+
+            int iterationsUsed = 0;
+            const double temperature =
+                RegulaFalsi<ThrowOnError>::solve(residualAsDouble,
+                                                 static_cast<double>(cfg.tempMin),
+                                                 static_cast<double>(cfg.tempMax),
+                                                 cfg.maxIterations,
+                                                 static_cast<double>(cfg.tolerance),
+                                                 iterationsUsed);
+
+            // final consistent state at the solution temperature
+            residual(static_cast<Scalar>(temperature));
         }
         catch (const std::runtime_error&) {
-            return false; // inner flash failed at a bracket bound
+            return false;
         }
-        if (rMin * rMax > 0.0)
-            return false; // hSpec unattainable on the bracket
-
-        int iterationsUsed = 0;
-        const double temperature =
-            RegulaFalsi<ThrowOnError>::solve(residual, cfg.tempMin, cfg.tempMax,
-                                             cfg.maxIterations, cfg.tolerance,
-                                             iterationsUsed);
-
-        // final consistent state at the solution temperature
-        residual(temperature);
         return true;
     }
 };
