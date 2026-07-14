@@ -45,7 +45,7 @@
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
 
-#include <opm/material/constraintsolvers/MvpCpData.hpp>
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
 #include <opm/material/densead/Evaluation.hpp>
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
@@ -291,7 +291,7 @@ inline CpTable<double, 2> f1CpTable()
                   "F1 cp table assumes Comp0 = C1 (methane)");
     static_assert(std::is_same_v<typename FS::Comp1, C10<double>>,
                   "F1 cp table assumes Comp1 = nC10 (decane)");
-    return {MvpCpData<double>::methane(), MvpCpData<double>::decane()};
+    return {IdealGasCaloricData<double>::methane(), IdealGasCaloricData<double>::decane()};
 }
 
 /*!
@@ -307,9 +307,9 @@ inline CpTable<double, 3> f2CpTable()
                   "F2 cp table assumes Comp1 = C1 (methane)");
     static_assert(std::is_same_v<typename FS::Comp2, C10<double>>,
                   "F2 cp table assumes Comp2 = nC10 (decane)");
-    return {MvpCpData<double>::carbonDioxide(),
-            MvpCpData<double>::methane(),
-            MvpCpData<double>::decane()};
+    return {IdealGasCaloricData<double>::carbonDioxide(),
+            IdealGasCaloricData<double>::methane(),
+            IdealGasCaloricData<double>::decane()};
 }
 
 /*!

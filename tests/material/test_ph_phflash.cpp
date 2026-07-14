@@ -42,8 +42,8 @@
 #define BOOST_TEST_MODULE PhMvpPhFlash
 #include <boost/test/unit_test.hpp>
 
-#include <opm/material/constraintsolvers/MvpCpData.hpp>
-#include <opm/material/constraintsolvers/MvpEnthalpy.hpp>
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
+#include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/constraintsolvers/PHFlash.hpp>
 
 #include <opm/material/fluidsystems/ThreeComponentFluidSystem.hh>
@@ -70,19 +70,19 @@ using Opm::PhMvpTest::f2Z;
 using FluidSystemF1 = Opm::PhMvpTest::TwoComponentFluidSystem<Scalar>;
 constexpr int numComponentsF1 = FluidSystemF1::numComponents;
 using EvaluationF1 = Opm::PhMvpTest::FlashEvaluation<FluidSystemF1>;
-using EnthalpyF1 = Opm::MvpEnthalpy<Scalar, FluidSystemF1>;
+using EnthalpyF1 = Opm::MixtureEnthalpy<Scalar, FluidSystemF1>;
 using PhFlashF1 = Opm::PHFlash<Scalar, FluidSystemF1>;
 
 // F2: ternary CO2/C1/nC10
 using FluidSystemF2 = Opm::ThreeComponentFluidSystem<Scalar>;
 constexpr int numComponentsF2 = FluidSystemF2::numComponents;
 using EvaluationF2 = Opm::PhMvpTest::FlashEvaluation<FluidSystemF2>;
-using EnthalpyF2 = Opm::MvpEnthalpy<Scalar, FluidSystemF2>;
+using EnthalpyF2 = Opm::MixtureEnthalpy<Scalar, FluidSystemF2>;
 using PhFlashF2 = Opm::PHFlash<Scalar, FluidSystemF2>;
 
 namespace {
 
-const Scalar T0 = Opm::MvpCpData<Scalar>::referenceTemperature();
+const Scalar T0 = Opm::IdealGasCaloricData<Scalar>::referenceTemperature();
 
 constexpr double PT_TOLERANCE = 1.e-8;        // inner isothermal flash: fugacity-ratio residual
 constexpr double ROUNDTRIP_TOLERANCE = 1.e-3; // [K] outer acceptance bound on the recovered temperature

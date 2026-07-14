@@ -50,13 +50,13 @@
  *   differs per phase (the liquid's is of vaporization-enthalpy scale), so
  *   with this model the enthalpy genuinely depends on the flash result.
  *
- * Units: SI, molar enthalpy [J/mol]; H(T0) = 0 at the MvpCpData datum
+ * Units: SI, molar enthalpy [J/mol]; H(T0) = 0 at the IdealGasCaloricData datum
  * (the caloric part carries the datum; the residual vanishes as P -> 0).
  */
-#ifndef OPM_MVP_ENTHALPY_HPP
-#define OPM_MVP_ENTHALPY_HPP
+#ifndef OPM_MIXTURE_ENTHALPY_HPP
+#define OPM_MIXTURE_ENTHALPY_HPP
 
-#include <opm/material/constraintsolvers/MvpCpData.hpp>
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 
 #include <opm/material/common/MathToolbox.hpp>
 #include <opm/material/Constants.hpp>
@@ -79,7 +79,7 @@ enum class EnthalpyModel { caloric, eos_departure };
  * split-cancellation property, and the unit/datum conventions.
  */
 template <class Scalar, class FluidSystem>
-struct MvpEnthalpy {
+struct MixtureEnthalpy {
     static constexpr int numComponents = FluidSystem::numComponents;
 
     using EOSType = CompositionalConfig::EOSType;
@@ -300,4 +300,4 @@ private:
 
 } // namespace Opm
 
-#endif // OPM_MVP_ENTHALPY_HPP
+#endif // OPM_MIXTURE_ENTHALPY_HPP

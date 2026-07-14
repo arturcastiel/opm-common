@@ -25,7 +25,7 @@
 /*!
  * \file
  *
- * \brief Tests for the caloric mixture-enthalpy model (MvpEnthalpy/MvpCpData)
+ * \brief Tests for the caloric mixture-enthalpy model (MixtureEnthalpy/IdealGasCaloricData)
  *        — the property the isenthalpic (P-H) flash inverts for temperature.
  *
  * The cases live in the CaloricModel suite so that the EoS-consistent
@@ -36,8 +36,8 @@
 #define BOOST_TEST_MODULE PhMvpEnthalpy
 #include <boost/test/unit_test.hpp>
 
-#include <opm/material/constraintsolvers/MvpCpData.hpp>
-#include <opm/material/constraintsolvers/MvpEnthalpy.hpp>
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
+#include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
@@ -58,11 +58,11 @@ using Opm::PhMvpTest::f1Z;
 using FluidSystemF1 = Opm::PhMvpTest::TwoComponentFluidSystem<Scalar>;
 constexpr int numComponentsF1 = FluidSystemF1::numComponents;
 using EvaluationF1 = Opm::PhMvpTest::FlashEvaluation<FluidSystemF1>;
-using EnthalpyF1 = Opm::MvpEnthalpy<Scalar, FluidSystemF1>;
+using EnthalpyF1 = Opm::MixtureEnthalpy<Scalar, FluidSystemF1>;
 
 namespace {
 
-const Scalar T0 = Opm::MvpCpData<Scalar>::referenceTemperature();
+const Scalar T0 = Opm::IdealGasCaloricData<Scalar>::referenceTemperature();
 
 // unchecked probe helper: flash F1 at (P, T) and return the mixture enthalpy
 // of the flashed state. Deliberately assertion-free — the calling test owns

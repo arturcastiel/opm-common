@@ -32,12 +32,12 @@
  *
  * The isothermal flash (PTFlash) is reused unmodified as the inner machinery:
  * at each trial temperature the mixture is flashed and its molar enthalpy
- * (MvpEnthalpy, caloric or EoS-departure model) is compared against the
+ * (MixtureEnthalpy, caloric or EoS-departure model) is compared against the
  * specified value; the temperature is bracketed and root-found.
  *
  * Contract notes:
  * - The specified enthalpy is MOLAR [J/mol] and MUST be expressed against the
- *   same reference datum as the enthalpy model (MvpCpData: H(T0) = 0) — a
+ *   same reference datum as the enthalpy model (IdealGasCaloricData: H(T0) = 0) — a
  *   datum mismatch manifests as a systematically wrong temperature, not as a
  *   solver failure.
  * - Values only: after solve() the fluid state's AD derivatives (if any) are
@@ -56,8 +56,8 @@
 #ifndef OPM_PH_FLASH_HPP
 #define OPM_PH_FLASH_HPP
 
-#include <opm/material/constraintsolvers/MvpCpData.hpp>
-#include <opm/material/constraintsolvers/MvpEnthalpy.hpp>
+#include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
+#include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
 
 #include <opm/common/utility/numeric/RootFinders.hpp>
@@ -83,7 +83,7 @@ namespace Opm {
  * validity range; widen them deliberately, not by default.
  */
 template <class Scalar, int numComponents>
-struct PhFlashConfig {
+struct PHFlashConfig {
     //! per-component heat-capacity polynomials. MUST be populated by the
     //! caller: the default-constructed table is all-zero and unusable —
     //! solve() rejects it (returns false) rather than "solving" H = 0.
@@ -91,7 +91,7 @@ struct PhFlashConfig {
     //! enthalpy reference datum [K]. The specified enthalpy handed to
     //! solve() MUST be expressed against this same datum — a mismatch
     //! produces a systematically wrong temperature, not a solver failure.
-    Scalar refTemperature = MvpCpData<Scalar>::referenceTemperature();
+    Scalar refTemperature = IdealGasCaloricData<Scalar>::referenceTemperature();
     //! [K] lower bracket bound. Note this default extrapolates the cp
     //! correlations slightly below their nominal validity (~273 K) — accepted
     //! for the synthetic self-consistent use; narrow for quantitative work.
@@ -111,16 +111,16 @@ struct PhFlashConfig {
  *
  * The EnthalpyCalc template parameter is the enthalpy-provider seam; any
  * substitute must supply a static mixtureEnthalpy(fluidState, cpTable,
- * refTemperature, eosType, model) with MvpEnthalpy's semantics (molar
+ * refTemperature, eosType, model) with MixtureEnthalpy's semantics (molar
  * enthalpy of a flashed, L-consistent state).
  */
 template <class Scalar, class FluidSystem,
-          class EnthalpyCalc = MvpEnthalpy<Scalar, FluidSystem>>
+          class EnthalpyCalc = MixtureEnthalpy<Scalar, FluidSystem>>
 struct PHFlash {
     static constexpr int numComponents = FluidSystem::numComponents;
 
     using EOSType = CompositionalConfig::EOSType;
-    using Config = PhFlashConfig<Scalar, numComponents>;
+    using Config = PHFlashConfig<Scalar, numComponents>;
 
     /*!
      * \brief Solve H(p, T, z) = hSpec for T and flash the state at the

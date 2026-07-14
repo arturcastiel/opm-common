@@ -26,14 +26,14 @@
  * \file
  *
  * \brief Ideal-gas heat-capacity polynomials and the enthalpy reference state
- *        used by the caloric mixture-enthalpy model (MvpEnthalpy) and the
+ *        used by the caloric mixture-enthalpy model (MixtureEnthalpy) and the
  *        isenthalpic (P-H) flash.
  *
  * Units are SI throughout: temperature [K], molar heat capacity [J/(mol K)],
  * molar enthalpy [J/mol]. Enthalpy is zero at the reference temperature.
  */
-#ifndef OPM_MVP_CP_DATA_HPP
-#define OPM_MVP_CP_DATA_HPP
+#ifndef OPM_IDEAL_GAS_CALORIC_DATA_HPP
+#define OPM_IDEAL_GAS_CALORIC_DATA_HPP
 
 #include <array>
 
@@ -81,7 +81,7 @@ using CpTable = std::array<ComponentCp<Scalar>, numComponents>;
  * the same datum, H(referenceTemperature) = 0.
  */
 template <class Scalar>
-struct MvpCpData {
+struct IdealGasCaloricData {
     //! reference temperature T0 [K]; enthalpy is zero here
     static constexpr Scalar referenceTemperature() { return 298.15; }
 
@@ -113,4 +113,4 @@ struct MvpCpData {
 
 } // namespace Opm
 
-#endif // OPM_MVP_CP_DATA_HPP
+#endif // OPM_IDEAL_GAS_CALORIC_DATA_HPP
