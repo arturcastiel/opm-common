@@ -697,6 +697,7 @@ list(APPEND DUNE_TEST_SOURCE_FILES
   tests/material/test_ncpflash.cpp
   tests/material/test_pengrobinson.cpp
   tests/material/test_ph_enthalpy.cpp
+  tests/material/test_ph_phflash.cpp
   tests/material/test_ph_ptflash.cpp
   tests/material/test_tabulation.cpp
   tests/material/test_threecomponents_ptflash.cpp
@@ -1329,6 +1330,7 @@ list(APPEND PUBLIC_HEADER_FILES
   opm/material/constraintsolvers/MvpCpData.hpp
   opm/material/constraintsolvers/MvpEnthalpy.hpp
   opm/material/constraintsolvers/NcpFlash.hpp
+  opm/material/constraintsolvers/PHFlash.hpp
   opm/material/constraintsolvers/PTFlash.hpp
   opm/material/densead/DynamicEvaluation.hpp
   opm/material/densead/Evaluation.hpp
