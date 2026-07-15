@@ -64,6 +64,7 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -93,14 +94,23 @@ struct PHFlashConfig {
     //! solve() MUST be expressed against this same datum — a mismatch
     //! produces a systematically wrong temperature, not a solver failure.
     Scalar refTemperature = IdealGasCaloricData<Scalar>::referenceTemperature();
-    //! [K] lower bracket bound. Note this default extrapolates the cp
-    //! correlations slightly below their nominal validity (~273 K) — accepted
-    //! for the synthetic self-consistent use; narrow for quantitative work.
-    Scalar tempMin = 200.0;
-    Scalar tempMax = 600.0;   // [K] upper bracket bound
-    //! convergence tolerance of the bracketing solver — applied to both the
-    //! temperature interval [K] and the enthalpy residual [J/mol]
+    //! [K] bracket bounds. Both ends are full inner-flash evaluations, so
+    //! they must lie inside the isothermal flash's robust envelope AND the
+    //! cp-correlation validity window (250-600 K): near-critical feeds fail
+    //! to flash at extreme bounds (e.g. a 99%-methane feed at 200 K), which
+    //! reports as "no solution" although the root is interior. The defaults
+    //! are the field-validated window every in-tree consumer uses.
+    Scalar tempMin = 270.0;
+    Scalar tempMax = 460.0;
+    //! convergence tolerance of the bracketing solver's TEMPERATURE
+    //! interval [K]
     Scalar tolerance = 1e-6;
+    //! acceptance tolerance on the ENTHALPY residual |H(T*) - hSpec|
+    //! [J/mol], checked after the root-find. Where the departure-model
+    //! enthalpy jumps at a phase-label flip, the bracketing loop can
+    //! converge its interval onto the discontinuity although no root
+    //! exists; this check is what turns that case into an honest failure.
+    Scalar enthalpyTolerance = 1.0;
     int maxIterations = 100;
     EnthalpyModel model = EnthalpyModel::caloric;
 };
@@ -141,13 +151,19 @@ struct PHFlash {
      * \param eosType cubic equation-of-state variant for the inner flash and
      *        the departure enthalpy
      * \param verbosity inner-flash verbosity (passed through)
-     * \return true on success; false when no solution is found on the
+     * \return true on success — the root-find converged AND the final
+     *         enthalpy residual |H(T*) - hSpec| lies within
+     *         cfg.enthalpyTolerance; false when no solution is found on the
      *         bracket: hSpec outside the attainable enthalpy range, an
-     *         unpopulated cp table, an inner-flash convergence failure on the
-     *         sweep, or root-finder iteration exhaustion (possible where the
-     *         departure-model enthalpy jumps at a phase-label flip). On
-     *         false, the state is left at the last trial evaluated — treat
-     *         it as invalid.
+     *         unpopulated cp table, an inner-flash convergence failure on
+     *         the sweep, or a residual exceeding the acceptance tolerance
+     *         at the converged temperature. The latter is how a
+     *         departure-model enthalpy JUMP at a phase-label flip reports:
+     *         the bracketing loop converges its interval onto the
+     *         discontinuity (it does not exhaust iterations there) and only
+     *         the residual check can tell that no root exists. On false,
+     *         the state is left at the last trial evaluated — treat it as
+     *         invalid.
      *
      * \note std::logic_error (e.g. an unknown twoPhaseMethod string) is
      *       deliberately NOT caught: programmer errors stay loud.
@@ -179,25 +195,47 @@ struct PHFlash {
             return false;
 
         // Warm start across NEARBY trial temperatures: a previous trial's
-        // converged split seeds the next inner flash far better than the
-        // Wilson correlation (the same answer-reuse the reference
-        // implementations apply) — but ONLY within a proximity window. A
-        // split carried across a large temperature jump is worse than
-        // Wilson: it does not make the inner flash fail, it makes it
-        // converge to a WRONG root, which poisons the residual silently
-        // (the bracket endpoints, evaluated back to back, are the extreme
-        // case — seeding tempMax from tempMin's split broke the bracket
-        // pre-check outright). Only a converged TWO-PHASE split is cached
-        // — single-phase equilibrium ratios are degenerate — and the
-        // cached ratios are y/x from the converged state (fs.K() is an
-        // input, never an output). A warm-seeded inner flash that fails
-        // retires the seed and retries cold, so within the window
-        // robustness is exactly that of the cold path.
+        // converged equilibrium ratios seed the next inner flash far better
+        // than the Wilson correlation (the same answer-reuse the reference
+        // implementations apply). Two hard rules keep it sound:
+        //
+        //   1. Only K is warm-seeded; L is ALWAYS set to the cold sentinel
+        //      -1. The isothermal flash runs its phase-stability test only
+        //      for a non-interior L, and the test itself starts its
+        //      Michelsen trials from the incoming K — so a warm K
+        //      accelerates BOTH the stability test and the split solve,
+        //      while an interior warm L would silently skip the stability
+        //      verdict altogether. That skip is the wrong-root trap: near a
+        //      phase boundary a stale split converges the inner flash to
+        //      the trivial root (x = y = z satisfies the fugacity-ratio
+        //      criterion exactly), which does not throw and poisons the
+        //      residual — and, on the FINAL evaluation, the state's
+        //      saturations — silently. No split may ever be accepted
+        //      without a stability verdict at its own (T, p, z).
+        //
+        //   2. The seed is reused only within a proximity window of the
+        //      temperature that produced it (with the stability test always
+        //      running, this is a pure performance heuristic, not a
+        //      correctness guard); the bracket endpoints, evaluated back to
+        //      back, therefore always run cold.
+        //
+        // Only a converged TWO-PHASE split with strictly positive x AND y
+        // is cached (single-phase ratios are degenerate; a zero component
+        // would cache K = 0, a poison seed); the cached ratios are y/x from
+        // the converged state (fs.K() is an input, never an output). A
+        // warm-seeded inner flash that fails retires the seed and retries
+        // cold.
         bool haveWarmSeed = false;
         std::array<Scalar, numComponents> warmK{};
-        Scalar warmL = 1.0;
         Scalar warmT = 0.0;
-        const Scalar maxWarmStep = 0.1 * (cfg.tempMax - cfg.tempMin);
+        const Scalar maxWarmStep =
+            std::min(0.1 * (cfg.tempMax - cfg.tempMin), Scalar(15.0));
+
+        auto seedCold = [&]() {
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx)
+                fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
+            fluidState.setLvalue(ValueType(-1.0));
+        };
 
         // residual r(T) = H(p, T, z) - hSpec; evaluating it flashes the state
         // at the trial temperature (the isothermal flash's input contract)
@@ -208,7 +246,7 @@ struct PHFlash {
             if (haveWarmSeed && std::abs(T - warmT) <= maxWarmStep) {
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx)
                     fluidState.setKvalue(compIdx, ValueType(warmK[compIdx]));
-                fluidState.setLvalue(ValueType(warmL));
+                fluidState.setLvalue(ValueType(-1.0)); // rule 1: stability always runs
                 try {
                     Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
                     solved = true;
@@ -218,9 +256,7 @@ struct PHFlash {
                 }
             }
             if (!solved) {
-                for (int compIdx = 0; compIdx < numComponents; ++compIdx)
-                    fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
-                fluidState.setLvalue(ValueType(1.0));
+                seedCold();
                 Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
             }
 
@@ -229,13 +265,12 @@ struct PHFlash {
             if (L > 0.0 && L < 1.0) {
                 haveWarmSeed = true;
                 warmT = T;
-                warmL = L;
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                     const Scalar x = Opm::getValue(
                         fluidState.moleFraction(FluidSystem::oilPhaseIdx, compIdx));
                     const Scalar y = Opm::getValue(
                         fluidState.moleFraction(FluidSystem::gasPhaseIdx, compIdx));
-                    if (!(x > 0.0)) {
+                    if (!(x > 0.0) || !(y > 0.0)) {
                         haveWarmSeed = false;
                         break;
                     }
@@ -250,8 +285,19 @@ struct PHFlash {
                 fluidState, cfg.cpTable, cfg.refTemperature, eosType, cfg.model));
             return h - hSpec;
         };
-        // the root finder's API is double-typed; bridge explicitly
+        // The root finder's API is double-typed; bridge explicitly, and
+        // memoize the two bracket-endpoint values: the root finder
+        // re-evaluates f at both endpoints on entry, which would otherwise
+        // duplicate the pre-check's two full (cold) inner flashes.
+        double rMinCached = 0.0, rMaxCached = 0.0;
+        bool endpointsCached = false;
         auto residualAsDouble = [&](const double T) -> double {
+            if (endpointsCached) {
+                if (T == static_cast<double>(cfg.tempMin))
+                    return rMinCached;
+                if (T == static_cast<double>(cfg.tempMax))
+                    return rMaxCached;
+            }
             return static_cast<double>(residual(static_cast<Scalar>(T)));
         };
 
@@ -259,15 +305,21 @@ struct PHFlash {
         // an inner-flash convergence failure anywhere on the sweep, a
         // bracket without a sign change (hSpec unattainable — the bracket
         // pre-check also keeps the root finder's bracketing-failure throw
-        // unreachable), or root-finder iteration exhaustion (which CAN
-        // happen despite a sign change where the departure-model enthalpy
-        // jumps at a single-phase label flip: a sign change then need not
-        // enclose a smooth root).
+        // unreachable), or a final enthalpy residual beyond the acceptance
+        // tolerance. The residual check matters because the root finder's
+        // interval exit does not look at the function value: where the
+        // departure-model enthalpy jumps at a phase-label flip, the loop
+        // CONVERGES its interval onto the discontinuity (it does not
+        // exhaust iterations there) and only the residual can tell that no
+        // root exists inside the jump.
         try {
             const Scalar rMin = residual(cfg.tempMin);
             const Scalar rMax = residual(cfg.tempMax);
             if (rMin * rMax > 0.0)
                 return false; // hSpec unattainable on the bracket
+            rMinCached = static_cast<double>(rMin);
+            rMaxCached = static_cast<double>(rMax);
+            endpointsCached = true;
 
             int iterationsUsed = 0;
             const double temperature =
@@ -278,8 +330,11 @@ struct PHFlash {
                                                  static_cast<double>(cfg.tolerance),
                                                  iterationsUsed);
 
-            // final consistent state at the solution temperature
-            residual(static_cast<Scalar>(temperature));
+            // final consistent state at the solution temperature — and the
+            // acceptance test on the value this call produces
+            const Scalar rFinal = residual(static_cast<Scalar>(temperature));
+            if (!(std::abs(rFinal) <= cfg.enthalpyTolerance))
+                return false; // converged onto a discontinuity, not a root
         }
         catch (const std::runtime_error&) {
             return false;

@@ -92,6 +92,12 @@ PhFlashF1::Config makeConfigF1(const EnthalpyModel model)
     PhFlashF1::Config cfg;
     cfg.cpTable = Opm::PhMvpTest::f1CpTable();
     cfg.model = model;
+    // this suite deliberately exercises the WIDE envelope (the 200 K
+    // single-phase liquid point is where the departure term is largest, and
+    // the equimolar F1 feed flashes fine there) — pinned explicitly because
+    // the config defaults are the narrower field-validated window
+    cfg.tempMin = 200.;
+    cfg.tempMax = 600.;
     return cfg;
 }
 
