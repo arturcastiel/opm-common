@@ -128,11 +128,12 @@ namespace Opm {
             if (component_param_.size() < numComponents) {
                 component_param_.push_back(param);
             } else {
-                // Adding another component would exceed the limit.
-                const std::string msg = fmt::format("The fluid system has reached its maximum capacity of {} components,"
-                                                    "the component '{}' will not be added.", NumComp, param.name);
-                OpmLog::note(msg);
-                // Optionally, throw an exception?
+                // A silently dropped component is never recoverable
+                // downstream — the system would flash a different mixture
+                // than the caller configured.
+                throw std::runtime_error(
+                    fmt::format("The fluid system has reached its maximum capacity of {} components, "
+                                "the component '{}' cannot be added.", NumComp, param.name));
             }
         }
 
@@ -180,8 +181,17 @@ namespace Opm {
 
         static void init()
         {
+            // A true lifecycle reset: this class holds process-global
+            // configuration, and a second configuration pass in the same
+            // process (tools, tests) must not silently keep the previous
+            // components, interaction coefficients, or enthalpy data —
+            // stale pairings of those three are exactly the silent-physics
+            // class of defect.
             waterPvt_ = std::make_shared<WaterPvt>();
+            component_param_.clear();
             component_param_.reserve(numComponents);
+            interaction_coefficients_.clear();
+            enthalpy_data_set_ = false;
         }
 
         /*!
@@ -200,9 +210,25 @@ namespace Opm {
          * row > column lives at index row*(row-1)/2 + column, i.e.
          * (1,0), (2,0), (2,1), ... for numComponents*(numComponents-1)/2
          * entries in total.
+         *
+         * Throws std::invalid_argument on any other size: a short vector
+         * would otherwise become an out-of-bounds read at fugacity time,
+         * far from the misuse site. The empty vector is the documented
+         * "all zero" state.
          */
         static void setInteractionCoefficients(std::vector<Scalar> bic)
-        { interaction_coefficients_ = std::move(bic); }
+        {
+            const std::size_t expected =
+                std::size_t(numComponents) * (numComponents - 1) / 2;
+            if (!bic.empty() && bic.size() != expected) {
+                throw std::invalid_argument(
+                    fmt::format("setInteractionCoefficients: expected {} packed "
+                                "lower-triangle entries for {} components (or an "
+                                "empty vector for all-zero), got {}",
+                                expected, int(numComponents), bic.size()));
+            }
+            interaction_coefficients_ = std::move(bic);
+        }
 
         /*!
          * \brief The acentric factor of a component [].
@@ -383,9 +409,13 @@ namespace Opm {
          * The molar->specific conversion divides by the phase average molar
          * mass; component molar masses are stored in g/mol (kg/kmol),
          * consistent with the m^3/kmol volume basis of the EoS, hence the
-         * 1e-3 factor to kg/mol. This is the same enthalpy (per mole) that
-         * the isenthalpic flash inverts — flash and energy path agree by
-         * construction.
+         * 1e-3 factor to kg/mol. Under the CALORIC model this is the same
+         * enthalpy (per mole) that the isenthalpic flash inverts — the two
+         * paths agree by construction ONLY in that mode: this method has no
+         * EoS-departure channel yet, so combining an energy-module consumer
+         * with an eos_departure P-H configuration would silently use two
+         * different enthalpy functions (~the residual apart). The departure
+         * channel arrives with the energy-coupling stage.
          */
         template <class FluidState, class LhsEval = typename FluidState::ValueType, class ParamCacheEval = LhsEval>
         static LhsEval enthalpy(const FluidState& fluidState,
