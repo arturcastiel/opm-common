@@ -149,6 +149,41 @@ BOOST_AUTO_TEST_CASE(PhaseDecompositionMatchesFeedSum)
     BOOST_CHECK_CLOSE(viaPhases, viaFeed, 1e-9); // [%]
 }
 
+// The presets against EXTERNAL reference values — the one check no amount of
+// internal consistency can substitute. Every other test in this suite
+// manufactures its expectation from the same cp table it verifies, so a
+// corrupt coefficient row passes them all (an n-decane row of untraceable
+// origin sat ~32% low until an external benchmark exposed it). The pinned
+// values are the reference-EoS ideal-gas heat capacities (Setzmann & Wagner
+// 1991 methane; Lemmon & Span 2006 n-decane; Span & Wagner 1996 CO2),
+// tabulated at four temperatures spanning the fit window.
+BOOST_AUTO_TEST_CASE(PresetsMatchReferenceIdealGasCp)
+{
+    using Caloric = Opm::IdealGasCaloricData<double>;
+
+    constexpr std::array<double, 4> temps{298.15, 350., 450., 600.};
+    const struct {
+        const char* name;
+        Opm::ComponentCp<double> preset;
+        std::array<double, 4> cpRef; // [J/(mol K)] at temps[]
+    } pins[] = {
+        {"methane", Caloric::methane(), {35.7085, 37.9628, 43.5052, 52.4919}},
+        {"decane", Caloric::decane(), {233.0250, 266.2081, 328.2699, 405.7329}},
+        {"carbonDioxide", Caloric::carbonDioxide(), {37.1408, 39.3941, 43.0700, 47.3303}},
+    };
+
+    for (const auto& pin : pins) {
+        for (std::size_t i = 0; i < temps.size(); ++i) {
+            BOOST_TEST_CONTEXT(pin.name << " at T = " << temps[i]) {
+                // 1% relative: an order looser than the fit residuals (max
+                // 0.3%), an order tighter than the defect class it guards
+                BOOST_CHECK_CLOSE(pin.preset.heatCapacity(temps[i]),
+                                  pin.cpRef[i], 1.0); // [%]
+            }
+        }
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END() // CaloricModel
 
 // ────────────────────────────────────────────────────────────────────────────

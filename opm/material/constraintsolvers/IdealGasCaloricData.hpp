@@ -93,26 +93,35 @@ struct IdealGasCaloricData {
     //! caloric enthalpy itself is pressure-independent)
     static constexpr Scalar referencePressure() { return 1e5; }
 
-    // The coefficients below follow the standard ideal-gas heat-capacity
-    // polynomial tabulations cp = c0 + c1*T + c2*T^2 + c3*T^3 (cf. Poling,
-    // Prausnitz & O'Connell, "The Properties of Gases and Liquids"), with a
-    // nominal fit validity of roughly 273-1500 K. Within the P-H stack they
-    // are self-consistent by construction (the isenthalpic round-trip
-    // manufactures its target enthalpy from the same table); for studies
-    // where absolute enthalpy values matter, confirm the coefficients
-    // against the cited tabulations.
+    // The coefficients below are least-squares cubic fits,
+    // cp = c0 + c1*T + c2*T^2 + c3*T^3, to the ideal-gas heat capacity of
+    // each fluid's reference equation of state, fitted over 250-600 K (the
+    // temperature window the isenthalpic flash practically operates in):
+    //   methane: Setzmann & Wagner, J. Phys. Chem. Ref. Data 20 (1991) 1061
+    //            (fit RMS 0.024, max 0.063 J/(mol K))
+    //   n-decane: Lemmon & Span, J. Chem. Eng. Data 51 (2006) 785
+    //            (fit RMS 0.27, max 0.79 J/(mol K))
+    //   CO2:     Span & Wagner, J. Phys. Chem. Ref. Data 25 (1996) 1509
+    //            (fit RMS 0.003, max 0.014 J/(mol K))
+    // The reference curves were sampled from the fluids' Helmholtz ideal
+    // parts (CoolProp 8.0.0 as the extraction tool; CoolProp itself is not a
+    // dependency). Outside 250-600 K the cubics extrapolate — refit rather
+    // than trust them there. A unit test pins each preset against tabulated
+    // reference values so a corrupt coefficient row cannot enter silently
+    // (an earlier n-decane row of untraceable origin was ~32% low, which
+    // no self-consistent round-trip test could detect).
 
     //! methane (C1) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> methane()
-    { return {19.25, 5.213e-2, 1.197e-5, -1.132e-8}; }
+    { return {40.1503, -8.47372e-2, 2.93012e-4, -1.96125e-7}; }
 
     //! n-decane (nC10) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> decane()
-    { return {16.35, 5.762e-1, -3.115e-4, 6.62e-8}; }
+    { return {79.4791, 3.1066e-1, 9.88317e-4, -1.00245e-6}; }
 
     //! carbon dioxide (CO2) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> carbonDioxide()
-    { return {19.80, 7.344e-2, -5.602e-5, 1.715e-8}; }
+    { return {18.2687, 8.36359e-2, -7.75148e-5, 3.14088e-8}; }
 
     /*!
      * \brief Preset lookup by component name (deck-style aliases,
