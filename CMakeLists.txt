@@ -260,6 +260,10 @@ macro(opm-common_tests_hook)
         ${Python3_EXECUTABLE} -m unittest discover
     )
  endif()
+
+  # smoke test of the flash CLI: the canonical isothermal->isenthalpic
+  # round-trips, exercised through the installed-tool surface
+  add_test(NAME opmflash_selftest COMMAND opmflash --selftest)
 endmacro()
 
 macro(opm-common_targets_hook)

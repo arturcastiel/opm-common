@@ -865,6 +865,7 @@ list(APPEND PROGRAM_SOURCE_FILES
   examples/opmi.cpp
   examples/opmpack.cpp
   examples/opmhash.cpp
+  examples/opmflash.cpp
   examples/rst_deck.cpp
   examples/make_ext_smry.cpp
   examples/co2brinepvt.cpp

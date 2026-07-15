@@ -191,6 +191,20 @@ namespace Opm {
         { waterPvt_ = std::move(pvtObj); }
 
         /*!
+         * \brief Set the binary interaction coefficients directly, for
+         *        consumers configured without a deck (initFromState() fills
+         *        them from the BIC keyword and is unchanged).
+         *
+         * Packed lower-triangle order, the same layout
+         * interactionCoefficient() reads: the pair (row, column) with
+         * row > column lives at index row*(row-1)/2 + column, i.e.
+         * (1,0), (2,0), (2,1), ... for numComponents*(numComponents-1)/2
+         * entries in total.
+         */
+        static void setInteractionCoefficients(std::vector<Scalar> bic)
+        { interaction_coefficients_ = std::move(bic); }
+
+        /*!
          * \brief The acentric factor of a component [].
          *
          * \copydetails Doxygen::compIdxParam
