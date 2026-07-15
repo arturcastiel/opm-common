@@ -151,6 +151,30 @@ BOOST_AUTO_TEST_CASE(RoundTripDepartureF1)
     }
 }
 
+// Warm-start stress: a dense sweep of inversions across the full enthalpy
+// range (single-liquid through the two-phase window into single-vapor).
+// Inside every solve the trial-temperature sequence repeatedly sets, uses,
+// and retires the warm split cache (single-phase trials retire it, two-phase
+// trials rebuild it); each recovered temperature must still close the
+// round-trip exactly as the cold path did. Guards the answer-reuse
+// optimization against ever trading correctness for speed.
+BOOST_AUTO_TEST_CASE(RoundTripDenseSweepF1)
+{
+    constexpr double Tlo = 210.;
+    constexpr double Thi = 390.;
+    constexpr int nPoints = 25;
+    for (int i = 0; i < nPoints; ++i) {
+        const double Tstar = Tlo + i * (Thi - Tlo) / (nPoints - 1);
+        for (const auto model : {EnthalpyModel::caloric, EnthalpyModel::eos_departure}) {
+            const double hSpec = manufactureHspecF1(f1Pressure, Tstar, model);
+            const double T = recoverTemperatureF1(f1Pressure, hSpec, model);
+            BOOST_CHECK_MESSAGE(std::abs(T - Tstar) < ROUNDTRIP_TOLERANCE,
+                                "dense-sweep round-trip: expected T* = "
+                                    << Tstar << " K, recovered " << T << " K");
+        }
+    }
+}
+
 // Ternary round-trip (F2) at its canonical two-phase point, both models
 BOOST_AUTO_TEST_CASE(RoundTripTernaryF2)
 {

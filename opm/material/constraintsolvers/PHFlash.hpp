@@ -64,6 +64,7 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -177,15 +178,74 @@ struct PHFlash {
         if (!(cpMagnitude > 0.0))
             return false;
 
+        // Warm start across NEARBY trial temperatures: a previous trial's
+        // converged split seeds the next inner flash far better than the
+        // Wilson correlation (the same answer-reuse the reference
+        // implementations apply) — but ONLY within a proximity window. A
+        // split carried across a large temperature jump is worse than
+        // Wilson: it does not make the inner flash fail, it makes it
+        // converge to a WRONG root, which poisons the residual silently
+        // (the bracket endpoints, evaluated back to back, are the extreme
+        // case — seeding tempMax from tempMin's split broke the bracket
+        // pre-check outright). Only a converged TWO-PHASE split is cached
+        // — single-phase equilibrium ratios are degenerate — and the
+        // cached ratios are y/x from the converged state (fs.K() is an
+        // input, never an output). A warm-seeded inner flash that fails
+        // retires the seed and retries cold, so within the window
+        // robustness is exactly that of the cold path.
+        bool haveWarmSeed = false;
+        std::array<Scalar, numComponents> warmK{};
+        Scalar warmL = 1.0;
+        Scalar warmT = 0.0;
+        const Scalar maxWarmStep = 0.1 * (cfg.tempMax - cfg.tempMin);
+
         // residual r(T) = H(p, T, z) - hSpec; evaluating it flashes the state
-        // at the trial temperature (Wilson-K + L re-seeded each trial — the
-        // isothermal flash's input contract; fs.K() is an input, not output)
+        // at the trial temperature (the isothermal flash's input contract)
         auto residual = [&](const Scalar T) -> Scalar {
             fluidState.setTemperature(ValueType(T));
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx)
-                fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
-            fluidState.setLvalue(ValueType(1.0));
-            Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+
+            bool solved = false;
+            if (haveWarmSeed && std::abs(T - warmT) <= maxWarmStep) {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx)
+                    fluidState.setKvalue(compIdx, ValueType(warmK[compIdx]));
+                fluidState.setLvalue(ValueType(warmL));
+                try {
+                    Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+                    solved = true;
+                }
+                catch (const std::runtime_error&) {
+                    haveWarmSeed = false; // stale seed misled the flash — retire it
+                }
+            }
+            if (!solved) {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx)
+                    fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
+                fluidState.setLvalue(ValueType(1.0));
+                Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+            }
+
+            // cache the converged split for the next trial
+            const Scalar L = Opm::getValue(fluidState.L());
+            if (L > 0.0 && L < 1.0) {
+                haveWarmSeed = true;
+                warmT = T;
+                warmL = L;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar x = Opm::getValue(
+                        fluidState.moleFraction(FluidSystem::oilPhaseIdx, compIdx));
+                    const Scalar y = Opm::getValue(
+                        fluidState.moleFraction(FluidSystem::gasPhaseIdx, compIdx));
+                    if (!(x > 0.0)) {
+                        haveWarmSeed = false;
+                        break;
+                    }
+                    warmK[compIdx] = y / x;
+                }
+            }
+            else {
+                haveWarmSeed = false;
+            }
+
             const Scalar h = Opm::getValue(EnthalpyCalc::mixtureEnthalpy(
                 fluidState, cfg.cpTable, cfg.refTemperature, eosType, cfg.model));
             return h - hSpec;
