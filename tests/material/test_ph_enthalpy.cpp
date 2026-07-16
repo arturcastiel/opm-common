@@ -36,6 +36,9 @@
 #define BOOST_TEST_MODULE PhMvpEnthalpy
 #include <boost/test/unit_test.hpp>
 
+#include <opm/material/components/C1.hpp>
+#include <opm/material/components/C10.hpp>
+#include <opm/material/components/SimpleCO2.hpp>
 #include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/fluidsystems/GenericOilGasWaterFluidSystem.hpp>
@@ -48,6 +51,7 @@
 
 #include <array>
 #include <cmath>
+#include <string>
 
 using Scalar = double;
 using Opm::PhMvpTest::FlashCase;
@@ -182,6 +186,40 @@ BOOST_AUTO_TEST_CASE(PresetsMatchReferenceIdealGasCp)
             }
         }
     }
+}
+
+// The caloric coefficients live on the component classes (the species'
+// identity card, next to its EoS constants); the IdealGasCaloricData presets
+// are delegating wrappers over them. Pin the delegation coefficient-wise so
+// the two surfaces can never drift apart, and pin the CoolProp-cited triple
+// points added alongside (values from the reference-EoS fluid files,
+// CoolProp 8.0.0; papers cited on the classes).
+BOOST_AUTO_TEST_CASE(ComponentClassCaloricIdentity)
+{
+    using Caloric = Opm::IdealGasCaloricData<double>;
+
+    const auto checkSame = [](const char* name,
+                              const Opm::ComponentCp<double>& wrapper,
+                              const Opm::ComponentCp<double>& owner) {
+        BOOST_TEST_CONTEXT(name) {
+            BOOST_CHECK_EQUAL(wrapper.c0, owner.c0);
+            BOOST_CHECK_EQUAL(wrapper.c1, owner.c1);
+            BOOST_CHECK_EQUAL(wrapper.c2, owner.c2);
+            BOOST_CHECK_EQUAL(wrapper.c3, owner.c3);
+        }
+    };
+    checkSame("methane", Caloric::methane(),
+              Opm::C1<double>::idealGasHeatCapacityPolynomial());
+    checkSame("decane", Caloric::decane(),
+              Opm::C10<double>::idealGasHeatCapacityPolynomial());
+    checkSame("carbonDioxide", Caloric::carbonDioxide(),
+              Opm::SimpleCO2<double>::idealGasHeatCapacityPolynomial());
+
+    // triple points [K]/[Pa] vs the CoolProp reference-fluid values
+    BOOST_CHECK_CLOSE(Opm::C1<double>::tripleTemperature(), 90.6941, 1e-6);
+    BOOST_CHECK_CLOSE(Opm::C1<double>::triplePressure(), 11696.06, 0.01);
+    BOOST_CHECK_CLOSE(Opm::C10<double>::tripleTemperature(), 243.5, 1e-6);
+    BOOST_CHECK_CLOSE(Opm::C10<double>::triplePressure(), 1.4042, 0.02);
 }
 
 BOOST_AUTO_TEST_SUITE_END() // CaloricModel
@@ -329,16 +367,30 @@ using EOSTypeB = Opm::CompositionalConfig::EOSType;
 using FluidSystemGeneric = Opm::GenericOilGasWaterFluidSystem<Scalar, 2, false>;
 
 // idempotent per-case setup: register the F1 components on the generic fluid
-// system (its own conventions: molar mass g/mol, Vc m^3/kmol) and enable the
-// enthalpy support from the component-name presets
+// system straight from their component classes (the single identity card —
+// no literal constants; conversions to the fluid-system conventions: molar
+// mass g/mol, Vc m^3/kmol) and enable the enthalpy support from the
+// component-name presets
 void setupGenericF1()
 {
     using FS = FluidSystemGeneric;
+    using CompC1 = Opm::C1<Scalar>;
+    using CompC10 = Opm::C10<Scalar>;
     static bool done = false;
     if (!done) {
         FS::init();
-        FS::addComponent(FS::ComponentParam{"C1", 16.043, 190.6, 4.60e6, 9.863e-2, 0.011});
-        FS::addComponent(FS::ComponentParam{"C10", 142.28, 617.7, 2.11e6, 6.098e-1, 0.489});
+        FS::addComponent(FS::ComponentParam{std::string(CompC1::name()),
+                                            CompC1::molarMass() * 1e3,
+                                            CompC1::criticalTemperature(),
+                                            CompC1::criticalPressure(),
+                                            CompC1::criticalVolume(),
+                                            CompC1::acentricFactor()});
+        FS::addComponent(FS::ComponentParam{std::string(CompC10::name()),
+                                            CompC10::molarMass() * 1e3,
+                                            CompC10::criticalTemperature(),
+                                            CompC10::criticalPressure(),
+                                            CompC10::criticalVolume(),
+                                            CompC10::acentricFactor()});
         done = true;
     }
     FS::initEnthalpyFromComponentNames(); // exercises the preset name mapping

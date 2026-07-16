@@ -25,9 +25,15 @@
 /*!
  * \file
  *
- * \brief Ideal-gas heat-capacity polynomials and the enthalpy reference state
- *        used by the caloric mixture-enthalpy model (MixtureEnthalpy) and the
- *        isenthalpic (P-H) flash.
+ * \brief Name-keyed lookup of the components' ideal-gas heat-capacity
+ *        polynomials and the enthalpy reference state used by the caloric
+ *        mixture-enthalpy model (MixtureEnthalpy) and the isenthalpic (P-H)
+ *        flash.
+ *
+ * The polynomial coefficients live on the component classes (their caloric
+ * identity, next to the EoS constants); the polynomial mathematics lives in
+ * ComponentCp.hpp. This header owns the shared reference datum and the
+ * deck-style name lookup.
  *
  * Units are SI throughout: temperature [K], molar heat capacity [J/(mol K)],
  * molar enthalpy [J/mol]. Enthalpy is zero at the reference temperature.
@@ -35,47 +41,17 @@
 #ifndef OPM_IDEAL_GAS_CALORIC_DATA_HPP
 #define OPM_IDEAL_GAS_CALORIC_DATA_HPP
 
-#include <array>
+#include <opm/material/components/C1.hpp>
+#include <opm/material/components/C10.hpp>
+#include <opm/material/components/ComponentCp.hpp>
+#include <opm/material/components/SimpleCO2.hpp>
+
 #include <cctype>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace Opm {
-
-/*!
- * \brief Cubic ideal-gas heat-capacity polynomial of one component:
- *        cp(T) = c0 + c1*T + c2*T^2 + c3*T^3   [J/(mol K)]
- */
-template <class Scalar>
-struct ComponentCp {
-    Scalar c0, c1, c2, c3;
-
-    //! cp(T) [J/(mol K)]. Generic in the evaluation type (double or AD).
-    template <class Eval>
-    Eval heatCapacity(const Eval& T) const
-    {
-        return c0 + c1*T + c2*T*T + c3*T*T*T;
-    }
-
-    /*!
-     * \brief Ideal-gas enthalpy h(T) = int_{T0}^{T} cp dT' [J/mol],
-     *        in closed form. h(T0) = 0 by construction.
-     */
-    template <class Eval>
-    Eval enthalpyIntegral(const Eval& T, const Scalar T0) const
-    {
-        return c0*(T - T0)
-             + c1/2*(T*T - T0*T0)
-             + c2/3*(T*T*T - T0*T0*T0)
-             + c3/4*(T*T*T*T - T0*T0*T0*T0);
-    }
-};
-
-//! Per-component cp table for an N-component fluid system, indexed like the
-//! fluid system's component indices.
-template <class Scalar, int numComponents>
-using CpTable = std::array<ComponentCp<Scalar>, numComponents>;
 
 /*!
  * \brief The enthalpy reference state and component cp presets.
@@ -93,35 +69,28 @@ struct IdealGasCaloricData {
     //! caloric enthalpy itself is pressure-independent)
     static constexpr Scalar referencePressure() { return 1e5; }
 
-    // The coefficients below are least-squares cubic fits,
-    // cp = c0 + c1*T + c2*T^2 + c3*T^3, to the ideal-gas heat capacity of
-    // each fluid's reference equation of state, fitted over 250-600 K (the
-    // temperature window the isenthalpic flash practically operates in):
-    //   methane: Setzmann & Wagner, J. Phys. Chem. Ref. Data 20 (1991) 1061
-    //            (fit RMS 0.024, max 0.063 J/(mol K))
-    //   n-decane: Lemmon & Span, J. Chem. Eng. Data 51 (2006) 785
-    //            (fit RMS 0.27, max 0.79 J/(mol K))
-    //   CO2:     Span & Wagner, J. Phys. Chem. Ref. Data 25 (1996) 1509
-    //            (fit RMS 0.003, max 0.014 J/(mol K))
-    // The reference curves were sampled from the fluids' Helmholtz ideal
-    // parts (CoolProp 8.0.0 as the extraction tool; CoolProp itself is not a
-    // dependency). Outside 250-600 K the cubics extrapolate — refit rather
-    // than trust them there. A unit test pins each preset against tabulated
-    // reference values so a corrupt coefficient row cannot enter silently
-    // (an earlier n-decane row of untraceable origin was ~32% low, which
-    // no self-consistent round-trip test could detect).
+    // The coefficients live on the COMPONENT CLASSES (C1.hpp, C10.hpp,
+    // SimpleCO2.hpp — idealGasHeatCapacityPolynomial()), each next to the
+    // species' other constants and its provenance block: one identity card
+    // per species. The wrappers below are the stable lookup surface; the
+    // fitting recipe (least-squares cubic to the reference-EoS ideal-gas cp,
+    // 250-600 K window, CoolProp 8.0.0 as extraction tool) is documented on
+    // the classes. A unit test pins each preset against tabulated reference
+    // values so a corrupt coefficient row cannot enter silently (an earlier
+    // n-decane row of untraceable origin was ~32% low, which no
+    // self-consistent round-trip test could detect).
 
     //! methane (C1) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> methane()
-    { return {40.1503, -8.47372e-2, 2.93012e-4, -1.96125e-7}; }
+    { return C1<Scalar>::idealGasHeatCapacityPolynomial(); }
 
     //! n-decane (nC10) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> decane()
-    { return {79.4791, 3.1066e-1, 9.88317e-4, -1.00245e-6}; }
+    { return C10<Scalar>::idealGasHeatCapacityPolynomial(); }
 
     //! carbon dioxide (CO2) ideal-gas cp polynomial [J/(mol K)]
     static constexpr ComponentCp<Scalar> carbonDioxide()
-    { return {18.2687, 8.36359e-2, -7.75148e-5, 3.14088e-8}; }
+    { return SimpleCO2<Scalar>::idealGasHeatCapacityPolynomial(); }
 
     /*!
      * \brief Preset lookup by component name (deck-style aliases,

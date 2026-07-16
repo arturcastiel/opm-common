@@ -1307,6 +1307,7 @@ list(APPEND PUBLIC_HEADER_FILES
   opm/material/components/CO2.hpp
   opm/material/components/CO2Tables.hpp
   opm/material/components/Component.hpp
+  opm/material/components/ComponentCp.hpp
   opm/material/components/Dnapl.hpp
   opm/material/components/H2.hpp
   opm/material/components/H2O.hpp
