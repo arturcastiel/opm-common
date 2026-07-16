@@ -42,10 +42,16 @@
 #define BOOST_TEST_MODULE PhMvpPhFlash
 #include <boost/test/unit_test.hpp>
 
+#include <opm/material/components/BinaryInteraction.hpp>
+#include <opm/material/components/C1.hpp>
+#include <opm/material/components/N2.hpp>
 #include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/constraintsolvers/PHFlash.hpp>
-
+#include <opm/material/constraintsolvers/PTFlash.hpp>
+#include <opm/material/densead/Evaluation.hpp>
+#include <opm/material/fluidstates/CompositionalFluidState.hpp>
+#include <opm/material/fluidsystems/GenericOilGasWaterFluidSystem.hpp>
 #include <opm/material/fluidsystems/ThreeComponentFluidSystem.hh>
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
@@ -53,6 +59,7 @@
 #include "ph_mvp_fixtures.hh"
 
 #include <cmath>
+#include <string>
 
 using Scalar = double;
 using EOSType = Opm::CompositionalConfig::EOSType;
@@ -240,4 +247,107 @@ BOOST_AUTO_TEST_CASE(JouleThomsonSign)
     BOOST_CHECK_MESSAGE(tDeparture < f1Temperature,
                         "expected Joule-Thomson cooling, got T = " << tDeparture
                                                                    << " K at " << pLow << " Pa");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Bracket adaptation (endpoint-throw recovery). The confirmed field case: an
+// equimolar N2/C1 feed at 100 bar is single-phase supercritical, and its
+// inner flash throws (Rachford-Rice non-convergence) above ~400 K — INSIDE
+// the default [270, 460] K bracket. Before the adaptation, the hot bound's
+// throw turned into NO SOLUTION although the root sits at 300 K. The solver
+// must now recover it on the UNCHANGED default bracket — and stay honestly
+// false when the target is truly unattainable.
+// ────────────────────────────────────────────────────────────────────────────
+namespace {
+
+using FluidSystemN2C1 = Opm::GenericOilGasWaterFluidSystem<Scalar, 2, false>;
+using EvaluationN2C1 = Opm::DenseAd::Evaluation<Scalar, 3>;
+using PhFlashN2C1 = Opm::PHFlash<Scalar, FluidSystemN2C1>;
+using EnthalpyN2C1 = Opm::MixtureEnthalpy<Scalar, FluidSystemN2C1>;
+
+void setupN2C1()
+{
+    using FS = FluidSystemN2C1;
+    using CompN2 = Opm::N2<Scalar>;
+    using CompC1 = Opm::C1<Scalar>;
+    static bool done = false;
+    if (done)
+        return;
+    FS::init();
+    FS::addComponent(FS::ComponentParam{std::string(CompN2::name()),
+                                        CompN2::molarMass() * 1e3,
+                                        CompN2::criticalTemperature(),
+                                        CompN2::criticalPressure(),
+                                        CompN2::criticalVolume(),
+                                        CompN2::acentricFactor()});
+    FS::addComponent(FS::ComponentParam{std::string(CompC1::name()),
+                                        CompC1::molarMass() * 1e3,
+                                        CompC1::criticalTemperature(),
+                                        CompC1::criticalPressure(),
+                                        CompC1::criticalVolume(),
+                                        CompC1::acentricFactor()});
+    FS::setInteractionCoefficients({Opm::BinaryInteraction<Scalar>::kij("N2", "C1")});
+    FS::initEnthalpyFromComponentNames();
+    done = true;
+}
+
+Opm::CompositionalFluidState<EvaluationN2C1, FluidSystemN2C1>
+makeN2C1State(const Scalar p, const Scalar t)
+{
+    Opm::CompositionalFluidState<EvaluationN2C1, FluidSystemN2C1> fs;
+    for (unsigned phaseIdx = 0; phaseIdx < FluidSystemN2C1::numPhases; ++phaseIdx)
+        fs.setPressure(phaseIdx, p);
+    fs.setTemperature(t);
+    fs.setMoleFraction(0, 0.5);
+    fs.setMoleFraction(1, 0.5);
+    for (int compIdx = 0; compIdx < 2; ++compIdx)
+        fs.setKvalue(compIdx, fs.wilsonK_(compIdx));
+    fs.setLvalue(-1.0);
+    return fs;
+}
+
+typename PhFlashN2C1::Config n2c1Config()
+{
+    typename PhFlashN2C1::Config cfg; // deliberately the UNCHANGED defaults
+    for (int compIdx = 0; compIdx < 2; ++compIdx)
+        cfg.cpTable[compIdx] = Opm::IdealGasCaloricData<Scalar>::byName(
+            std::string(FluidSystemN2C1::componentName(compIdx)));
+    cfg.model = EnthalpyModel::eos_departure;
+    return cfg;
+}
+
+} // anonymous namespace
+
+BOOST_AUTO_TEST_CASE(BracketAdaptationRecoversSupercriticalFeed)
+{
+    setupN2C1();
+    constexpr Scalar p = 100e5;
+    constexpr Scalar tAnchor = 300.0;
+    const auto eos = EOSType::PR;
+    const auto cfg = n2c1Config();
+
+    // forward: isothermal flash at the anchor, read off the enthalpy
+    auto fs = makeN2C1State(p, tAnchor);
+    Opm::PTFlash<Scalar, FluidSystemN2C1, true>::solve(fs, "ssi", 1e-8, eos);
+    const Scalar hSpec = Opm::getValue(EnthalpyN2C1::mixtureEnthalpy(
+        fs, cfg.cpTable, cfg.refTemperature, eos, cfg.model));
+
+    // invert on the default bracket: pre-adaptation this reported false
+    auto fsBack = makeN2C1State(p, 0.5 * (cfg.tempMin + cfg.tempMax));
+    const bool ok = PhFlashN2C1::solve(fsBack, hSpec, cfg, "ssi", 1e-8, eos);
+    BOOST_REQUIRE_MESSAGE(ok, "adaptation failed to recover the interior root");
+    BOOST_CHECK_SMALL(std::abs(Opm::getValue(fsBack.temperature(0)) - tAnchor), 1e-4);
+}
+
+BOOST_AUTO_TEST_CASE(BracketAdaptationStaysHonestlyFalse)
+{
+    setupN2C1();
+    constexpr Scalar p = 100e5;
+    const auto eos = EOSType::PR;
+    const auto cfg = n2c1Config();
+
+    // far below H(tempMin) for this feed (H(270 K) ~ -2.2e3 J/mol):
+    // unattainable on any evaluable bracket — must stay false
+    auto fs = makeN2C1State(p, 0.5 * (cfg.tempMin + cfg.tempMax));
+    BOOST_CHECK(!PhFlashN2C1::solve(fs, -50000.0, cfg, "ssi", 1e-8, eos));
 }

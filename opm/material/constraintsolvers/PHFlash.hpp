@@ -67,6 +67,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -77,12 +78,13 @@ namespace Opm {
  *        the temperature search.
  *
  * The temperature bracket must contain the solution; a specified enthalpy
- * outside [H(tempMin), H(tempMax)] makes solve() return false. The bracket
- * bounds are full inner-flash evaluations, so they must lie within the
- * isothermal flash's robust operating envelope: at extreme temperatures the
+ * outside the attainable range makes solve() return false. The bracket
+ * bounds are full inner-flash evaluations; at extreme temperatures the
  * Wilson-seeded stability/split machinery can fail to converge (and throws).
- * The defaults are chosen inside that envelope and near the cp-correlation
- * validity range; widen them deliberately, not by default.
+ * A bound whose evaluation throws is stepped toward the other bound until it
+ * flashes (bracket adaptation) — no roots are lost, since H(T) is undefined
+ * wherever the inner flash cannot converge. The defaults are chosen near the
+ * cp-correlation validity range; widen them deliberately, not by default.
  */
 template <class Scalar, int numComponents>
 struct PHFlashConfig {
@@ -153,10 +155,14 @@ struct PHFlash {
      * \param verbosity inner-flash verbosity (passed through)
      * \return true on success — the root-find converged AND the final
      *         enthalpy residual |H(T*) - hSpec| lies within
-     *         cfg.enthalpyTolerance; false when no solution is found on the
-     *         bracket: hSpec outside the attainable enthalpy range, an
-     *         unpopulated cp table, an inner-flash convergence failure on
-     *         the sweep, or a residual exceeding the acceptance tolerance
+     *         cfg.enthalpyTolerance. A bracket bound whose inner flash
+     *         fails to converge is stepped toward the other bound until it
+     *         flashes (bracket adaptation) before anything else is decided.
+     *         false when no solution is found: hSpec outside the attainable
+     *         enthalpy range on the (possibly adapted) bracket, an
+     *         unpopulated cp table, a bound that stays unevaluable after
+     *         adaptation, an inner-flash convergence failure at an interior
+     *         trial, or a residual exceeding the acceptance tolerance
      *         at the converged temperature. The latter is how a
      *         departure-model enthalpy JUMP at a phase-label flip reports:
      *         the bracketing loop converges its interval onto the
@@ -285,47 +291,87 @@ struct PHFlash {
                 fluidState, cfg.cpTable, cfg.refTemperature, eosType, cfg.model));
             return h - hSpec;
         };
+        // Bracket adaptation (endpoint-throw recovery): a bracket BOUND whose
+        // inner flash fails to converge — deeply supercritical light-gas
+        // states are the confirmed field case (Rachford-Rice non-convergence
+        // above ~400 K for an equimolar N2/C1 feed at 100 bar, i.e. INSIDE
+        // the default bracket) — is stepped toward the opposite bound until
+        // it flashes. Losing that terrain loses no roots: where the inner
+        // flash cannot converge, H(T) cannot be EVALUATED, so no root is
+        // defined there. The honest-false contract is unchanged; it now
+        // speaks about the adapted bracket.
+        Scalar tLo = cfg.tempMin;
+        Scalar tHi = cfg.tempMax;
+
         // The root finder's API is double-typed; bridge explicitly, and
-        // memoize the two bracket-endpoint values: the root finder
-        // re-evaluates f at both endpoints on entry, which would otherwise
-        // duplicate the pre-check's two full (cold) inner flashes.
-        double rMinCached = 0.0, rMaxCached = 0.0;
+        // memoize the two bracket-bound values: the root finder re-evaluates
+        // f at both bounds on entry, which would otherwise duplicate the
+        // pre-check's two full (cold) inner flashes.
+        double rLoCached = 0.0, rHiCached = 0.0;
         bool endpointsCached = false;
         auto residualAsDouble = [&](const double T) -> double {
             if (endpointsCached) {
-                if (T == static_cast<double>(cfg.tempMin))
-                    return rMinCached;
-                if (T == static_cast<double>(cfg.tempMax))
-                    return rMaxCached;
+                if (T == static_cast<double>(tLo))
+                    return rLoCached;
+                if (T == static_cast<double>(tHi))
+                    return rHiCached;
             }
             return static_cast<double>(residual(static_cast<Scalar>(T)));
         };
 
         // Everything below reports failure as `false` per the contract:
-        // an inner-flash convergence failure anywhere on the sweep, a
-        // bracket without a sign change (hSpec unattainable — the bracket
-        // pre-check also keeps the root finder's bracketing-failure throw
-        // unreachable), or a final enthalpy residual beyond the acceptance
-        // tolerance. The residual check matters because the root finder's
-        // interval exit does not look at the function value: where the
-        // departure-model enthalpy jumps at a phase-label flip, the loop
-        // CONVERGES its interval onto the discontinuity (it does not
-        // exhaust iterations there) and only the residual can tell that no
-        // root exists inside the jump.
+        // an inner-flash convergence failure at an interior trial, a bound
+        // that stays unevaluable after adaptation, an (adapted) bracket
+        // without a sign change (hSpec unattainable — the pre-check also
+        // keeps the root finder's bracketing-failure throw unreachable), or
+        // a final enthalpy residual beyond the acceptance tolerance. The
+        // residual check matters because the root finder's interval exit
+        // does not look at the function value: where the departure-model
+        // enthalpy jumps at a phase-label flip, the loop CONVERGES its
+        // interval onto the discontinuity (it does not exhaust iterations
+        // there) and only the residual can tell that no root exists inside
+        // the jump.
         try {
-            const Scalar rMin = residual(cfg.tempMin);
-            const Scalar rMax = residual(cfg.tempMax);
-            if (rMin * rMax > 0.0)
-                return false; // hSpec unattainable on the bracket
-            rMinCached = static_cast<double>(rMin);
-            rMaxCached = static_cast<double>(rMax);
+            // evaluate a bound, stepping it a quarter of the remaining span
+            // toward the other bound each time its inner flash throws
+            constexpr int maxAdaptations = 8;
+            auto evaluateBound = [&](Scalar& tBound, const Scalar tOther,
+                                     Scalar& rBound) -> bool {
+                for (int attempt = 0; attempt < maxAdaptations; ++attempt) {
+                    try {
+                        rBound = residual(tBound);
+                        return true;
+                    }
+                    catch (const std::runtime_error&) {
+                        tBound += 0.25 * (tOther - tBound);
+                    }
+                }
+                return false;
+            };
+
+            Scalar rLo = 0.0, rHi = 0.0;
+            if (!evaluateBound(tLo, tHi, rLo))
+                return false; // no evaluable state found from the cold side
+            if (!evaluateBound(tHi, tLo, rHi))
+                return false; // no evaluable state found from the hot side
+            if (!(tLo < tHi))
+                return false; // adaptation collapsed the bracket
+            if (verbosity >= 1 && (tLo != cfg.tempMin || tHi != cfg.tempMax)) {
+                std::cout << "PHFlash: bracket adapted to [" << tLo << ", "
+                          << tHi << "] K (a bound's inner flash did not converge)"
+                          << std::endl;
+            }
+            if (rLo * rHi > 0.0)
+                return false; // hSpec unattainable on the (adapted) bracket
+            rLoCached = static_cast<double>(rLo);
+            rHiCached = static_cast<double>(rHi);
             endpointsCached = true;
 
             int iterationsUsed = 0;
             const double temperature =
                 RegulaFalsi<ThrowOnError>::solve(residualAsDouble,
-                                                 static_cast<double>(cfg.tempMin),
-                                                 static_cast<double>(cfg.tempMax),
+                                                 static_cast<double>(tLo),
+                                                 static_cast<double>(tHi),
                                                  cfg.maxIterations,
                                                  static_cast<double>(cfg.tolerance),
                                                  iterationsUsed);
