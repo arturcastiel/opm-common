@@ -1300,6 +1300,7 @@ list(APPEND PUBLIC_HEADER_FILES
   opm/material/common/Valgrind.hpp
   opm/material/common/quad.hpp
   opm/material/components/Air.hpp
+  opm/material/components/BinaryInteraction.hpp
   opm/material/components/Brine.hpp
   opm/material/components/BrineDynamic.hpp
   opm/material/components/C1.hpp

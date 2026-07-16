@@ -41,6 +41,7 @@
 #include <opm/material/eos/CubicEOS.hpp>
 #include <opm/material/fluidsystems/BaseFluidSystem.hpp>
 #include <opm/material/fluidsystems/ThreeComponentFluidSystem.hh>
+#include <opm/material/components/BinaryInteraction.hpp>
 #include <opm/material/components/C10.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
@@ -89,10 +90,10 @@ public:
     using Comp0 = C1<Scalar>;
     using Comp1 = C10<Scalar>;
 
-    //! C1/nC10 binary interaction parameter (standard PR literature value for
-    //! the methane/n-decane pair). The unequal-index shortcut in
+    //! C1/nC10 binary interaction parameter, from the single cited home of
+    //! the pair values (BinaryInteraction.hpp). The unequal-index shortcut in
     //! interactionCoefficient() is valid only because the system is binary.
-    static constexpr Scalar bipC1nC10 = 0.0411;
+    static constexpr Scalar bipC1nC10 = BinaryInteraction<Scalar>::kij("C1", "C10");
 
     template <class ValueType>
     using ParameterCache = PTFlashParameterCache<ValueType, TwoComponentFluidSystem<Scalar>>;

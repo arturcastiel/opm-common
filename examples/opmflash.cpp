@@ -38,6 +38,7 @@
 
 #include "config.h"
 
+#include <opm/material/components/BinaryInteraction.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/C10.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
@@ -75,9 +76,8 @@ using EOSType = Opm::CompositionalConfig::EOSType;
 // C10.hpp, SimpleCO2.hpp), converted to the fluid-system conventions
 // (molar mass g/mol, critical volume m3/kmol). Heat-capacity data comes
 // from the IdealGasCaloricData presets of the same names. Binary
-// interaction coefficients are the standard PR literature values used
-// throughout this library's compositional tests: C1/nC10 0.0411;
-// C1/CO2 and CO2/nC10 0.10.
+// interaction coefficients come from their single cited home,
+// BinaryInteraction.hpp.
 struct ComponentEntry {
     std::string_view name;    // canonical, understood by IdealGasCaloricData
     double molarMassGramPerMol;
@@ -126,13 +126,8 @@ const ComponentEntry& lookupComponent(const std::string& name)
 
 double pairKij(std::string_view a, std::string_view b)
 {
-    const auto is = [](std::string_view x, std::string_view y,
-                       std::string_view p, std::string_view q)
-    { return (x == p && y == q) || (x == q && y == p); };
-    if (is(a, b, "C1", "C10")) { return 0.0411; }
-    if (is(a, b, "C1", "CO2")) { return 0.10; }
-    if (is(a, b, "CO2", "C10")) { return 0.10; }
-    return 0.0;
+    // single cited home of the pair values: BinaryInteraction.hpp
+    return Opm::BinaryInteraction<double>::kij(a, b);
 }
 
 // ── command line ───────────────────────────────────────────────────────────
@@ -211,11 +206,16 @@ void listComponents()
     }
     std::cout <<
         "\nBinary interaction coefficients (applied automatically per pair;\n"
-        "standard PR literature values, the same ones this library's\n"
-        "compositional tests use):\n"
-        "  C1/C10   0.0411\n"
-        "  C1/CO2   0.10\n"
-        "  CO2/C10  0.10\n"
+        "standard PR literature values from BinaryInteraction.hpp, the same\n"
+        "ones this library's compositional tests use):\n";
+    const auto& db = componentDatabase();
+    for (std::size_t i = 0; i < db.size(); ++i) {
+        for (std::size_t j = i + 1; j < db.size(); ++j) {
+            std::cout << "  " << db[i].name << '/' << db[j].name << "   "
+                      << std::defaultfloat << pairKij(db[i].name, db[j].name) << '\n';
+        }
+    }
+    std::cout <<
         "  (any pair not listed: 0)\n\n"
         "Select with --components, e.g.  --components C1,C10  or\n"
         "--components CO2,C1,C10  (2 or 3 components; --z must match).\n";
