@@ -36,8 +36,13 @@
 #define BOOST_TEST_MODULE PhMvpEnthalpy
 #include <boost/test/unit_test.hpp>
 
+#include <opm/material/components/Air.hpp>
+#include <opm/material/components/BinaryInteraction.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/C10.hpp>
+#include <opm/material/components/H2.hpp>
+#include <opm/material/components/H2O.hpp>
+#include <opm/material/components/N2.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
 #include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
@@ -174,6 +179,13 @@ BOOST_AUTO_TEST_CASE(PresetsMatchReferenceIdealGasCp)
         {"methane", Caloric::methane(), {35.7085, 37.9628, 43.5052, 52.4919}},
         {"decane", Caloric::decane(), {233.0250, 266.2081, 328.2699, 405.7329}},
         {"carbonDioxide", Caloric::carbonDioxide(), {37.1408, 39.3941, 43.0700, 47.3303}},
+        // tier-1 batch (reference-EoS ideal-gas cp via CoolProp 8.0.0):
+        // Span et al. 2000 N2 · Wagner & Pruss 2002 H2O (window 275-600 K) ·
+        // Leachman et al. 2009 H2 · Lemmon et al. 2000 air
+        {"nitrogen", Caloric::nitrogen(), {29.1253, 29.1665, 29.3869, 30.1091}},
+        {"water", Caloric::water(), {33.5873, 33.8786, 34.7197, 36.3249}},
+        {"hydrogen", Caloric::hydrogen(), {28.8341, 29.0864, 29.2280, 29.3287}},
+        {"air", Caloric::air(), {29.1012, 29.2001, 29.5591, 30.4393}},
     };
 
     for (const auto& pin : pins) {
@@ -214,12 +226,36 @@ BOOST_AUTO_TEST_CASE(ComponentClassCaloricIdentity)
               Opm::C10<double>::idealGasHeatCapacityPolynomial());
     checkSame("carbonDioxide", Caloric::carbonDioxide(),
               Opm::SimpleCO2<double>::idealGasHeatCapacityPolynomial());
+    checkSame("nitrogen", Caloric::nitrogen(),
+              Opm::N2<double>::idealGasHeatCapacityPolynomial());
+    checkSame("water", Caloric::water(),
+              Opm::H2O<double>::idealGasHeatCapacityPolynomial());
+    checkSame("hydrogen", Caloric::hydrogen(),
+              Opm::H2<double>::idealGasHeatCapacityPolynomial());
+    checkSame("air", Caloric::air(),
+              Opm::Air<double>::idealGasHeatCapacityPolynomial());
 
     // triple points [K]/[Pa] vs the CoolProp reference-fluid values
     BOOST_CHECK_CLOSE(Opm::C1<double>::tripleTemperature(), 90.6941, 1e-6);
     BOOST_CHECK_CLOSE(Opm::C1<double>::triplePressure(), 11696.06, 0.01);
     BOOST_CHECK_CLOSE(Opm::C10<double>::tripleTemperature(), 243.5, 1e-6);
     BOOST_CHECK_CLOSE(Opm::C10<double>::triplePressure(), 1.4042, 0.02);
+}
+
+// kij pairs: single cited home (BinaryInteraction.hpp). Pin the three PR
+// values, symmetry, the zero default, and the fixture's agreement — the
+// consumer copies can no longer drift apart.
+BOOST_AUTO_TEST_CASE(KijPairsSingleSource)
+{
+    using BI = Opm::BinaryInteraction<double>;
+    BOOST_CHECK_EQUAL(BI::kij("C1", "C10"), 0.0411);
+    BOOST_CHECK_EQUAL(BI::kij("C1", "CO2"), 0.10);
+    BOOST_CHECK_EQUAL(BI::kij("CO2", "C10"), 0.10);
+    BOOST_CHECK_EQUAL(BI::kij("C10", "C1"), BI::kij("C1", "C10")); // symmetric
+    BOOST_CHECK_EQUAL(BI::kij("C1", "N2"), 0.0);                   // unlisted -> 0
+    // the F1 fixture fluid system draws from the same home
+    BOOST_CHECK_EQUAL(FluidSystemF1::interactionCoefficient(0, 1),
+                      BI::kij("C1", "C10"));
 }
 
 BOOST_AUTO_TEST_SUITE_END() // CaloricModel

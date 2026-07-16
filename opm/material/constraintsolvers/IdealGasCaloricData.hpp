@@ -41,9 +41,13 @@
 #ifndef OPM_IDEAL_GAS_CALORIC_DATA_HPP
 #define OPM_IDEAL_GAS_CALORIC_DATA_HPP
 
+#include <opm/material/components/Air.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/C10.hpp>
 #include <opm/material/components/ComponentCp.hpp>
+#include <opm/material/components/H2.hpp>
+#include <opm/material/components/H2O.hpp>
+#include <opm/material/components/N2.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
 
 #include <cctype>
@@ -92,6 +96,22 @@ struct IdealGasCaloricData {
     static constexpr ComponentCp<Scalar> carbonDioxide()
     { return SimpleCO2<Scalar>::idealGasHeatCapacityPolynomial(); }
 
+    //! nitrogen (N2) ideal-gas cp polynomial [J/(mol K)]
+    static constexpr ComponentCp<Scalar> nitrogen()
+    { return N2<Scalar>::idealGasHeatCapacityPolynomial(); }
+
+    //! water (H2O) ideal-gas cp polynomial [J/(mol K)] — window 275–600 K
+    static constexpr ComponentCp<Scalar> water()
+    { return H2O<Scalar>::idealGasHeatCapacityPolynomial(); }
+
+    //! hydrogen (H2) ideal-gas cp polynomial [J/(mol K)]
+    static constexpr ComponentCp<Scalar> hydrogen()
+    { return H2<Scalar>::idealGasHeatCapacityPolynomial(); }
+
+    //! air (pseudo-component) ideal-gas cp polynomial [J/(mol K)]
+    static constexpr ComponentCp<Scalar> air()
+    { return Air<Scalar>::idealGasHeatCapacityPolynomial(); }
+
     /*!
      * \brief Preset lookup by component name (deck-style aliases,
      *        case-insensitive).
@@ -112,6 +132,14 @@ struct IdealGasCaloricData {
             return decane();
         if (n == "CO2" || n == "CARBONDIOXIDE" || n == "CARBON-DIOXIDE" || n == "CARBON DIOXIDE")
             return carbonDioxide();
+        if (n == "N2" || n == "NITROGEN")
+            return nitrogen();
+        if (n == "H2O" || n == "WATER")
+            return water();
+        if (n == "H2" || n == "HYDROGEN")
+            return hydrogen();
+        if (n == "AIR")
+            return air();
 
         throw std::runtime_error(
             "IdealGasCaloricData: no ideal-gas heat-capacity preset for component '"

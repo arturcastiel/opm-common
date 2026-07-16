@@ -30,6 +30,7 @@
 #include <opm/common/Exceptions.hpp>
 
 #include <opm/material/components/Component.hpp>
+#include <opm/material/components/ComponentCp.hpp>
 #include <opm/material/common/MathToolbox.hpp>
 #include <opm/material/IdealGas.hpp>
 
@@ -95,6 +96,25 @@ public:
      */
     static Scalar criticalPressure()
     { return 37.86e5; /* [Pa] */ }
+
+    /*!
+     * \brief Cubic ideal-gas heat-capacity polynomial of air \f$\mathrm{[J/(mol\ K)]}\f$.
+     *
+     * Least-squares fit to the ideal-gas part of the reference model for
+     * standard air (Lemmon, Jacobsen, Penoncello & Friend, J. Phys. Chem.
+     * Ref. Data 2000), window 250–600 K, RMS 0.003 / max 0.008 J/(mol K);
+     * sampled via CoolProp 8.0.0 (extraction tool only). Air is a
+     * pseudo-component; the polynomial describes the standard mixture.
+     * Outside the window the cubic extrapolates — refit rather than trust
+     * it there.
+     *
+     * This is the CALORIC (ideal-gas) identity consumed by MixtureEnthalpy
+     * and the isenthalpic flash; it deliberately does NOT implement the
+     * Component<> gasEnthalpy/gasHeatCapacity slots (those are real-fluid
+     * correlations where implemented).
+     */
+    static constexpr ComponentCp<Scalar> idealGasHeatCapacityPolynomial()
+    { return {29.9425, -7.55596e-3, 1.76632e-5, -6.12278e-9}; }
 
     /*!
      * \brief The density of \f$AIR\f$ at a given pressure and temperature [kg/m^3].

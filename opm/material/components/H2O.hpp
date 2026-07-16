@@ -33,6 +33,7 @@
 #include "iapws/Region4.hpp"
 
 #include "Component.hpp"
+#include "ComponentCp.hpp"
 
 #include <opm/common/Exceptions.hpp>
 
@@ -90,6 +91,23 @@ public:
      */
     static const Scalar acentricFactor()
     { return Common::acentricFactor; }
+
+    /*!
+     * \brief Cubic ideal-gas heat-capacity polynomial of water \f$\mathrm{[J/(mol\ K)]}\f$.
+     *
+     * Least-squares fit to the ideal-gas part of the reference EoS
+     * (Wagner & Pruß, J. Phys. Chem. Ref. Data 2002 — IAPWS-95), window
+     * 275–600 K (IAPWS-95 exposes no ideal part below its Tmin = 273.16 K),
+     * RMS 0.002 / max 0.006 J/(mol K); sampled via CoolProp 8.0.0
+     * (extraction tool only). Outside the window the cubic extrapolates —
+     * refit rather than trust it there.
+     *
+     * This is the CALORIC (ideal-gas) identity consumed by MixtureEnthalpy
+     * and the isenthalpic flash; it deliberately does NOT implement or
+     * replace this class's real-fluid IAPWS enthalpy methods.
+     */
+    static constexpr ComponentCp<Scalar> idealGasHeatCapacityPolynomial()
+    { return {35.0748, -1.70167e-2, 4.87443e-5, -2.821e-8}; }
 
     /*!
      * \brief Returns the critical temperature \f$\mathrm{[K]}\f$ of water
