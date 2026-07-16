@@ -40,10 +40,19 @@
  *    source — this table is for the non-deck consumers (tests, opmflash)
  *    that would otherwise each carry their own copy.
  *
- * The values are the standard Peng-Robinson literature coefficients used
- * throughout this library's compositional tests. Scope note: kij values are
- * EoS-family-specific — these are PR values; a future SRK consumer extends
- * the lookup with its own cited set rather than reusing these.
+ * The values are Peng-Robinson coefficients, per-pair sourced:
+ *  - the hydrocarbon/CO2 trio (C1/C10, C1/CO2, CO2/C10) are the values this
+ *    library's compositional tests have always used;
+ *  - the N2/H2O/H2 pairs come from the darts-flash component-data
+ *    compilation (TU Delft open-darts, dartsflash/components.py), itself a
+ *    literature compilation.
+ * Cross-source note: compilations disagree within a few 1e-2 (e.g.
+ * darts-flash lists C1/C10 = 0.0484 where this library uses 0.0411) — one
+ * source per pair, never mixed for the same pair.
+ *
+ * Scope note: kij values are EoS-family-specific — these are PR values; a
+ * future SRK consumer extends the lookup with its own cited set rather than
+ * reusing these.
  *
  * Unlisted pairs return 0.0 — the standard convention (ideal geometric-mean
  * mixing), also what every fluid system defaults to.
@@ -68,9 +77,19 @@ struct BinaryInteraction {
                                std::string_view p, std::string_view q)
         { return (x == p && y == q) || (x == q && y == p); };
 
+        // this library's compositional-test values
         if (is(a, b, "C1", "C10")) { return 0.0411; }
         if (is(a, b, "C1", "CO2")) { return 0.10; }
         if (is(a, b, "CO2", "C10")) { return 0.10; }
+        // darts-flash component-data compilation
+        if (is(a, b, "N2", "C1")) { return 0.0291; }
+        if (is(a, b, "N2", "C10")) { return 0.1; }
+        if (is(a, b, "N2", "CO2")) { return -0.0462; }
+        if (is(a, b, "N2", "H2O")) { return 0.32547; }
+        if (is(a, b, "H2O", "C1")) { return 0.47893; }
+        if (is(a, b, "H2O", "C10")) { return 0.48; }
+        if (is(a, b, "H2O", "CO2")) { return 0.19014; }
+        if (is(a, b, "H2", "C1")) { return -0.1622; }
         return 0.0;
     }
 };

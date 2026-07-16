@@ -41,6 +41,9 @@
 #include <opm/material/components/BinaryInteraction.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/C10.hpp>
+#include <opm/material/components/H2.hpp>
+#include <opm/material/components/H2O.hpp>
+#include <opm/material/components/N2.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
 #include <opm/material/constraintsolvers/IdealGasCaloricData.hpp>
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
@@ -79,7 +82,7 @@ using EOSType = Opm::CompositionalConfig::EOSType;
 // interaction coefficients come from their single cited home,
 // BinaryInteraction.hpp.
 struct ComponentEntry {
-    std::string_view name;    // canonical, understood by IdealGasCaloricData
+    std::string name;         // canonical, understood by IdealGasCaloricData
     double molarMassGramPerMol;
     double criticalTemperature;
     double criticalPressure;
@@ -90,16 +93,22 @@ struct ComponentEntry {
 template <class Comp>
 ComponentEntry makeEntry()
 {
-    return {Comp::name(), Comp::molarMass() * 1e3, Comp::criticalTemperature(),
+    return {std::string(Comp::name()), Comp::molarMass() * 1e3, Comp::criticalTemperature(),
             Comp::criticalPressure(), Comp::criticalVolume(), Comp::acentricFactor()};
 }
 
+// Water is flashed as a plain PR component here (no association term) — fine
+// for quick checks, not a rigorous aqueous model. Air is deliberately absent:
+// its component class carries no acentric factor / critical volume.
 const std::vector<ComponentEntry>& componentDatabase()
 {
     static const std::vector<ComponentEntry> db{
         makeEntry<Opm::C1<double>>(),
         makeEntry<Opm::C10<double>>(),
         makeEntry<Opm::SimpleCO2<double>>(),
+        makeEntry<Opm::N2<double>>(),
+        makeEntry<Opm::H2O<double>>(),
+        makeEntry<Opm::H2<double>>(),
     };
     return db;
 }
@@ -113,6 +122,9 @@ const ComponentEntry& lookupComponent(const std::string& name)
         if (upper == "C1" || upper == "CH4" || upper == "METHANE") { return "C1"; }
         if (upper == "C10" || upper == "NC10" || upper == "DECANE" || upper == "N-DECANE") { return "C10"; }
         if (upper == "CO2" || upper == "CARBONDIOXIDE") { return "CO2"; }
+        if (upper == "N2" || upper == "NITROGEN") { return "N2"; }
+        if (upper == "H2O" || upper == "WATER") { return "H2O"; }
+        if (upper == "H2" || upper == "HYDROGEN") { return "H2"; }
         return upper;
     }();
     for (const auto& entry : componentDatabase()) {
@@ -195,6 +207,9 @@ void listComponents()
         if (e.name == "C1") { aliases = "CH4, METHANE"; }
         else if (e.name == "C10") { aliases = "nC10, DECANE"; }
         else if (e.name == "CO2") { aliases = "CARBONDIOXIDE"; }
+        else if (e.name == "N2") { aliases = "NITROGEN"; }
+        else if (e.name == "H2O") { aliases = "WATER"; }
+        else if (e.name == "H2") { aliases = "HYDROGEN"; }
         std::cout << "  " << std::setw(5) << std::left << e.name
                   << std::setw(17) << aliases << std::right
                   << std::setw(9) << std::setprecision(3) << e.molarMassGramPerMol
@@ -218,7 +233,8 @@ void listComponents()
     std::cout <<
         "  (any pair not listed: 0)\n\n"
         "Select with --components, e.g.  --components C1,C10  or\n"
-        "--components CO2,C1,C10  (2 or 3 components; --z must match).\n";
+        "--components CO2,C1,C10  (2 to 4 components; --z must match).\n"
+        "Note: H2O is flashed as a plain PR component (no association term).\n";
 }
 
 void printUsage()
@@ -568,8 +584,9 @@ int dispatchOnComponentCount(const Cli& cli)
     switch (cli.components.size()) {
     case 2: return runCases<2>(cli);
     case 3: return runCases<3>(cli);
+    case 4: return runCases<4>(cli);
     default:
-        throw std::runtime_error("supported component counts: 2, 3");
+        throw std::runtime_error("supported component counts: 2, 3, 4");
     }
 }
 

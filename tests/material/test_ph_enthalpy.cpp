@@ -252,7 +252,17 @@ BOOST_AUTO_TEST_CASE(KijPairsSingleSource)
     BOOST_CHECK_EQUAL(BI::kij("C1", "CO2"), 0.10);
     BOOST_CHECK_EQUAL(BI::kij("CO2", "C10"), 0.10);
     BOOST_CHECK_EQUAL(BI::kij("C10", "C1"), BI::kij("C1", "C10")); // symmetric
-    BOOST_CHECK_EQUAL(BI::kij("C1", "N2"), 0.0);                   // unlisted -> 0
+    // darts-flash compilation pairs (N2/H2O/H2)
+    BOOST_CHECK_EQUAL(BI::kij("N2", "C1"), 0.0291);
+    BOOST_CHECK_EQUAL(BI::kij("N2", "C10"), 0.1);
+    BOOST_CHECK_EQUAL(BI::kij("N2", "CO2"), -0.0462);
+    BOOST_CHECK_EQUAL(BI::kij("N2", "H2O"), 0.32547);
+    BOOST_CHECK_EQUAL(BI::kij("H2O", "C1"), 0.47893);
+    BOOST_CHECK_EQUAL(BI::kij("H2O", "C10"), 0.48);
+    BOOST_CHECK_EQUAL(BI::kij("H2O", "CO2"), 0.19014);
+    BOOST_CHECK_EQUAL(BI::kij("H2", "C1"), -0.1622);
+    BOOST_CHECK_EQUAL(BI::kij("H2", "H2O"), 0.0);                  // listed-as-zero source value
+    BOOST_CHECK_EQUAL(BI::kij("C1", "XX"), 0.0);                   // unlisted -> 0
     // the F1 fixture fluid system draws from the same home
     BOOST_CHECK_EQUAL(FluidSystemF1::interactionCoefficient(0, 1),
                       BI::kij("C1", "C10"));
