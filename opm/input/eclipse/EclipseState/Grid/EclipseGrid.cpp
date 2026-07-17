@@ -59,6 +59,7 @@
 #include <opm/input/eclipse/Parser/ParserKeywords/Z.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -300,6 +301,41 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
     initGrid(deck, actnum);
 
+    if (deck.hasKeyword<ParserKeywords::DUALPORO>()) {
+        this->m_dualPorosity = true;
+
+        if (this->getNZ() % 2 != 0) {
+            throw OpmInputError(fmt::format("DUALPORO requires an even number of layers, but NZ={} was given. "
+                                            "The first NZ/2 layers hold the matrix cells and the last NZ/2 "
+                                            "layers the fracture cells.", this->getNZ()),
+                                deck.get<ParserKeywords::DUALPORO>().front().location());
+        }
+
+        // Shared geometry: the fracture half duplicates the matrix half's
+        // corner depths — the fracture system has no geometry of its own
+        // (grid geometry is defined by the matrix cells only). Deck-supplied
+        // fracture-half geometry that disagrees is overridden with a warning;
+        // note the block-centred path stacks layers below the column top
+        // regardless of deeper TOPS values, so this copy is also what makes
+        // co-location expressible at all.
+        const std::size_t half = this->getCartesianSize() / 2;
+        std::size_t offset_twins = 0;
+        for (std::size_t g = 0; g < half; ++g) {
+            if (std::abs(this->getCellDepth(g) - this->getCellDepth(g + half)) > 1.0e-6)
+                ++offset_twins;
+        }
+
+        const std::size_t zcorn_half = this->m_zcorn.size() / 2;
+        std::copy(this->m_zcorn.begin(), this->m_zcorn.begin() + zcorn_half,
+                  this->m_zcorn.begin() + zcorn_half);
+
+        if (offset_twins > 0) {
+            OpmLog::warning(fmt::format("DUALPORO: {} fracture cell(s) had geometry differing from their "
+                                        "matrix twins; the shared matrix geometry is used for the "
+                                        "fracture system.", offset_twins));
+        }
+    }
+
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
         this->m_mapaxes = std::make_optional<MapAxes>( deck );
 
@@ -342,6 +378,34 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
     bool EclipseGrid::circle( ) const{
         return this->m_circle;
+    }
+
+    bool EclipseGrid::dualPorosity() const {
+        return this->m_dualPorosity;
+    }
+
+    std::size_t EclipseGrid::matrixLayerCount() const {
+        return this->m_dualPorosity ? this->getNZ() / 2 : this->getNZ();
+    }
+
+    bool EclipseGrid::isFractureLayer(std::size_t k) const {
+        return this->m_dualPorosity && (k >= this->getNZ() / 2);
+    }
+
+    bool EclipseGrid::isFractureCell(std::size_t globalIndex) const {
+        // Natural ordering is K-major, so the fracture half (k >= NZ/2) is
+        // exactly the upper half of the global index range.
+        return this->m_dualPorosity && (globalIndex >= this->getCartesianSize() / 2);
+    }
+
+    std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const {
+        assert(this->m_dualPorosity && !this->isFractureCell(matrixGlobalIndex));
+        return matrixGlobalIndex + this->getCartesianSize() / 2;
+    }
+
+    std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const {
+        assert(this->isFractureCell(fractureGlobalIndex));
+        return fractureGlobalIndex - this->getCartesianSize() / 2;
     }
 
 
