@@ -51,6 +51,7 @@
 
 #include <opm/input/eclipse/Parser/ParserKeywords/M.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/R.hpp>
+#include <opm/input/eclipse/Parser/ParserKeywords/S.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/T.hpp>
 
 #include <fmt/format.h>
@@ -160,6 +161,7 @@ namespace Opm {
             this->m_inputGrid.setDEPTH(field_props.get_double("DEPTH"));
         }
         this->conveyNumericalAquiferEffects();
+        this->applyDualPorosityNNC(deck);
         if (field_props.has_double("MINPVV")) {
             field_props.deleteMINPVV();
         }
@@ -457,6 +459,54 @@ namespace Opm {
         this->appendInputNNC(numerical_aquifer.aquiferCellNNCs());
 
         this->m_transMult.applyNumericalAquifer(numerical_aquifer.allAquiferCellIds());
+    }
+
+    // Dual porosity: couple every active matrix cell to its active fracture
+    // twin with one NNC carrying TR = PERMX_matrix * bulkVolume_matrix * sigma
+    // (all SI). sigma comes cell-by-cell from SIGMAV, or as one field value
+    // from SIGMA; the fracture-half entries of SIGMAV carry no meaning. A zero
+    // sigma means "no coupling" and produces no connection.
+    void EclipseState::applyDualPorosityNNC(const Deck& deck)
+    {
+        if (! this->m_runspec.dualPorosity()) {
+            return;
+        }
+
+        const auto& grid = this->m_inputGrid;
+        const std::size_t half = grid.getCartesianSize() / 2;
+
+        std::vector<double> sigmav;
+        double sigma_scalar = 0.0;
+        if (this->field_props.has_double("SIGMAV")) {
+            sigmav = this->field_props.get_global_double("SIGMAV");
+        }
+        else if (deck.hasKeyword<ParserKeywords::SIGMA>()) {
+            sigma_scalar = deck.get<ParserKeywords::SIGMA>().back()
+                               .getRecord(0).getItem(0).getSIDouble(0);
+        }
+        else {
+            OpmLog::warning("DUALPORO: neither SIGMA nor SIGMAV is present — "
+                            "no matrix-fracture coupling will be created.");
+            return;
+        }
+
+        const auto& permx = this->field_props.get_global_double("PERMX");
+
+        std::vector<NNCdata> dp_nnc;
+        for (std::size_t g = 0; g < half; ++g) {
+            const std::size_t twin = grid.fractureTwin(g);
+            if (!grid.cellActive(g) || !grid.cellActive(twin)) {
+                continue;
+            }
+
+            const double sigma = sigmav.empty() ? sigma_scalar : sigmav[g];
+            const double trans = permx[g] * grid.getCellVolume(g) * sigma;
+            if (trans > 0.0) {
+                dp_nnc.emplace_back(g, twin, trans);
+            }
+        }
+
+        this->appendInputNNC(dp_nnc);
     }
 
     void EclipseState::applyMULTXYZ()
