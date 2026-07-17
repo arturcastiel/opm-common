@@ -4107,3 +4107,79 @@ BOOST_AUTO_TEST_CASE(DualPorositySinglePorosityUnchanged) {
     for (std::size_t g = 0; g < grid.getCartesianSize(); ++g)
         BOOST_CHECK(!grid.isFractureCell(g));
 }
+
+BOOST_AUTO_TEST_CASE(DualPorosityEgridFileShape) {
+    // The written file carries geometry for the matrix half only: halved
+    // layer count, matrix-half ZCORN, extended one-per-geometric-cell ACTNUM,
+    // porosity-model flag set, and the coupling connection written
+    // fracture-cell first — the reference-simulator file layout.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2*2000 /\n"
+        "PORO\n 0.20 0.01 /\n"
+        "PERMX\n 1.0 1000.0 /\n"
+        "SIGMA\n 0.12 /\n"
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    Opm::EclipseState es(deck);
+    const auto& grid = es.getInputGrid();
+    const auto units = Opm::UnitSystem::newMETRIC();
+
+    WorkArea work;
+    const std::string fileName = "DPSHAPE.EGRID";
+    grid.save(fileName, false, es.getInputNNC().input(), units);
+
+    Opm::EclIO::EclFile file(fileName);
+
+    const auto filehead = file.get<int>("FILEHEAD");
+    BOOST_CHECK_EQUAL(filehead[5], 1);      // porosity model: dual porosity
+
+    const auto gridhead = file.get<int>("GRIDHEAD");
+    BOOST_CHECK_EQUAL(gridhead[1], 1);
+    BOOST_CHECK_EQUAL(gridhead[2], 1);
+    BOOST_CHECK_EQUAL(gridhead[3], 1);      // halved NZ
+
+    const auto zcorn = file.get<float>("ZCORN");
+    BOOST_CHECK_EQUAL(zcorn.size(), 8U);    // one geometric cell only
+
+    const auto actnum = file.get<int>("ACTNUM");
+    BOOST_REQUIRE_EQUAL(actnum.size(), 1U);
+    BOOST_CHECK_EQUAL(actnum[0], 3);        // matrix AND fracture active
+
+    const auto nnc1 = file.get<int>("NNC1");
+    const auto nnc2 = file.get<int>("NNC2");
+    BOOST_REQUIRE_EQUAL(nnc1.size(), 1U);
+    BOOST_CHECK_EQUAL(nnc1[0], 2);          // fracture cell first
+    BOOST_CHECK_EQUAL(nnc2[0], 1);          // matrix cell second
+}
+
+BOOST_AUTO_TEST_CASE(DualPorosityEgridSinglePorosityShapeUnchanged) {
+    // A single-porosity grid keeps the full shape — no halving, plain ACTNUM.
+    const std::string props =
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2000 2010 /\n";
+    auto deck = createDualPorosityDeck("1 1 2", props, false);
+    Opm::EclipseGrid grid( deck );
+    const auto units = Opm::UnitSystem::newMETRIC();
+
+    WorkArea work;
+    const std::string fileName = "SPSHAPE.EGRID";
+    grid.save(fileName, false, std::vector<Opm::NNCdata>{}, units);
+
+    Opm::EclIO::EclFile file(fileName);
+    const auto filehead = file.get<int>("FILEHEAD");
+    BOOST_CHECK_EQUAL(filehead[5], 0);
+    const auto gridhead = file.get<int>("GRIDHEAD");
+    BOOST_CHECK_EQUAL(gridhead[3], 2);
+    BOOST_CHECK_EQUAL(file.get<float>("ZCORN").size(), 16U);
+    BOOST_CHECK_EQUAL(file.get<int>("ACTNUM").size(), 2U);
+}

@@ -114,6 +114,7 @@ namespace Opm::RestartIO {
 
         /// Logical switch to indicate that the network option is used.
         LogiHEAD& network(const int maxNoNodes);
+        LogiHEAD& dualPorosity(const bool dual_poro);
 
         /// Linearised result array.
         ///
