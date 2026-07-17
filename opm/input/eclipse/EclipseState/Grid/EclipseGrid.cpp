@@ -311,29 +311,24 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
                                 deck.get<ParserKeywords::DUALPORO>().front().location());
         }
 
-        // Shared geometry: the fracture half duplicates the matrix half's
-        // corner depths — the fracture system has no geometry of its own
-        // (grid geometry is defined by the matrix cells only). Deck-supplied
-        // fracture-half geometry that disagrees is overridden with a warning;
-        // note the block-centred path stacks layers below the column top
-        // regardless of deeper TOPS values, so this copy is also what makes
-        // co-location expressible at all.
+        // The fracture system has no geometry of its own: it shares the matrix
+        // geometry. The doubled internal grid keeps whatever (pillar-monotone)
+        // corner depths the deck/builder produced for the fracture half — that
+        // stacking is pure bookkeeping so downstream corner-point processing
+        // stays valid — while the PHYSICAL co-location is enforced through the
+        // cell-depth override: every fracture cell reports its matrix twin's
+        // depth (the same mechanism numerical-aquifer cells use). Volumes and
+        // thickness are twin-identical by construction (same DX/DY/DZ), so
+        // depth is the only property that needs the identity.
         const std::size_t half = this->getCartesianSize() / 2;
-        std::size_t offset_twins = 0;
-        for (std::size_t g = 0; g < half; ++g) {
-            if (std::abs(this->getCellDepth(g) - this->getCellDepth(g + half)) > 1.0e-6)
-                ++offset_twins;
+        std::vector<double> depth(this->getNumActive());
+        for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
+            if (!this->cellActive(g))
+                continue;
+            const std::size_t geom = (g < half) ? g : (g - half);
+            depth[this->activeIndex(g)] = this->getCellDepth(geom);
         }
-
-        const std::size_t zcorn_half = this->m_zcorn.size() / 2;
-        std::copy(this->m_zcorn.begin(), this->m_zcorn.begin() + zcorn_half,
-                  this->m_zcorn.begin() + zcorn_half);
-
-        if (offset_twins > 0) {
-            OpmLog::warning(fmt::format("DUALPORO: {} fracture cell(s) had geometry differing from their "
-                                        "matrix twins; the shared matrix geometry is used for the "
-                                        "fracture system.", offset_twins));
-        }
+        this->setDEPTH(depth);
     }
 
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
