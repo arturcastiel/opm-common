@@ -712,7 +712,7 @@ constexpr double dpMinExpectedTrans = 9.869232667160130e-16 * 1.0e5 * 0.12;
 } // anonymous namespace
 
 BOOST_AUTO_TEST_CASE(DualPorositySigmaNNCFromScalarSigma) {
-    // The reference-fixture case: one block, sigma as a single field value.
+    // One block, sigma as a single field value.
     auto deck = createDualPorosityStateDeck("1 1 2", dpMinProps + "SIGMA\n 0.12 /\n");
     EclipseState es(deck);
 

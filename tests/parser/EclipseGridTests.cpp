@@ -4029,11 +4029,6 @@ BOOST_AUTO_TEST_CASE(DualPorosityTwinMapping) {
     BOOST_CHECK(grid.dualPorosity());
     BOOST_CHECK_EQUAL(grid.matrixLayerCount(), 2U);
 
-    BOOST_CHECK(!grid.isFractureLayer(0));
-    BOOST_CHECK(!grid.isFractureLayer(1));
-    BOOST_CHECK(grid.isFractureLayer(2));
-    BOOST_CHECK(grid.isFractureLayer(3));
-
     const std::size_t half = grid.getCartesianSize() / 2;
     BOOST_CHECK_EQUAL(half, 12U);
     BOOST_CHECK(!grid.isFractureCell(half - 1));
@@ -4052,7 +4047,7 @@ BOOST_AUTO_TEST_CASE(DualPorosityTwinMapping) {
 }
 
 BOOST_AUTO_TEST_CASE(DualPorosityColocatedGeometry) {
-    // The reference-fixture layout: 1x1x2, both halves 100x100x10 at 2000 m.
+    // 1x1x2, both halves 100x100x10 at 2000 m — the smallest dual-porosity case.
     // Both continua carry the FULL block bulk volume; the fracture twin is
     // co-located (same depth, same thickness).
     const std::string props =
@@ -4073,8 +4068,8 @@ BOOST_AUTO_TEST_CASE(DualPorosityColocatedGeometry) {
 
 BOOST_AUTO_TEST_CASE(DualPorosityDeckOffsetOverridden) {
     // The fracture system has no geometry of its own: whatever the deck says
-    // for the fracture half, the shared matrix geometry wins (a warning is
-    // emitted when they disagree).
+    // for the fracture half, the physical co-location wins through the
+    // twin-depth contract.
     const std::string props =
         "DX\n 2*100 /\n"
         "DY\n 2*100 /\n"
@@ -4102,8 +4097,6 @@ BOOST_AUTO_TEST_CASE(DualPorositySinglePorosityUnchanged) {
 
     BOOST_CHECK(!grid.dualPorosity());
     BOOST_CHECK_EQUAL(grid.matrixLayerCount(), 4U);
-    for (std::size_t k = 0; k < 4; ++k)
-        BOOST_CHECK(!grid.isFractureLayer(k));
     for (std::size_t g = 0; g < grid.getCartesianSize(); ++g)
         BOOST_CHECK(!grid.isFractureCell(g));
 }

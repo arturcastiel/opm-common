@@ -49,6 +49,7 @@
 #include <opm/input/eclipse/Deck/DeckSection.hpp>
 #include <opm/input/eclipse/Deck/Deck.hpp>
 
+#include <opm/input/eclipse/Parser/ParserKeywords/D.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/M.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/R.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/S.hpp>
@@ -159,6 +160,10 @@ namespace Opm {
         }
         if (field_props.depth_edited()) {
             this->m_inputGrid.setDEPTH(field_props.get_double("DEPTH"));
+        }
+        if (this->m_inputGrid.dualPorosity() != this->m_runspec.dualPorosity()) {
+            throw OpmInputError("DUALPORO must be specified in the RUNSPEC section.",
+                                deck.get<ParserKeywords::DUALPORO>().back().location());
         }
         this->conveyNumericalAquiferEffects();
         this->applyDualPorosityNNC(deck);
@@ -473,16 +478,22 @@ namespace Opm {
         }
 
         const auto& grid = this->m_inputGrid;
-        const std::size_t half = grid.getCartesianSize() / 2;
 
+        // SIGMAV (cell-by-cell) takes precedence over the scalar SIGMA when
+        // both are present.
         std::vector<double> sigmav;
         double sigma_scalar = 0.0;
         if (this->field_props.has_double("SIGMAV")) {
             sigmav = this->field_props.get_global_double("SIGMAV");
         }
         else if (deck.hasKeyword<ParserKeywords::SIGMA>()) {
-            sigma_scalar = deck.get<ParserKeywords::SIGMA>().back()
-                               .getRecord(0).getItem(0).getSIDouble(0);
+            const auto& kw = deck.get<ParserKeywords::SIGMA>().back();
+            sigma_scalar = kw.getRecord(0)
+                             .getItem<ParserKeywords::SIGMA::COUPLING>().getSIDouble(0);
+            if (sigma_scalar < 0.0) {
+                throw OpmInputError("The SIGMA shape factor cannot be negative.",
+                                    kw.location());
+            }
         }
         else {
             OpmLog::warning("DUALPORO: neither SIGMA nor SIGMAV is present — "
@@ -498,13 +509,20 @@ namespace Opm {
         const auto& permx = this->field_props.get_global_double("PERMX");
 
         std::vector<NNCdata> dp_nnc;
-        for (std::size_t g = 0; g < half; ++g) {
+        for (std::size_t g = 0; g < grid.getCartesianSize(); ++g) {
+            if (grid.isFractureCell(g)) {
+                break;  // matrix cells occupy the first half of the index range
+            }
             const std::size_t twin = grid.fractureTwin(g);
             if (!grid.cellActive(g) || !grid.cellActive(twin)) {
                 continue;
             }
 
             const double sigma = sigmav.empty() ? sigma_scalar : sigmav[g];
+            if (sigma < 0.0) {
+                throw OpmInputError("The SIGMAV shape factor cannot be negative.",
+                                    deck.get<ParserKeywords::SIGMAV>().back().location());
+            }
             const double trans = permx[g] * grid.getCellVolume(g) * sigma;
             if (trans > 0.0) {
                 dp_nnc.emplace_back(g, twin, trans);

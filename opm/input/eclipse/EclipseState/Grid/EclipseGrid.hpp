@@ -283,13 +283,11 @@ namespace Opm {
         /// last NZ/2 layers the co-located fracture cells. The authoritative
         /// runspec flag is Runspec::dualPorosity(); this grid-side flag is
         /// captured at construction for geometry-level queries only.
-        bool dualPorosity() const;
-        std::size_t matrixLayerCount() const;
-        bool isFractureLayer(std::size_t k) const;
-        bool isFractureCell(std::size_t globalIndex) const;
-        std::size_t fractureTwin(std::size_t matrixGlobalIndex) const;
-        std::size_t matrixTwin(std::size_t fractureGlobalIndex) const;
-        void updateDualPorosityDepth();
+        bool dualPorosity() const noexcept;
+        std::size_t matrixLayerCount() const noexcept;
+        bool isFractureCell(std::size_t globalIndex) const noexcept;
+        std::size_t fractureTwin(std::size_t matrixGlobalIndex) const noexcept;
+        std::size_t matrixTwin(std::size_t fractureGlobalIndex) const noexcept;
 
         const std::vector<double>& getCOORD() const;
         const std::vector<double>& getZCORN() const;
@@ -381,6 +379,7 @@ namespace Opm {
         PinchMode m_pinchGapMode;
         double    m_pinchMaxEmptyGap;
         bool m_dualPorosity = false;
+        void updateDualPorosityDepth();
         bool lgr_grid = false;
         mutable std::optional<std::vector<double>> active_volume;
 

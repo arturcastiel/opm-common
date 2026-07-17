@@ -22,6 +22,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <opm/output/eclipse/EclipseIO.hpp>
+#include <opm/output/eclipse/VectorItems/logihead.hpp>
 #include <opm/output/eclipse/RestartValue.hpp>
 
 #include <opm/output/data/Cells.hpp>
@@ -1037,24 +1038,16 @@ END
     EclipseIO eclWriter(es, eclGrid, schedule, summary_config);
     eclWriter.writeInitial(data::Solution{}, {}, es.getInputNNC().input());
 
-    // EGRID: the reference file shape.
+    // EGRID shape details are pinned by EclipseGridTests; here only the
+    // porosity-model flag, as written through the full EclipseIO pipeline.
     EclIO::EclFile egrid("DPIO.EGRID");
-    BOOST_CHECK_EQUAL(egrid.get<int>("FILEHEAD")[5], 1);
-    const auto gridhead = egrid.get<int>("GRIDHEAD");
-    BOOST_CHECK_EQUAL(gridhead[1], 1);
-    BOOST_CHECK_EQUAL(gridhead[2], 1);
-    BOOST_CHECK_EQUAL(gridhead[3], 1);
-    BOOST_CHECK_EQUAL(egrid.get<float>("ZCORN").size(), 8U);
-    const auto actnum = egrid.get<int>("ACTNUM");
-    BOOST_REQUIRE_EQUAL(actnum.size(), 1U);
-    BOOST_CHECK_EQUAL(actnum[0], 3);
-    BOOST_REQUIRE_EQUAL(egrid.get<int>("NNC1").size(), 1U);
-    BOOST_CHECK_EQUAL(egrid.get<int>("NNC1")[0], 2);
-    BOOST_CHECK_EQUAL(egrid.get<int>("NNC2")[0], 1);
+    constexpr int fileheadPorosityModel = 5;   // 0-based index; 1 = dual porosity
+    BOOST_CHECK_EQUAL(egrid.get<int>("FILEHEAD")[fileheadPorosityModel], 1);
 
     // INIT: flag, doubled matrix-first arrays, co-located depths, coupling.
     EclIO::EclFile init("DPIO.INIT");
-    BOOST_CHECK_EQUAL(init.get<bool>("LOGIHEAD")[14], true);
+    namespace VI = ::Opm::RestartIO::Helpers::VectorItems;
+    BOOST_CHECK_EQUAL(init.get<bool>("LOGIHEAD")[VI::logihead::DualPoro], true);
     const auto porv = init.get<float>("PORV");
     BOOST_REQUIRE_EQUAL(porv.size(), 2U);
     BOOST_CHECK_CLOSE(porv[0], 20000.0f, 1e-4);

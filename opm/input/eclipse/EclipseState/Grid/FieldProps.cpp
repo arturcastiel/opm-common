@@ -2274,25 +2274,38 @@ void FieldProps::applyDPGRID(const GRIDSection& grid_section)
     // per-half property boxes.
     if (!grid_section.hasKeyword("DPGRID"))
         return;
-    if (this->grid_ptr == nullptr || !this->grid_ptr->dualPorosity())
+    if (!this->grid_ptr->dualPorosity())
         return;
 
     const auto& grid = *this->grid_ptr;
-    const std::size_t half = grid.getCartesianSize() / 2;
 
-    for (auto& [name, field] : this->double_data) {
-        (void)name;
-        for (std::size_t g = 0; g < half; ++g) {
-            const std::size_t twin = g + half;
-            if (!grid.cellActive(g) || !grid.cellActive(twin))
-                continue;
-            const auto ai_m = grid.activeIndex(g);
-            const auto ai_f = grid.activeIndex(twin);
-            if (value::has_value(field.value_status[ai_m]) &&
-                !value::has_value(field.value_status[ai_f]))
+    // (global cartesian, matrix active, fracture active) index triples for
+    // every twin pair with both continua active — invariant across fields.
+    struct TwinIndices { std::size_t g; std::size_t twin; std::size_t ai_m; std::size_t ai_f; };
+    std::vector<TwinIndices> twins;
+    for (std::size_t g = 0; g < grid.getCartesianSize(); ++g) {
+        if (grid.isFractureCell(g))
+            break;  // matrix cells occupy the first half of the index range
+        const std::size_t twin = grid.fractureTwin(g);
+        if (grid.cellActive(g) && grid.cellActive(twin))
+            twins.push_back({g, twin, grid.activeIndex(g), grid.activeIndex(twin)});
+    }
+
+    for (auto& entry : this->double_data) {
+        auto& field = entry.second;
+        for (const auto& t : twins) {
+            if (value::has_value(field.value_status[t.ai_m]) &&
+                !value::has_value(field.value_status[t.ai_f]))
             {
-                field.data[ai_f] = field.data[ai_m];
-                field.value_status[ai_f] = field.value_status[ai_m];
+                field.data[t.ai_f] = field.data[t.ai_m];
+                field.value_status[t.ai_f] = field.value_status[t.ai_m];
+            }
+            if (field.global_data.has_value() &&
+                value::has_value((*field.global_value_status)[t.g]) &&
+                !value::has_value((*field.global_value_status)[t.twin]))
+            {
+                (*field.global_data)[t.twin] = (*field.global_data)[t.g];
+                (*field.global_value_status)[t.twin] = (*field.global_value_status)[t.g];
             }
         }
     }
