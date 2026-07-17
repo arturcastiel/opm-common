@@ -289,6 +289,7 @@ namespace Opm {
         bool isFractureCell(std::size_t globalIndex) const;
         std::size_t fractureTwin(std::size_t matrixGlobalIndex) const;
         std::size_t matrixTwin(std::size_t fractureGlobalIndex) const;
+        void updateDualPorosityDepth();
 
         const std::vector<double>& getCOORD() const;
         const std::vector<double>& getZCORN() const;

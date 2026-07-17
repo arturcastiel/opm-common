@@ -490,6 +490,11 @@ namespace Opm {
             return;
         }
 
+        if (!this->field_props.has_double("PERMX")) {
+            OpmLog::warning("DUALPORO: PERMX is not present — "
+                            "no matrix-fracture coupling will be created.");
+            return;
+        }
         const auto& permx = this->field_props.get_global_double("PERMX");
 
         std::vector<NNCdata> dp_nnc;

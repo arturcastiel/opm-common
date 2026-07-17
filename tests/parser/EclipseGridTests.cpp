@@ -4183,3 +4183,79 @@ BOOST_AUTO_TEST_CASE(DualPorosityEgridSinglePorosityShapeUnchanged) {
     BOOST_CHECK_EQUAL(file.get<float>("ZCORN").size(), 16U);
     BOOST_CHECK_EQUAL(file.get<int>("ACTNUM").size(), 2U);
 }
+
+BOOST_AUTO_TEST_CASE(DualPorosityDepthSurvivesActivityChange) {
+    // Field-property processing re-runs resetACTNUM after construction (e.g.
+    // zero-pore-volume cells get deactivated). The ACTIVE-indexed twin-depth
+    // override must be rebuilt with the new mapping — a stale vector reports
+    // the wrong depth for every fracture cell behind the deactivated one.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 2 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DX\n 4*100 /\n"
+        "DY\n 4*100 /\n"
+        "DZ\n 4*10 /\n"
+        "TOPS\n 4*2000 /\n"
+        "PORO\n 0.20 0.0 0.01 0.01 /\n"
+        "PERMX\n 1.0 1.0 1000.0 1000.0 /\n"
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    Opm::EclipseState es(deck);
+    const auto& grid = es.getInputGrid();
+
+    // matrix cell 1 died (zero pore volume) — 3 active cells remain
+    BOOST_CHECK_EQUAL(grid.getNumActive(), 3U);
+
+    // every ACTIVE fracture cell still reports its matrix twin's depth
+    BOOST_CHECK_CLOSE(grid.getCellDepth(2), 2005.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellDepth(3), 2005.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellDepth(0), 2005.0, 1e-10);
+}
+
+BOOST_AUTO_TEST_CASE(DPGRIDCopiesMatrixGeometry) {
+    // DPGRID: the fracture half's cell sizes come from the matrix twins no
+    // matter what the deck supplied there.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 2 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DPGRID\n"
+        "DX\n 2*100 2*7 /\n"
+        "DY\n 2*100 2*7 /\n"
+        "DZ\n 2*10 2*99 /\n"
+        "TOPS\n 4*2000 /\n"
+        "PORO\n 0.20 0.20 0.01 0.01 /\n"
+        "PERMX\n 4*1.0 /\n"
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    Opm::EclipseGrid grid( deck );
+
+    BOOST_CHECK_CLOSE(grid.getCellThickness(2), 10.0, 1e-10);   // not 99
+    BOOST_CHECK_CLOSE(grid.getCellThickness(3), 10.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellVolume(std::size_t{2}), 1.0e5, 1e-10);  // not 7*7*99
+    BOOST_CHECK_CLOSE(grid.getCellDepth(2), 2005.0, 1e-10);     // twin depth contract
+}
+
+BOOST_AUTO_TEST_CASE(DPGRIDCornerPointRejected) {
+    // Corner-point input with DPGRID is not supported — both halves must be
+    // written out explicitly.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DPGRID\n"
+        "COORD\n 24*1 /\n"
+        "ZCORN\n 16*1 /\n"
+        "PORO\n 2*0.2 /\n"
+        "PERMX\n 2*1.0 /\n"
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    BOOST_CHECK_THROW(Opm::EclipseGrid{ deck }, Opm::OpmInputError);
+}

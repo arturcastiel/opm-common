@@ -311,24 +311,13 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
                                 deck.get<ParserKeywords::DUALPORO>().front().location());
         }
 
-        // The fracture system has no geometry of its own: it shares the matrix
-        // geometry. The doubled internal grid keeps whatever (pillar-monotone)
-        // corner depths the deck/builder produced for the fracture half — that
-        // stacking is pure bookkeeping so downstream corner-point processing
-        // stays valid — while the PHYSICAL co-location is enforced through the
-        // cell-depth override: every fracture cell reports its matrix twin's
-        // depth (the same mechanism numerical-aquifer cells use). Volumes and
-        // thickness are twin-identical by construction (same DX/DY/DZ), so
-        // depth is the only property that needs the identity.
-        const std::size_t half = this->getCartesianSize() / 2;
-        std::vector<double> depth(this->getNumActive());
-        for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
-            if (!this->cellActive(g))
-                continue;
-            const std::size_t geom = (g < half) ? g : (g - half);
-            depth[this->activeIndex(g)] = this->getCellDepth(geom);
+        if (deck.hasKeyword<ParserKeywords::DPGRID>() && deck.hasKeyword<ParserKeywords::ZCORN>()) {
+            throw OpmInputError("DPGRID is supported for block-centred grid input only; "
+                                "with corner-point input specify both halves explicitly.",
+                                deck.get<ParserKeywords::DPGRID>().front().location());
         }
-        this->setDEPTH(depth);
+
+        this->updateDualPorosityDepth();
     }
 
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
@@ -401,6 +390,33 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
     std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const {
         assert(this->isFractureCell(fractureGlobalIndex));
         return fractureGlobalIndex - this->getCartesianSize() / 2;
+    }
+
+    // The fracture system has no geometry of its own: it shares the matrix
+    // geometry. The doubled internal grid keeps whatever (pillar-monotone)
+    // corner depths the deck/builder produced for the fracture half — that
+    // stacking is pure bookkeeping so downstream corner-point processing
+    // stays valid — while the PHYSICAL co-location is enforced through the
+    // cell-depth override: every fracture cell reports its matrix twin's
+    // depth (the same mechanism numerical-aquifer cells use). The override is
+    // ACTIVE-indexed, so it must be rebuilt whenever the active mapping
+    // changes (resetACTNUM — e.g. field-property processing deactivating
+    // zero-pore-volume cells after construction).
+    void EclipseGrid::updateDualPorosityDepth() {
+        if (!this->m_dualPorosity)
+            return;
+
+        this->m_depth.reset();
+
+        const std::size_t half = this->getCartesianSize() / 2;
+        std::vector<double> depth(this->getNumActive());
+        for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
+            if (!this->cellActive(g))
+                continue;
+            const std::size_t geom = (g < half) ? g : (g - half);
+            depth[this->activeIndex(g)] = this->getCellDepth(geom);
+        }
+        this->setDEPTH(depth);
     }
 
 
@@ -750,6 +766,24 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         std::vector<double> DX = EclipseGrid::createDVector(  this->getNXYZ(), 0 , "DX" , "DXV" , deck);
         std::vector<double> DY = EclipseGrid::createDVector(  this->getNXYZ(), 1 , "DY" , "DYV" , deck);
         std::vector<double> DZ = EclipseGrid::createDVector(  this->getNXYZ(), 2 , "DZ" , "DZV" , deck);
+
+        // DPGRID: the fracture system shares the matrix geometry — the matrix
+        // half's cell sizes are copied onto the fracture half regardless of
+        // what (if anything) the deck supplied there. Depths follow through
+        // the twin-depth contract; the stacked corner depths built below stay
+        // pillar-monotone.
+        if (deck.hasKeyword<ParserKeywords::DPGRID>() &&
+            deck.hasKeyword<ParserKeywords::DUALPORO>() &&
+            this->getNZ() % 2 == 0)
+        {
+            const std::size_t half = this->getCartesianSize() / 2;
+            for (std::size_t g = 0; g < half; ++g) {
+                DX[g + half] = DX[g];
+                DY[g + half] = DY[g];
+                DZ[g + half] = DZ[g];
+            }
+        }
+
         std::vector<double> TOPS = EclipseGrid::createTOPSVector( this->getNXYZ(), DZ , deck );
 
         m_coord = makeCoordDxDyDzTops(DX, DY, DZ, TOPS);
@@ -2776,6 +2810,8 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
             }
             this->active_volume = std::nullopt;
         }
+
+        this->updateDualPorosityDepth();
     }
 
 
