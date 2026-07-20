@@ -76,6 +76,15 @@ Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&       ecl_grid,
     , label_to_index { std::cref(emptyLgrLabels()) }
 {}
 
+Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&       ecl_grid,
+                                const FieldPropsManager& fpm,
+                                CompletedCells&          completed_cells,
+                                const bool               scale_fracture_perm_)
+    : ScheduleGrid { ecl_grid, fpm, completed_cells }
+{
+    this->scale_fracture_perm = scale_fracture_perm_;
+}
+
 Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
                                 const FieldPropsManager&     fpm,
                                 CompletedCells&              completed_cells,
@@ -87,6 +96,18 @@ Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
     , cells_lgr      { std::ref(completed_cells_lgr) }
     , label_to_index { std::cref(label_to_index_) }
 {}
+
+Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
+                                const FieldPropsManager&     fpm,
+                                CompletedCells&              completed_cells,
+                                std::vector<CompletedCells>& completed_cells_lgr,
+                                const std::unordered_map<std::string, std::size_t>& label_to_index_,
+                                const bool scale_fracture_perm_)
+    : ScheduleGrid { ecl_grid, fpm, completed_cells,
+                     completed_cells_lgr, label_to_index_ }
+{
+    this->scale_fracture_perm = scale_fracture_perm_;
+}
 
 void Opm::ScheduleGrid::include_numerical_aquifers(const NumericalAquifers& num_aquifers)
 {
@@ -242,6 +263,21 @@ void Opm::ScheduleGrid::populate_props_from_main_grid_cell(CompletedCells::Cell&
     props.active_index = active_index;
 
     populate(*this->fp, active_index, props);
+
+    this->apply_fracture_perm_scaling(cell);
+}
+
+void Opm::ScheduleGrid::apply_fracture_perm_scaling(CompletedCells::Cell& cell) const
+{
+    if (! (this->scale_fracture_perm && this->grid->isFractureCell(cell.global_index))) {
+        return;
+    }
+
+    auto& props = *cell.props;
+
+    props.permx *= props.poro;
+    props.permy *= props.poro;
+    props.permz *= props.poro;
 }
 
 void Opm::ScheduleGrid::
