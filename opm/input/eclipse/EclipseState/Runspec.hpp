@@ -648,6 +648,9 @@ public:
     bool dualPorosity() const noexcept;
     bool dualPermeability() const noexcept;
     bool fracturePermeabilityScalingDisabled() const noexcept;
+    bool gravityDrainage() const noexcept;
+    bool gravityDrainageAlternative() const noexcept;
+    bool gravityDrainageReInfiltration() const noexcept;
 
     bool operator==(const Runspec& data) const;
     static bool rst_cmp(const Runspec& full_state, const Runspec& rst_state);
@@ -686,6 +689,9 @@ public:
         serializer(m_dualporo);
         serializer(m_dualperm);
         serializer(m_nodppm);
+        serializer(m_gravdr);
+        serializer(m_gravdrm);
+        serializer(m_gravdrm_reinfiltration);
     }
 
 private:
@@ -720,6 +726,9 @@ private:
     bool m_dualporo{false};
     bool m_dualperm{false};
     bool m_nodppm{false};
+    bool m_gravdr{false};
+    bool m_gravdrm{false};
+    bool m_gravdrm_reinfiltration{true};
 };
 
 std::size_t declaredMaxRegionID(const Runspec& rspec);

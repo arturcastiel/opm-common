@@ -179,6 +179,38 @@ SIGMAV
     }
 }
 
+BOOST_AUTO_TEST_CASE(GravityDrainageFieldProps) {
+    // DZMTRXV and SIGMAGDV are per-cell arrays (JSON schema: "data" with a
+    // "dimension") -- registered in GRID::double_keywords like SIGMAV.
+    std::string deck_string = R"(
+GRID
+
+PORO
+   8*0.10 /
+
+DZMTRXV
+  8*5.0 /
+
+SIGMAGDV
+  8*0.04 /
+)";
+    EclipseGrid grid(EclipseGrid(2,2,2));
+    Deck deck = Parser{}.parseString(deck_string);
+    FieldPropsManager fpm(deck, Phases{true, true, false}, grid, TableManager());
+
+    BOOST_CHECK(fpm.has_double("DZMTRXV"));
+    BOOST_CHECK(fpm.has_double("SIGMAGDV"));
+
+    const auto& dz = fpm.get_double("DZMTRXV");
+    const auto& sgd = fpm.get_double("SIGMAGDV");
+    BOOST_CHECK_EQUAL(dz.size(), grid.getNumActive());
+    BOOST_CHECK_EQUAL(sgd.size(), grid.getNumActive());
+    for (std::size_t i = 0; i < dz.size(); ++i) {
+        BOOST_CHECK_CLOSE(dz[i], 5.0, 1e-10);
+        BOOST_CHECK_CLOSE(sgd[i], 0.04, 1e-10);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(SigmaDeckScalar) {
     // SIGMA is a single global scalar (JSON schema: "size": 1), not a per-cell array like
     // SIGMAV (schema: "data", no "size"). FieldProps::GRID::double_keywords is strictly a

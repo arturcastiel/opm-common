@@ -21,6 +21,7 @@
 #include <opm/input/eclipse/EclipseState/Tables/Regdims.hpp>
 #include <opm/input/eclipse/EclipseState/Tables/Tabdims.hpp>
 
+#include <opm/common/utility/OpmInputError.hpp>
 #include <opm/common/utility/TimeService.hpp>
 
 #include <opm/common/OpmLog/OpmLog.hpp>
@@ -835,6 +836,9 @@ Runspec::Runspec(const Deck& deck)
     , m_dualporo   (false)
     , m_dualperm   (false)
     , m_nodppm     (false)
+    , m_gravdr     (false)
+    , m_gravdrm    (false)
+    , m_gravdrm_reinfiltration (true)
 {
     if (DeckSection::hasRUNSPEC(deck)) {
         const RUNSPECSection runspecSection{deck};
@@ -905,6 +909,28 @@ Runspec::Runspec(const Deck& deck)
             // Dual permeability implies the dual-porosity option.
             m_dualperm = true;
             m_dualporo = true;
+        }
+
+        if (runspecSection.hasKeyword<ParserKeywords::GRAVDR>()) {
+            if (!m_dualporo) {
+                throw OpmInputError("GRAVDR applies to dual-porosity runs only; "
+                                    "specify DUALPORO or DUALPERM.",
+                                    runspecSection.get<ParserKeywords::GRAVDR>().front().location());
+            }
+            m_gravdr = true;
+        }
+
+        if (runspecSection.hasKeyword<ParserKeywords::GRAVDRM>()) {
+            if (!m_dualporo) {
+                throw OpmInputError("GRAVDRM applies to dual-porosity runs only; "
+                                    "specify DUALPORO or DUALPERM.",
+                                    runspecSection.get<ParserKeywords::GRAVDRM>().front().location());
+            }
+            // The alternative model supersedes GRAVDR when both are present.
+            m_gravdrm = true;
+            const auto& record = runspecSection.get<ParserKeywords::GRAVDRM>().back().getRecord(0);
+            const auto& allow = record.getItem<ParserKeywords::GRAVDRM::ALLOW_RE_INFL>().getTrimmedString(0);
+            m_gravdrm_reinfiltration = (allow != "NO");
         }
 
         if (runspecSection.hasKeyword<ParserKeywords::NODPPM>()) {
@@ -1030,6 +1056,9 @@ Runspec Runspec::serializationTestObject()
     result.m_dualporo = true;
     result.m_dualperm = true;
     result.m_nodppm = true;
+    result.m_gravdr = true;
+    result.m_gravdrm = true;
+    result.m_gravdrm_reinfiltration = false;
     result.m_geochem = Geochem::serializationTestObject();
 
     return result;
@@ -1166,6 +1195,21 @@ bool Runspec::dualPermeability() const noexcept
     return this->m_dualperm;
 }
 
+bool Runspec::gravityDrainage() const noexcept
+{
+    return this->m_gravdr || this->m_gravdrm;
+}
+
+bool Runspec::gravityDrainageAlternative() const noexcept
+{
+    return this->m_gravdrm;
+}
+
+bool Runspec::gravityDrainageReInfiltration() const noexcept
+{
+    return this->m_gravdrm_reinfiltration;
+}
+
 bool Runspec::fracturePermeabilityScalingDisabled() const noexcept
 {
     return this->m_nodppm;
@@ -1225,6 +1269,9 @@ bool Runspec::rst_cmp(const Runspec& full_spec, const Runspec& rst_spec)
         full_spec.m_dualporo == rst_spec.m_dualporo &&
         full_spec.m_dualperm == rst_spec.m_dualperm &&
         full_spec.m_nodppm == rst_spec.m_nodppm &&
+        full_spec.m_gravdr == rst_spec.m_gravdr &&
+        full_spec.m_gravdrm == rst_spec.m_gravdrm &&
+        full_spec.m_gravdrm_reinfiltration == rst_spec.m_gravdrm_reinfiltration &&
         Welldims::rst_cmp(full_spec.wellDimensions(), rst_spec.wellDimensions());
 }
 
@@ -1260,6 +1307,9 @@ bool Runspec::operator==(const Runspec& data) const
         && (this->m_dualporo == data.m_dualporo)
         && (this->m_dualperm == data.m_dualperm)
         && (this->m_nodppm == data.m_nodppm)
+        && (this->m_gravdr == data.m_gravdr)
+        && (this->m_gravdrm == data.m_gravdrm)
+        && (this->m_gravdrm_reinfiltration == data.m_gravdrm_reinfiltration)
         ;
 }
 
