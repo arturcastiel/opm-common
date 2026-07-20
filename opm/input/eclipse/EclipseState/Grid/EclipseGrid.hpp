@@ -278,6 +278,18 @@ namespace Opm {
         double getCellDepth(std::size_t globalIndex) const;
         ZcornMapper zcornMapper() const;
 
+        /// Dual-porosity twin bookkeeping (DUALPORO): the deck supplies an
+        /// even NZ where the first NZ/2 layers hold the matrix cells and the
+        /// last NZ/2 layers the co-located fracture cells. The authoritative
+        /// runspec flag is Runspec::dualPorosity(); this grid-side flag is
+        /// captured at construction for geometry-level queries only.
+        bool dualPorosity() const;
+        std::size_t matrixLayerCount() const;
+        bool isFractureLayer(std::size_t k) const;
+        bool isFractureCell(std::size_t globalIndex) const;
+        std::size_t fractureTwin(std::size_t matrixGlobalIndex) const;
+        std::size_t matrixTwin(std::size_t fractureGlobalIndex) const;
+
         const std::vector<double>& getCOORD() const;
         const std::vector<double>& getZCORN() const;
         const std::vector<int>& getACTNUM( ) const;
@@ -367,6 +379,7 @@ namespace Opm {
         // Option 2 of PINCH (GAP/NOGAP)
         PinchMode m_pinchGapMode;
         double    m_pinchMaxEmptyGap;
+        bool m_dualPorosity = false;
         bool lgr_grid = false;
         mutable std::optional<std::vector<double>> active_volume;
 
