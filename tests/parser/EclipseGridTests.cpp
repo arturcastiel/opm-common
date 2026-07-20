@@ -4153,6 +4153,80 @@ BOOST_AUTO_TEST_CASE(DualPorosityEgridFileShape) {
     BOOST_CHECK_EQUAL(nnc2[0], 1);          // matrix cell second
 }
 
+BOOST_AUTO_TEST_CASE(DualPermeabilityGridBehavesAsDualPorosity) {
+    // DUALPERM implies the dual-porosity grid conventions without DUALPORO in
+    // the deck: odd NZ is rejected, and the twin bookkeeping is live.
+    const char* oddDeck =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 3 /\n"
+        "DUALPERM\n"
+        "GRID\n"
+        "DX\n 3*100 /\n"
+        "DY\n 3*100 /\n"
+        "DZ\n 3*10 /\n"
+        "TOPS\n 3*2000 /\n"
+        "\n";
+    auto odd = Opm::Parser{}.parseString(oddDeck);
+    BOOST_CHECK_THROW(Opm::EclipseGrid{ odd }, Opm::OpmInputError);
+
+    const char* evenDeck =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 2 /\n"
+        "DUALPERM\n"
+        "GRID\n"
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2*2000 /\n"
+        "\n";
+    auto even = Opm::Parser{}.parseString(evenDeck);
+    const Opm::EclipseGrid grid{ even };
+    BOOST_CHECK(grid.dualPorosity());
+    BOOST_CHECK(grid.isFractureCell(1));
+    BOOST_CHECK_EQUAL(grid.matrixTwin(1), 0U);
+    BOOST_CHECK_EQUAL(grid.fractureTwin(0), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(DualPermeabilityEgridPorosityModelCode) {
+    // Same halved file layout as dual porosity, but the porosity-model code
+    // distinguishes the two: 2 for dual permeability.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 2 /\n"
+        "DUALPERM\n"
+        "GRID\n"
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2*2000 /\n"
+        "PORO\n 0.20 0.01 /\n"
+        "PERMX\n 1.0 1000.0 /\n"
+        "SIGMA\n 0.12 /\n"
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    Opm::EclipseState es(deck);
+    const auto& grid = es.getInputGrid();
+    const auto units = Opm::UnitSystem::newMETRIC();
+
+    WorkArea work;
+    const std::string fileName = "DKSHAPE.EGRID";
+    grid.save(fileName, false, es.getInputNNC().input(), units);
+
+    Opm::EclIO::EclFile file(fileName);
+
+    const auto filehead = file.get<int>("FILEHEAD");
+    BOOST_CHECK_EQUAL(filehead[5], 2);      // porosity model: dual permeability
+
+    const auto gridhead = file.get<int>("GRIDHEAD");
+    BOOST_CHECK_EQUAL(gridhead[3], 1);      // layer count still halved
+
+    const auto nnc1 = file.get<int>("NNC1");
+    BOOST_REQUIRE_EQUAL(nnc1.size(), 1U);   // coupling still rides the NNC path
+}
+
 BOOST_AUTO_TEST_CASE(DualPorosityEgridSinglePorosityShapeUnchanged) {
     // A single-porosity grid keeps the full shape — no halving, plain ACTNUM.
     const std::string props =

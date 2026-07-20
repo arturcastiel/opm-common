@@ -379,6 +379,7 @@ namespace Opm {
         PinchMode m_pinchGapMode;
         double    m_pinchMaxEmptyGap;
         bool m_dualPorosity = false;
+        bool m_dualPermeability = false;
         void updateDualPorosityDepth();
         bool lgr_grid = false;
         mutable std::optional<std::vector<double>> active_volume;

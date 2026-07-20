@@ -297,7 +297,9 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
     }
 
-    this->m_dualPorosity = deck.hasKeyword<ParserKeywords::DUALPORO>();
+    this->m_dualPermeability = deck.hasKeyword<ParserKeywords::DUALPERM>();
+    this->m_dualPorosity = this->m_dualPermeability
+        || deck.hasKeyword<ParserKeywords::DUALPORO>();
 
     updateNumericalAquiferCells(deck);
 
@@ -305,10 +307,13 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
     if (this->m_dualPorosity) {
         if (this->getNZ() % 2 != 0) {
-            throw OpmInputError(fmt::format("DUALPORO requires an even number of layers, but NZ={} was given. "
+            const auto& location = deck.hasKeyword<ParserKeywords::DUALPORO>()
+                ? deck.get<ParserKeywords::DUALPORO>().front().location()
+                : deck.get<ParserKeywords::DUALPERM>().front().location();
+            throw OpmInputError(fmt::format("Dual-porosity runs require an even number of layers, but NZ={} was given. "
                                             "The first NZ/2 layers hold the matrix cells and the last NZ/2 "
                                             "layers the fracture cells.", this->getNZ()),
-                                deck.get<ParserKeywords::DUALPORO>().front().location());
+                                location);
         }
 
         if (deck.hasKeyword<ParserKeywords::DPGRID>() && deck.hasKeyword<ParserKeywords::ZCORN>()) {
@@ -2312,7 +2317,9 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         std::vector<int> filehead(100,0);
         filehead[0] = 3;                     // version number
         filehead[1] = 2007;                  // release year
-        filehead[5] = this->m_dualPorosity ? 1 : 0;  // porosity model: 1 = dual porosity
+        filehead[5] = this->m_dualPorosity           // porosity model:
+            ? (this->m_dualPermeability ? 2 : 1)     //   1 = dual porosity, 2 = dual permeability
+            : 0;
         filehead[6] = 1;                     // corner point grid
 
         egridfile.write("FILEHEAD", filehead);

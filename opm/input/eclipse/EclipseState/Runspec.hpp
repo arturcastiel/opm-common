@@ -646,6 +646,7 @@ public:
     bool compositional() const noexcept;
     bool biof() const noexcept;
     bool dualPorosity() const noexcept;
+    bool dualPermeability() const noexcept;
     bool fracturePermeabilityScalingDisabled() const noexcept;
 
     bool operator==(const Runspec& data) const;
@@ -683,6 +684,7 @@ public:
         serializer(m_biof);
         serializer(m_geochem);
         serializer(m_dualporo);
+        serializer(m_dualperm);
         serializer(m_nodppm);
     }
 
@@ -716,6 +718,7 @@ private:
     bool m_temp{false};
     bool m_biof{false};
     bool m_dualporo{false};
+    bool m_dualperm{false};
     bool m_nodppm{false};
 };
 
