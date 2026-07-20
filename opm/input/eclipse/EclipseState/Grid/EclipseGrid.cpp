@@ -406,12 +406,11 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
         this->m_depth.reset();
 
-        const std::size_t half = this->getCartesianSize() / 2;
         std::vector<double> depth(this->getNumActive());
         for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
             if (!this->cellActive(g))
                 continue;
-            const std::size_t geom = (g < half) ? g : (g - half);
+            const std::size_t geom = this->isFractureCell(g) ? this->matrixTwin(g) : g;
             depth[this->activeIndex(g)] = this->getCellDepth(geom);
         }
         this->setDEPTH(depth);
@@ -778,9 +777,9 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         {
             const std::size_t half = this->getCartesianSize() / 2;
             for (std::size_t g = 0; g < half; ++g) {
-                DX[g + half] = DX[g];
-                DY[g + half] = DY[g];
-                DZ[g + half] = DZ[g];
+                DX[this->fractureTwin(g)] = DX[g];
+                DY[this->fractureTwin(g)] = DY[g];
+                DZ[this->fractureTwin(g)] = DZ[g];
             }
         }
 
