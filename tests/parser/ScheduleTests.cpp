@@ -7256,13 +7256,13 @@ DZ
 TOPS
  2000 /
 PORO
- 0.19 0.01 /
+ 0.25 0.05 /
 PERMX
- 1 50000 /
+ 5 20000 /
 PERMY
- 1 50000 /
+ 5 20000 /
 PERMZ
- 0.1 5000 /
+ 0.5 2000 /
 SCHEDULE
 WELSPECS
  'PF' 'G' 1 1 2005 'OIL' 7* /
@@ -7292,12 +7292,12 @@ BOOST_AUTO_TEST_CASE(DualPorosityFractureConnectionFactorScaled) {
     const auto& conn_scaled   = scaled  .getWell("PF", 0).getConnections()[0];
     const auto& conn_unscaled = unscaled.getWell("PF", 0).getConnections()[0];
 
-    // Fracture-cell porosity is 0.01: the defaulted connection factor and
+    // Fracture-cell porosity is 0.05: the defaulted connection factor and
     // Kh computed from the scaled permeability are exactly the fracture
     // porosity times their unscaled counterparts (isotropic scaling leaves
     // the Peaceman denominator unchanged).
-    BOOST_CHECK_CLOSE(conn_scaled.CF(), 0.01 * conn_unscaled.CF(), 1.0e-8);
-    BOOST_CHECK_CLOSE(conn_scaled.Kh(), 0.01 * conn_unscaled.Kh(), 1.0e-8);
+    BOOST_CHECK_CLOSE(conn_scaled.CF(), 0.05 * conn_unscaled.CF(), 1.0e-8);
+    BOOST_CHECK_CLOSE(conn_scaled.Kh(), 0.05 * conn_unscaled.Kh(), 1.0e-8);
 
     BOOST_CHECK(conn_scaled.CF() > 0.0);
     BOOST_CHECK(conn_scaled.Kh() > 0.0);
