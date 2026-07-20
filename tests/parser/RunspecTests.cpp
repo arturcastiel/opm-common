@@ -1085,6 +1085,40 @@ BOOST_AUTO_TEST_CASE(DualPorosity) {
     BOOST_CHECK( runspec.fracturePermeabilityScalingDisabled() );
 }
 
+BOOST_AUTO_TEST_CASE(DualPermeability) {
+    const std::string input = R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPERM
+    )";
+
+    Parser parser;
+
+    auto deck = parser.parseString(input);
+
+    Runspec runspec( deck );
+    BOOST_CHECK( runspec.dualPermeability() );
+    BOOST_CHECK( runspec.dualPorosity() );      // DUALPERM implies dual porosity
+}
+
+BOOST_AUTO_TEST_CASE(DualPorosityWithoutDualPermeability) {
+    const std::string input = R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    )";
+
+    Parser parser;
+
+    auto deck = parser.parseString(input);
+
+    Runspec runspec( deck );
+    BOOST_CHECK( runspec.dualPorosity() );
+    BOOST_CHECK( !runspec.dualPermeability() );
+}
+
 BOOST_AUTO_TEST_CASE(DualPorosity_absent) {
     const std::string input = R"(
     RUNSPEC
