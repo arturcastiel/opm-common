@@ -3745,3 +3745,35 @@ BOOST_AUTO_TEST_CASE(DualPorosityTwoSaturationTablesLoad) {
     Opm::EclipseState es(deck);
     BOOST_CHECK_EQUAL(es.getTableManager().getSwofTables().size(), 2U);
 }
+
+BOOST_AUTO_TEST_CASE(DPGRIDCopiesDefaultedProperties) {
+    // Properties given for the matrix half only follow onto the fracture
+    // twins; explicitly-supplied fracture values are kept.
+    const std::string deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 2 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DPGRID\n"
+        "DX\n 4*100 /\n"
+        "DY\n 4*100 /\n"
+        "DZ\n 4*10 /\n"
+        "TOPS\n 4*2000 /\n"
+        "PERMX\n 5.0 7.0 2* /\n"          // fracture half defaulted -> copied
+        "PORO\n 0.20 0.20 0.01 0.01 /\n"  // fracture given -> kept
+        "\n";
+    auto deck = Opm::Parser{}.parseString(deckData);
+    Opm::EclipseState es(deck);
+    const auto& fpm = es.fieldProps();
+
+    const auto& permx_si = fpm.get_double("PERMX");
+    // PERMX is stored in SI internally; compare fracture vs matrix twins.
+    BOOST_CHECK_CLOSE(permx_si[2], permx_si[0], 1e-10);
+    BOOST_CHECK_CLOSE(permx_si[3], permx_si[1], 1e-10);
+    BOOST_CHECK_GT(permx_si[1], permx_si[0]);   // 7 > 5 preserved
+
+    const auto& poro = fpm.get_double("PORO");
+    BOOST_CHECK_CLOSE(poro[2], 0.01, 1e-10);    // explicit fracture value kept
+    BOOST_CHECK_CLOSE(poro[0], 0.20, 1e-10);
+}

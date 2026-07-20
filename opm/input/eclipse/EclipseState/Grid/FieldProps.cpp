@@ -2262,6 +2262,40 @@ void FieldProps::scanGRIDSection(const GRIDSection& grid_section)
 
         this->handle_keyword(Section::GRID, keyword, box);
     }
+
+    this->applyDPGRID(grid_section);
+}
+
+void FieldProps::applyDPGRID(const GRIDSection& grid_section)
+{
+    // DPGRID: grid-section cell properties supplied for the matrix half only
+    // are copied onto the fracture twins. Values the deck DID supply for the
+    // fracture half are kept — decks routinely combine DPGRID with explicit
+    // per-half property boxes.
+    if (!grid_section.hasKeyword("DPGRID"))
+        return;
+    if (this->grid_ptr == nullptr || !this->grid_ptr->dualPorosity())
+        return;
+
+    const auto& grid = *this->grid_ptr;
+    const std::size_t half = grid.getCartesianSize() / 2;
+
+    for (auto& [name, field] : this->double_data) {
+        (void)name;
+        for (std::size_t g = 0; g < half; ++g) {
+            const std::size_t twin = g + half;
+            if (!grid.cellActive(g) || !grid.cellActive(twin))
+                continue;
+            const auto ai_m = grid.activeIndex(g);
+            const auto ai_f = grid.activeIndex(twin);
+            if (value::has_value(field.value_status[ai_m]) &&
+                !value::has_value(field.value_status[ai_f]))
+            {
+                field.data[ai_f] = field.data[ai_m];
+                field.value_status[ai_f] = field.value_status[ai_m];
+            }
+        }
+    }
 }
 
 void FieldProps::scanGRIDSectionOnlyACTNUM(const GRIDSection& grid_section)
