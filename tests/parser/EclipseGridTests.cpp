@@ -3969,3 +3969,141 @@ END
     BOOST_CHECK_CLOSE(grid.getCellDepth(1), 5.0, 1e-12);
 }
 
+
+namespace {
+
+Opm::Deck createDualPorosityDeck(const std::string& dimens, const std::string& gridProps, bool dualporo = true)
+{
+    const std::string deckData =
+        "RUNSPEC\n"
+        "\n"
+        "DIMENS\n"
+        " " + dimens + " /\n" +
+        (dualporo ? "DUALPORO\n" : "") +
+        "GRID\n" +
+        gridProps +
+        "EDIT\n"
+        "\n";
+    Opm::Parser parser;
+    return parser.parseString(deckData);
+}
+
+} // anonymous namespace
+
+BOOST_AUTO_TEST_CASE(DualPorosityRequiresEvenNZ) {
+    // DUALPORO with odd NZ must be rejected as an input error.
+    const std::string props3 =
+        "DX\n 3*100 /\n"
+        "DY\n 3*100 /\n"
+        "DZ\n 3*10 /\n"
+        "TOPS\n 3*2000 /\n";
+    auto odd_dp = createDualPorosityDeck("1 1 3", props3, true);
+    BOOST_CHECK_THROW(Opm::EclipseGrid{ odd_dp }, Opm::OpmInputError);
+
+    // The same grid without DUALPORO is fine — no new constraint on
+    // single-porosity decks.
+    auto odd_sp = createDualPorosityDeck("1 1 3", props3, false);
+    BOOST_CHECK_NO_THROW(Opm::EclipseGrid{ odd_sp });
+
+    // Even NZ with DUALPORO constructs.
+    const std::string props2 =
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2*2000 /\n";
+    auto even_dp = createDualPorosityDeck("1 1 2", props2, true);
+    BOOST_CHECK_NO_THROW(Opm::EclipseGrid{ even_dp });
+}
+
+BOOST_AUTO_TEST_CASE(DualPorosityTwinMapping) {
+    // 3x2x4: matrix = layers k=0,1; fracture = layers k=2,3. Co-located:
+    // fracture layer depths repeat the matrix layer depths.
+    const std::string props =
+        "DX\n 24*100 /\n"
+        "DY\n 24*100 /\n"
+        "DZ\n 24*10 /\n"
+        "TOPS\n 6*2000 6*2010 6*2000 6*2010 /\n";
+    auto deck = createDualPorosityDeck("3 2 4", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    BOOST_CHECK(grid.dualPorosity());
+    BOOST_CHECK_EQUAL(grid.matrixLayerCount(), 2U);
+
+    BOOST_CHECK(!grid.isFractureLayer(0));
+    BOOST_CHECK(!grid.isFractureLayer(1));
+    BOOST_CHECK(grid.isFractureLayer(2));
+    BOOST_CHECK(grid.isFractureLayer(3));
+
+    const std::size_t half = grid.getCartesianSize() / 2;
+    BOOST_CHECK_EQUAL(half, 12U);
+    BOOST_CHECK(!grid.isFractureCell(half - 1));
+    BOOST_CHECK(grid.isFractureCell(half));
+
+    for (std::size_t g = 0; g < half; ++g) {
+        const std::size_t twin = grid.fractureTwin(g);
+        BOOST_CHECK_EQUAL(twin, g + half);
+        BOOST_CHECK(grid.isFractureCell(twin));
+        BOOST_CHECK_EQUAL(grid.matrixTwin(twin), g);
+    }
+
+    // The twin of (i,j,k) is (i,j,k + NZ/2).
+    const std::size_t g_m = grid.getGlobalIndex(2, 1, 1);
+    BOOST_CHECK_EQUAL(grid.fractureTwin(g_m), grid.getGlobalIndex(2, 1, 3));
+}
+
+BOOST_AUTO_TEST_CASE(DualPorosityColocatedGeometry) {
+    // The reference-fixture layout: 1x1x2, both halves 100x100x10 at 2000 m.
+    // Both continua carry the FULL block bulk volume; the fracture twin is
+    // co-located (same depth, same thickness).
+    const std::string props =
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2*2000 /\n";
+    auto deck = createDualPorosityDeck("1 1 2", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    BOOST_CHECK_CLOSE(grid.getCellThickness(0), 10.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellThickness(1), 10.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellVolume(std::size_t{0}), 1.0e5, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellVolume(std::size_t{1}), 1.0e5, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellDepth(0), 2005.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellDepth(1), 2005.0, 1e-10);
+}
+
+BOOST_AUTO_TEST_CASE(DualPorosityDeckOffsetOverridden) {
+    // The fracture system has no geometry of its own: whatever the deck says
+    // for the fracture half, the shared matrix geometry wins (a warning is
+    // emitted when they disagree).
+    const std::string props =
+        "DX\n 2*100 /\n"
+        "DY\n 2*100 /\n"
+        "DZ\n 2*10 /\n"
+        "TOPS\n 2000 2050 /\n";
+    auto deck = createDualPorosityDeck("1 1 2", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    BOOST_CHECK(grid.dualPorosity());
+    BOOST_CHECK_CLOSE(grid.getCellDepth(0), 2005.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellDepth(1), 2005.0, 1e-10);
+    BOOST_CHECK_CLOSE(grid.getCellThickness(1), 10.0, 1e-10);
+}
+
+BOOST_AUTO_TEST_CASE(DualPorositySinglePorosityUnchanged) {
+    // Without DUALPORO the new API reports single-porosity semantics and the
+    // classification predicates never fire.
+    const std::string props =
+        "DX\n 4*100 /\n"
+        "DY\n 4*100 /\n"
+        "DZ\n 4*10 /\n"
+        "TOPS\n 2000 2010 2020 2030 /\n";
+    auto deck = createDualPorosityDeck("1 1 4", props, false);
+    Opm::EclipseGrid grid( deck );
+
+    BOOST_CHECK(!grid.dualPorosity());
+    BOOST_CHECK_EQUAL(grid.matrixLayerCount(), 4U);
+    for (std::size_t k = 0; k < 4; ++k)
+        BOOST_CHECK(!grid.isFractureLayer(k));
+    for (std::size_t g = 0; g < grid.getCartesianSize(); ++g)
+        BOOST_CHECK(!grid.isFractureCell(g));
+}
