@@ -311,29 +311,24 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
                                 deck.get<ParserKeywords::DUALPORO>().front().location());
         }
 
-        // Shared geometry: the fracture half duplicates the matrix half's
-        // corner depths — the fracture system has no geometry of its own
-        // (grid geometry is defined by the matrix cells only). Deck-supplied
-        // fracture-half geometry that disagrees is overridden with a warning;
-        // note the block-centred path stacks layers below the column top
-        // regardless of deeper TOPS values, so this copy is also what makes
-        // co-location expressible at all.
+        // The fracture system has no geometry of its own: it shares the matrix
+        // geometry. The doubled internal grid keeps whatever (pillar-monotone)
+        // corner depths the deck/builder produced for the fracture half — that
+        // stacking is pure bookkeeping so downstream corner-point processing
+        // stays valid — while the PHYSICAL co-location is enforced through the
+        // cell-depth override: every fracture cell reports its matrix twin's
+        // depth (the same mechanism numerical-aquifer cells use). Volumes and
+        // thickness are twin-identical by construction (same DX/DY/DZ), so
+        // depth is the only property that needs the identity.
         const std::size_t half = this->getCartesianSize() / 2;
-        std::size_t offset_twins = 0;
-        for (std::size_t g = 0; g < half; ++g) {
-            if (std::abs(this->getCellDepth(g) - this->getCellDepth(g + half)) > 1.0e-6)
-                ++offset_twins;
+        std::vector<double> depth(this->getNumActive());
+        for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
+            if (!this->cellActive(g))
+                continue;
+            const std::size_t geom = (g < half) ? g : (g - half);
+            depth[this->activeIndex(g)] = this->getCellDepth(geom);
         }
-
-        const std::size_t zcorn_half = this->m_zcorn.size() / 2;
-        std::copy(this->m_zcorn.begin(), this->m_zcorn.begin() + zcorn_half,
-                  this->m_zcorn.begin() + zcorn_half);
-
-        if (offset_twins > 0) {
-            OpmLog::warning(fmt::format("DUALPORO: {} fracture cell(s) had geometry differing from their "
-                                        "matrix twins; the shared matrix geometry is used for the "
-                                        "fracture system.", offset_twins));
-        }
+        this->setDEPTH(depth);
     }
 
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
@@ -2212,8 +2207,20 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         std::vector<int> nnc2;
 
         for (const NNCdata& n : nnc ) {
-            nnc1.push_back(n.cell1 + 1);
-            nnc2.push_back(n.cell2 + 1);
+            // Dual porosity: the matrix-fracture coupling connections are
+            // written fracture-cell first (NNC1 = fracture, NNC2 = matrix),
+            // matching the reference file layout. Ordinary connections keep
+            // their stored order.
+            if (this->m_dualPorosity
+                && this->isFractureCell(n.cell2) && !this->isFractureCell(n.cell1)
+                && this->matrixTwin(n.cell2) == n.cell1)
+            {
+                nnc1.push_back(n.cell2 + 1);
+                nnc2.push_back(n.cell1 + 1);
+            } else {
+                nnc1.push_back(n.cell1 + 1);
+                nnc2.push_back(n.cell2 + 1);
+            }
         }
 
         nnchead[0] = nnc1.size();
@@ -2261,9 +2268,19 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         m_input_coord.reset();
         m_input_zcorn.reset();
 
+        // Dual porosity: the file carries geometry for the matrix half only —
+        // halved layer count, matrix-half ZCORN, and one ACTNUM value per
+        // geometric cell with the extended encoding (0 = inactive, 1 = matrix,
+        // 2 = fracture, 3 = both). The fracture system shares the matrix
+        // geometry and has none of its own in the file.
+        if (this->m_dualPorosity) {
+            zcorn_f.resize(zcorn_f.size() / 2);
+        }
+
         std::vector<int> filehead(100,0);
         filehead[0] = 3;                     // version number
         filehead[1] = 2007;                  // release year
+        filehead[5] = this->m_dualPorosity ? 1 : 0;  // porosity model: 1 = dual porosity
         filehead[6] = 1;                     // corner point grid
 
         egridfile.write("FILEHEAD", filehead);
@@ -2272,7 +2289,7 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         gridhead[0] = 1;                    // corner point grid
         gridhead[1] = dims[0];              // nI
         gridhead[2] = dims[1];              // nJ
-        gridhead[3] = dims[2];              // nK
+        gridhead[3] = this->m_dualPorosity ? dims[2] / 2 : dims[2];  // nK (matrix half only)
         gridhead[24] = 1;                   // NUMRES (number of reservoirs)
         //gridhead[25] = 1;                 // TODO: This value depends on LGRs?
 
@@ -2312,7 +2329,17 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         egridfile.write("COORD", coord_f);
         egridfile.write("ZCORN", zcorn_f);
 
-        egridfile.write("ACTNUM", m_actnum);
+        if (this->m_dualPorosity) {
+            const std::size_t half = this->getCartesianSize() / 2;
+            std::vector<int> actnum_dp(half, 0);
+            for (std::size_t g = 0; g < half; ++g) {
+                actnum_dp[g] = (this->m_actnum[g] != 0 ? 1 : 0)
+                             + (this->m_actnum[g + half] != 0 ? 2 : 0);
+            }
+            egridfile.write("ACTNUM", actnum_dp);
+        } else {
+            egridfile.write("ACTNUM", m_actnum);
+        }
         egridfile.write("ENDGRID", endgrid);
 
     }
