@@ -761,6 +761,7 @@ set( keywords
      000_Eclipse100/S/SGWFN
      000_Eclipse100/S/SHRATE
      000_Eclipse100/S/SIGMA
+     000_Eclipse100/S/SIGMAGD
      000_Eclipse100/S/SIGMAGDV
      000_Eclipse100/S/SIGMATH
      000_Eclipse100/S/SIGMAV

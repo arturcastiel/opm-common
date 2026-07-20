@@ -211,6 +211,111 @@ SIGMAGDV
     }
 }
 
+BOOST_AUTO_TEST_CASE(GravityDrainageScalarBroadcast) {
+    // Whole-grid SIGMAGD and DZMTRX broadcast into their per-cell arrays so
+    // consumers read one uniform carrier.
+    const char* deck_string = R"(
+RUNSPEC
+OIL
+WATER
+DIMENS
+ 1 1 2 /
+DUALPORO
+GRID
+DX
+ 2*100 /
+DY
+ 2*100 /
+DZ
+ 2*10 /
+TOPS
+ 2*2000 /
+PORO
+ 0.20 0.01 /
+SIGMAGD
+ 0.04 /
+DZMTRX
+ 5.0 /
+)";
+    const auto deck = Parser{}.parseString(deck_string);
+    EclipseGrid grid(deck);
+    FieldPropsManager fpm(deck, Phases{true, true, false}, grid, TableManager());
+
+    BOOST_REQUIRE(fpm.has_double("SIGMAGDV"));
+    BOOST_REQUIRE(fpm.has_double("DZMTRXV"));
+    for (const auto& v : fpm.get_double("SIGMAGDV")) {
+        BOOST_CHECK_CLOSE(v, 0.04, 1e-10);
+    }
+    for (const auto& v : fpm.get_double("DZMTRXV")) {
+        BOOST_CHECK_CLOSE(v, 5.0, 1e-10);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainagePerCellFormWins) {
+    // A per-cell keyword supplied by the deck takes precedence over the
+    // whole-grid scalar broadcast.
+    const char* deck_string = R"(
+RUNSPEC
+OIL
+WATER
+DIMENS
+ 1 1 2 /
+DUALPORO
+GRID
+DX
+ 2*100 /
+DY
+ 2*100 /
+DZ
+ 2*10 /
+TOPS
+ 2*2000 /
+PORO
+ 0.20 0.01 /
+SIGMAGD
+ 0.04 /
+SIGMAGDV
+ 0.01 0.02 /
+)";
+    const auto deck = Parser{}.parseString(deck_string);
+    EclipseGrid grid(deck);
+    FieldPropsManager fpm(deck, Phases{true, true, false}, grid, TableManager());
+
+    const auto& sgd = fpm.get_double("SIGMAGDV");
+    BOOST_REQUIRE_EQUAL(sgd.size(), 2U);
+    BOOST_CHECK_CLOSE(sgd[0], 0.01, 1e-10);
+    BOOST_CHECK_CLOSE(sgd[1], 0.02, 1e-10);
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageScalarSinglePorosityInert) {
+    // Without a dual-continuum run the scalars broadcast nothing.
+    const char* deck_string = R"(
+RUNSPEC
+OIL
+WATER
+DIMENS
+ 1 1 2 /
+GRID
+DX
+ 2*100 /
+DY
+ 2*100 /
+DZ
+ 2*10 /
+TOPS
+ 2*2000 /
+PORO
+ 0.20 0.20 /
+SIGMAGD
+ 0.04 /
+)";
+    const auto deck = Parser{}.parseString(deck_string);
+    EclipseGrid grid(deck);
+    FieldPropsManager fpm(deck, Phases{true, true, false}, grid, TableManager());
+
+    BOOST_CHECK(!fpm.has_double("SIGMAGDV"));
+}
+
 BOOST_AUTO_TEST_CASE(SigmaDeckScalar) {
     // SIGMA is a single global scalar (JSON schema: "size": 1), not a per-cell array like
     // SIGMAV (schema: "data", no "size"). FieldProps::GRID::double_keywords is strictly a
