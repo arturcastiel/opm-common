@@ -297,13 +297,13 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
 
     }
 
+    this->m_dualPorosity = deck.hasKeyword<ParserKeywords::DUALPORO>();
+
     updateNumericalAquiferCells(deck);
 
     initGrid(deck, actnum);
 
-    if (deck.hasKeyword<ParserKeywords::DUALPORO>()) {
-        this->m_dualPorosity = true;
-
+    if (this->m_dualPorosity) {
         if (this->getNZ() % 2 != 0) {
             throw OpmInputError(fmt::format("DUALPORO requires an even number of layers, but NZ={} was given. "
                                             "The first NZ/2 layers hold the matrix cells and the last NZ/2 "
@@ -316,8 +316,6 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
                                 "with corner-point input specify both halves explicitly.",
                                 deck.get<ParserKeywords::DPGRID>().front().location());
         }
-
-        this->updateDualPorosityDepth();
     }
 
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
@@ -364,30 +362,26 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         return this->m_circle;
     }
 
-    bool EclipseGrid::dualPorosity() const {
+    bool EclipseGrid::dualPorosity() const noexcept {
         return this->m_dualPorosity;
     }
 
-    std::size_t EclipseGrid::matrixLayerCount() const {
+    std::size_t EclipseGrid::matrixLayerCount() const noexcept {
         return this->m_dualPorosity ? this->getNZ() / 2 : this->getNZ();
     }
 
-    bool EclipseGrid::isFractureLayer(std::size_t k) const {
-        return this->m_dualPorosity && (k >= this->getNZ() / 2);
-    }
-
-    bool EclipseGrid::isFractureCell(std::size_t globalIndex) const {
+    bool EclipseGrid::isFractureCell(std::size_t globalIndex) const noexcept {
         // Natural ordering is K-major, so the fracture half (k >= NZ/2) is
         // exactly the upper half of the global index range.
         return this->m_dualPorosity && (globalIndex >= this->getCartesianSize() / 2);
     }
 
-    std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const {
+    std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const noexcept {
         assert(this->m_dualPorosity && !this->isFractureCell(matrixGlobalIndex));
         return matrixGlobalIndex + this->getCartesianSize() / 2;
     }
 
-    std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const {
+    std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const noexcept {
         assert(this->isFractureCell(fractureGlobalIndex));
         return fractureGlobalIndex - this->getCartesianSize() / 2;
     }
@@ -405,15 +399,18 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
     void EclipseGrid::updateDualPorosityDepth() {
         if (!this->m_dualPorosity)
             return;
+        // resetACTNUM fires during initGrid, before the constructor rejects an
+        // odd layer count — the twin arithmetic is only meaningful once NZ is even.
+        if (this->getNZ() % 2 != 0)
+            return;
 
         this->m_depth.reset();
 
-        const std::size_t half = this->getCartesianSize() / 2;
         std::vector<double> depth(this->getNumActive());
         for (std::size_t g = 0; g < this->getCartesianSize(); ++g) {
             if (!this->cellActive(g))
                 continue;
-            const std::size_t geom = (g < half) ? g : (g - half);
+            const std::size_t geom = this->isFractureCell(g) ? this->matrixTwin(g) : g;
             depth[this->activeIndex(g)] = this->getCellDepth(geom);
         }
         this->setDEPTH(depth);
@@ -772,15 +769,17 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         // what (if anything) the deck supplied there. Depths follow through
         // the twin-depth contract; the stacked corner depths built below stay
         // pillar-monotone.
-        if (deck.hasKeyword<ParserKeywords::DPGRID>() &&
-            deck.hasKeyword<ParserKeywords::DUALPORO>() &&
+        // Odd NZ is rejected just after initGrid(); the parity guard here keeps
+        // the copy loop in bounds until that rejection fires.
+        if (this->m_dualPorosity &&
+            deck.hasKeyword<ParserKeywords::DPGRID>() &&
             this->getNZ() % 2 == 0)
         {
             const std::size_t half = this->getCartesianSize() / 2;
             for (std::size_t g = 0; g < half; ++g) {
-                DX[g + half] = DX[g];
-                DY[g + half] = DY[g];
-                DZ[g + half] = DZ[g];
+                DX[this->fractureTwin(g)] = DX[g];
+                DY[this->fractureTwin(g)] = DY[g];
+                DZ[this->fractureTwin(g)] = DZ[g];
             }
         }
 
@@ -2245,8 +2244,7 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
             // written fracture-cell first (NNC1 = fracture, NNC2 = matrix),
             // matching the reference file layout. Ordinary connections keep
             // their stored order.
-            if (this->m_dualPorosity
-                && this->isFractureCell(n.cell2) && !this->isFractureCell(n.cell1)
+            if (this->isFractureCell(n.cell2) && !this->isFractureCell(n.cell1)
                 && this->matrixTwin(n.cell2) == n.cell1)
             {
                 nnc1.push_back(n.cell2 + 1);
@@ -2323,7 +2321,7 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         gridhead[0] = 1;                    // corner point grid
         gridhead[1] = dims[0];              // nI
         gridhead[2] = dims[1];              // nJ
-        gridhead[3] = this->m_dualPorosity ? dims[2] / 2 : dims[2];  // nK (matrix half only)
+        gridhead[3] = this->matrixLayerCount();  // nK: matrix half only under dual porosity
         gridhead[24] = 1;                   // NUMRES (number of reservoirs)
         //gridhead[25] = 1;                 // TODO: This value depends on LGRs?
 
@@ -2364,11 +2362,15 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         egridfile.write("ZCORN", zcorn_f);
 
         if (this->m_dualPorosity) {
+            // Extended ACTNUM encoding, one value per geometric cell:
+            // 0 = inactive, 1 = matrix active, 2 = fracture active, 3 = both.
+            constexpr int activeMatrix = 1;
+            constexpr int activeFracture = 2;
             const std::size_t half = this->getCartesianSize() / 2;
             std::vector<int> actnum_dp(half, 0);
             for (std::size_t g = 0; g < half; ++g) {
-                actnum_dp[g] = (this->m_actnum[g] != 0 ? 1 : 0)
-                             + (this->m_actnum[g + half] != 0 ? 2 : 0);
+                actnum_dp[g] = (this->m_actnum[g] != 0 ? activeMatrix : 0)
+                             + (this->m_actnum[this->fractureTwin(g)] != 0 ? activeFracture : 0);
             }
             egridfile.write("ACTNUM", actnum_dp);
         } else {
