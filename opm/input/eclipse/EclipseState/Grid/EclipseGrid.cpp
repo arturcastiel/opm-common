@@ -381,6 +381,12 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         return this->m_dualPorosity && (globalIndex >= this->getCartesianSize() / 2);
     }
 
+    // Construction-time capture for file encoding (the porosity-model header
+    // code); flag authority remains Runspec::dualPermeability().
+    bool EclipseGrid::dualPermeability() const noexcept {
+        return this->m_dualPermeability;
+    }
+
     std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const noexcept {
         assert(this->m_dualPorosity && !this->isFractureCell(matrixGlobalIndex));
         return matrixGlobalIndex + this->getCartesianSize() / 2;
@@ -402,12 +408,14 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
     // changes (resetACTNUM — e.g. field-property processing deactivating
     // zero-pore-volume cells after construction).
     void EclipseGrid::updateDualPorosityDepth() {
-        if (!this->m_dualPorosity)
+        if (!this->m_dualPorosity) {
             return;
+        }
         // resetACTNUM fires during initGrid, before the constructor rejects an
         // odd layer count — the twin arithmetic is only meaningful once NZ is even.
-        if (this->getNZ() % 2 != 0)
+        if (this->getNZ() % 2 != 0) {
             return;
+        }
 
         this->m_depth.reset();
 

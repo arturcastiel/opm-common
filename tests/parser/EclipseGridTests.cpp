@@ -4184,6 +4184,7 @@ BOOST_AUTO_TEST_CASE(DualPermeabilityGridBehavesAsDualPorosity) {
     auto even = Opm::Parser{}.parseString(evenDeck);
     const Opm::EclipseGrid grid{ even };
     BOOST_CHECK(grid.dualPorosity());
+    BOOST_CHECK(grid.dualPermeability());
     BOOST_CHECK(grid.isFractureCell(1));
     BOOST_CHECK_EQUAL(grid.matrixTwin(1), 0U);
     BOOST_CHECK_EQUAL(grid.fractureTwin(0), 1U);

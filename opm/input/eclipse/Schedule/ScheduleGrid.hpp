@@ -97,20 +97,6 @@ public:
 
     /// Constructor.
     ///
-    /// Overload which additionally states whether dual-porosity fracture
-    /// cells report their permeability scaled by the fracture porosity.
-    ///
-    /// \param[in] scale_fracture_perm Pass the value of
-    /// Runspec::dualPorosity() && !Runspec::fracturePermeabilityScalingDisabled()
-    /// so well connection factors computed from these properties match the
-    /// scaled effective fracture permeability.
-    ScheduleGrid(const EclipseGrid&       ecl_grid,
-                 const FieldPropsManager& fpm,
-                 CompletedCells&          completed_cells,
-                 bool                     scale_fracture_perm);
-
-    /// Constructor.
-    ///
     /// Will populate collection of completed cells if needed.
     ///
     /// \param[in] ecl_grid Grid object with which to associate intersected
