@@ -135,6 +135,8 @@ namespace ALIAS {
 namespace GRID {
 static const std::unordered_map<std::string, keyword_info<double>> double_keywords = {{"DISPERC",keyword_info<double>{}.unit_string("Length")},
                                                                                       {"SIGMAV",  keyword_info<double>{}.unit_string("1/Length*Length")},
+                                                                                      {"SIGMAGDV",keyword_info<double>{}.unit_string("1/Length*Length")},
+                                                                                      {"DZMTRXV", keyword_info<double>{}.init(0.0).unit_string("Length")},
                                                                                       {"MINPVV",  keyword_info<double>{}.init(0.0).unit_string("ReservoirVolume").global_kw(true)},
                                                                                       {"MULTPV",  keyword_info<double>{}.init(1.0).mult(true)},
                                                                                       {"NTG",     keyword_info<double>{}.init(1.0)},
@@ -716,6 +718,7 @@ private:
     void processMULTREGP(const Deck& deck);
     void scanGRIDSection(const GRIDSection& grid_section);
     void applyDPGRID(const GRIDSection& grid_section);
+    void applyDualPorosityScalars(const GRIDSection& grid_section);
     void scanGRIDSectionOnlyACTNUM(const GRIDSection& grid_section);
     void initialize_depth_from_grid();
     void scanEDITSection(const EDITSection& edit_section);

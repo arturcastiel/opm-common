@@ -23,6 +23,8 @@
 
 #include <opm/input/eclipse/EclipseState/Runspec.hpp>
 
+#include <opm/common/utility/OpmInputError.hpp>
+
 #include <opm/input/eclipse/Deck/Deck.hpp>
 
 #include <opm/input/eclipse/Parser/Parser.hpp>
@@ -1117,6 +1119,64 @@ BOOST_AUTO_TEST_CASE(DualPorosityWithoutDualPermeability) {
     Runspec runspec( deck );
     BOOST_CHECK( runspec.dualPorosity() );
     BOOST_CHECK( !runspec.dualPermeability() );
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageStandard) {
+    const auto deck = Parser{}.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    GRAVDR
+    )");
+
+    Runspec runspec( deck );
+    BOOST_CHECK( runspec.gravityDrainage() );
+    BOOST_CHECK( !runspec.gravityDrainageAlternative() );
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageAlternative) {
+    const auto deck = Parser{}.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    GRAVDRM
+    /
+    )");
+
+    Runspec runspec( deck );
+    BOOST_CHECK( runspec.gravityDrainage() );
+    BOOST_CHECK( runspec.gravityDrainageAlternative() );
+    BOOST_CHECK( runspec.gravityDrainageReInfiltration() );   // default YES
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageAlternativeSupersedes) {
+    const auto deck = Parser{}.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    GRAVDR
+    GRAVDRM
+     'NO' /
+    )");
+
+    Runspec runspec( deck );
+    BOOST_CHECK( runspec.gravityDrainage() );
+    BOOST_CHECK( runspec.gravityDrainageAlternative() );      // GRAVDRM wins
+    BOOST_CHECK( !runspec.gravityDrainageReInfiltration() );  // 'NO' honored
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageRequiresDualPorosity) {
+    const auto deck = Parser{}.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    GRAVDR
+    )");
+
+    BOOST_CHECK_THROW( Runspec{ deck }, OpmInputError );
 }
 
 BOOST_AUTO_TEST_CASE(DualPorosity_absent) {

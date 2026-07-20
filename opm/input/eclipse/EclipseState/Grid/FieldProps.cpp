@@ -2264,6 +2264,35 @@ void FieldProps::scanGRIDSection(const GRIDSection& grid_section)
     }
 
     this->applyDPGRID(grid_section);
+    this->applyDualPorosityScalars(grid_section);
+}
+
+// The whole-grid scalar forms of the dual-porosity coupling properties
+// broadcast into their per-cell arrays, so every consumer reads one uniform
+// carrier.  A per-cell keyword supplied by the deck takes precedence.
+void FieldProps::applyDualPorosityScalars(const GRIDSection& grid_section)
+{
+    if (!this->grid_ptr->dualPorosity()) {
+        return;
+    }
+
+    if (grid_section.hasKeyword("SIGMAGD") &&
+        (this->double_data.find("SIGMAGDV") == this->double_data.end()))
+    {
+        const auto& record = grid_section["SIGMAGD"].back().getRecord(0);
+        auto& field = this->init_get<double>("SIGMAGDV");
+        field.default_assign(record.getItem("COUPLING").getSIDouble(0));
+    }
+
+    if (grid_section.hasKeyword("DZMTRX") &&
+        (this->double_data.find("DZMTRXV") == this->double_data.end()))
+    {
+        const auto& values = grid_section["DZMTRX"].back().getSIDoubleData();
+        if (!values.empty()) {
+            auto& field = this->init_get<double>("DZMTRXV");
+            field.default_assign(values.front());
+        }
+    }
 }
 
 void FieldProps::applyDPGRID(const GRIDSection& grid_section)
