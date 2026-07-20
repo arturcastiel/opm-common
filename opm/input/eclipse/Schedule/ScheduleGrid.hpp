@@ -97,6 +97,20 @@ public:
 
     /// Constructor.
     ///
+    /// Overload which additionally states whether dual-porosity fracture
+    /// cells report their permeability scaled by the fracture porosity.
+    ///
+    /// \param[in] scale_fracture_perm Pass the value of
+    /// Runspec::dualPorosity() && !Runspec::fracturePermeabilityScalingDisabled()
+    /// so well connection factors computed from these properties match the
+    /// scaled effective fracture permeability.
+    ScheduleGrid(const EclipseGrid&       ecl_grid,
+                 const FieldPropsManager& fpm,
+                 CompletedCells&          completed_cells,
+                 bool                     scale_fracture_perm);
+
+    /// Constructor.
+    ///
     /// Will populate collection of completed cells if needed.
     ///
     /// \param[in] ecl_grid Grid object with which to associate intersected
@@ -120,6 +134,22 @@ public:
                  CompletedCells&              completed_cells,
                  std::vector<CompletedCells>& completed_cells_lgr,
                  const std::unordered_map<std::string, std::size_t>& label_to_index_);
+
+    /// Constructor.
+    ///
+    /// Overload which additionally states whether dual-porosity fracture
+    /// cells report their permeability scaled by the fracture porosity.
+    ///
+    /// \param[in] scale_fracture_perm Pass the value of
+    /// Runspec::dualPorosity() && !Runspec::fracturePermeabilityScalingDisabled()
+    /// so well connection factors computed from these properties match the
+    /// scaled effective fracture permeability.
+    ScheduleGrid(const EclipseGrid&           ecl_grid,
+                 const FieldPropsManager&     fpm,
+                 CompletedCells&              completed_cells,
+                 std::vector<CompletedCells>& completed_cells_lgr,
+                 const std::unordered_map<std::string, std::size_t>& label_to_index_,
+                 bool scale_fracture_perm);
 
     /// Make collection aware of numerical aquifers
     ///
@@ -187,6 +217,12 @@ private:
     /// Property container.
     const FieldPropsManager* fp{nullptr};
 
+    /// Whether dual-porosity fracture cells report their permeability
+    /// scaled by the fracture porosity (EclipseGrid::isFractureCell
+    /// identifies the cells; Runspec::fracturePermeabilityScalingDisabled
+    /// turns the behaviour off at the construction site).
+    bool scale_fracture_perm{false};
+
     /// Collection of intersected cells in main grid.
     ///
     /// Reference to a mutable object that must outlive the ScheduleGrid.
@@ -243,6 +279,19 @@ private:
     /// \param[in,out] cell Intersected cell object.  This function will
     /// populate its Cell::Props sub-object.
     void populate_props_from_main_grid_cell(CompletedCells::Cell& cell) const;
+
+    /// Scale a dual-porosity fracture cell's permeability by its porosity.
+    ///
+    /// The effective permeability of a fracture cell is the deck value
+    /// scaled by the fracture porosity, so connection factors computed
+    /// from the cell properties match the scaled fracture system.  No
+    /// effect unless scaling was requested at construction and the cell is
+    /// a fracture cell (EclipseGrid::isFractureCell); matrix cells keep
+    /// their deck values.
+    ///
+    /// \param[in,out] cell Intersected cell object with an already
+    /// populated Cell::Props sub-object.
+    void apply_fracture_perm_scaling(CompletedCells::Cell& cell) const;
 
     /// Populate intersected cell property data for cell in main grid.
     ///
