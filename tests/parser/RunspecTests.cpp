@@ -1168,6 +1168,20 @@ BOOST_AUTO_TEST_CASE(GravityDrainageAlternativeSupersedes) {
     BOOST_CHECK( !runspec.gravityDrainageReInfiltration() );  // 'NO' honored
 }
 
+BOOST_AUTO_TEST_CASE(GravityDrainageReInfiltrationShortForm) {
+    const auto deck = Parser{}.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    GRAVDRM
+     'N' /
+    )");
+
+    Runspec runspec( deck );
+    BOOST_CHECK( !runspec.gravityDrainageReInfiltration() );  // short form honored
+}
+
 BOOST_AUTO_TEST_CASE(GravityDrainageRequiresDualPorosity) {
     const auto deck = Parser{}.parseString(R"(
     RUNSPEC

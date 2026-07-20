@@ -284,6 +284,7 @@ namespace Opm {
         /// runspec flag is Runspec::dualPorosity(); this grid-side flag is
         /// captured at construction for geometry-level queries only.
         bool dualPorosity() const noexcept;
+        bool dualPermeability() const noexcept;
         std::size_t matrixLayerCount() const noexcept;
         bool isFractureCell(std::size_t globalIndex) const noexcept;
         std::size_t fractureTwin(std::size_t matrixGlobalIndex) const noexcept;

@@ -2276,23 +2276,29 @@ void FieldProps::applyDualPorosityScalars(const GRIDSection& grid_section)
         return;
     }
 
-    if (grid_section.hasKeyword("SIGMAGD") &&
-        (this->double_data.find("SIGMAGDV") == this->double_data.end()))
+    const auto broadcast = [this, &grid_section](const std::string& scalar_kw,
+                                                 const std::string& item_name,
+                                                 const std::string& array_kw)
     {
-        const auto& record = grid_section["SIGMAGD"].back().getRecord(0);
-        auto& field = this->init_get<double>("SIGMAGDV");
-        field.default_assign(record.getItem("COUPLING").getSIDouble(0));
-    }
-
-    if (grid_section.hasKeyword("DZMTRX") &&
-        (this->double_data.find("DZMTRXV") == this->double_data.end()))
-    {
-        const auto& values = grid_section["DZMTRX"].back().getSIDoubleData();
-        if (!values.empty()) {
-            auto& field = this->init_get<double>("DZMTRXV");
-            field.default_assign(values.front());
+        if (!grid_section.hasKeyword(scalar_kw) ||
+            (this->double_data.find(array_kw) != this->double_data.end()))
+        {
+            return;
         }
-    }
+
+        const auto& keyword = grid_section[scalar_kw].back();
+        const double value = keyword.getRecord(0).getItem(item_name).getSIDouble(0);
+        if (value < 0.0) {
+            throw OpmInputError(fmt::format("The {} value cannot be negative.", scalar_kw),
+                                keyword.location());
+        }
+
+        this->init_get<double>(array_kw).default_assign(value);
+    };
+
+    broadcast("SIGMA",   "COUPLING", "SIGMAV");
+    broadcast("SIGMAGD", "COUPLING", "SIGMAGDV");
+    broadcast("DZMTRX",  "VALUE",    "DZMTRXV");
 }
 
 void FieldProps::applyDPGRID(const GRIDSection& grid_section)

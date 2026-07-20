@@ -161,9 +161,14 @@ namespace Opm {
         if (field_props.depth_edited()) {
             this->m_inputGrid.setDEPTH(field_props.get_double("DEPTH"));
         }
-        if (this->m_inputGrid.dualPorosity() != this->m_runspec.dualPorosity()) {
-            throw OpmInputError("DUALPORO must be specified in the RUNSPEC section.",
-                                deck.get<ParserKeywords::DUALPORO>().back().location());
+        if ((this->m_inputGrid.dualPorosity() != this->m_runspec.dualPorosity()) ||
+            (this->m_inputGrid.dualPermeability() != this->m_runspec.dualPermeability()))
+        {
+            const auto& location = deck.hasKeyword<ParserKeywords::DUALPORO>()
+                ? deck.get<ParserKeywords::DUALPORO>().back().location()
+                : deck.get<ParserKeywords::DUALPERM>().back().location();
+            throw OpmInputError("DUALPORO/DUALPERM must be specified in the RUNSPEC section.",
+                                location);
         }
         this->conveyNumericalAquiferEffects();
         this->applyDualPorosityNNC(deck);
@@ -468,9 +473,10 @@ namespace Opm {
 
     // Dual porosity: couple every active matrix cell to its active fracture
     // twin with one NNC carrying TR = PERMX_matrix * bulkVolume_matrix * sigma
-    // (all SI). sigma comes cell-by-cell from SIGMAV, or as one field value
-    // from SIGMA; the fracture-half entries of SIGMAV carry no meaning. A zero
-    // sigma means "no coupling" and produces no connection.
+    // (all SI). sigma comes cell-by-cell from the SIGMAV property; a scalar
+    // SIGMA arrives through the same carrier (FieldProps broadcasts it, with
+    // the per-cell form taking precedence). The fracture-half entries carry
+    // no meaning. A zero sigma means "no coupling" and produces no connection.
     void EclipseState::applyDualPorosityNNC(const Deck& deck)
     {
         if (! this->m_runspec.dualPorosity()) {
@@ -479,27 +485,12 @@ namespace Opm {
 
         const auto& grid = this->m_inputGrid;
 
-        // SIGMAV (cell-by-cell) takes precedence over the scalar SIGMA when
-        // both are present.
-        std::vector<double> sigmav;
-        double sigma_scalar = 0.0;
-        if (this->field_props.has_double("SIGMAV")) {
-            sigmav = this->field_props.get_global_double("SIGMAV");
-        }
-        else if (deck.hasKeyword<ParserKeywords::SIGMA>()) {
-            const auto& kw = deck.get<ParserKeywords::SIGMA>().back();
-            sigma_scalar = kw.getRecord(0)
-                             .getItem<ParserKeywords::SIGMA::COUPLING>().getSIDouble(0);
-            if (sigma_scalar < 0.0) {
-                throw OpmInputError("The SIGMA shape factor cannot be negative.",
-                                    kw.location());
-            }
-        }
-        else {
+        if (!this->field_props.has_double("SIGMAV")) {
             OpmLog::warning("DUALPORO: neither SIGMA nor SIGMAV is present — "
                             "no matrix-fracture coupling will be created.");
             return;
         }
+        const std::vector<double> sigmav = this->field_props.get_global_double("SIGMAV");
 
         if (!this->field_props.has_double("PERMX")) {
             OpmLog::warning("DUALPORO: PERMX is not present — "
@@ -518,8 +509,10 @@ namespace Opm {
                 continue;
             }
 
-            const double sigma = sigmav.empty() ? sigma_scalar : sigmav[g];
+            const double sigma = sigmav[g];
             if (sigma < 0.0) {
+                // Broadcast scalars are validated at broadcast time, so a
+                // negative can only come from an explicit SIGMAV keyword.
                 throw OpmInputError("The SIGMAV shape factor cannot be negative.",
                                     deck.get<ParserKeywords::SIGMAV>().back().location());
             }

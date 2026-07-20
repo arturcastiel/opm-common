@@ -76,15 +76,6 @@ Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&       ecl_grid,
     , label_to_index { std::cref(emptyLgrLabels()) }
 {}
 
-Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&       ecl_grid,
-                                const FieldPropsManager& fpm,
-                                CompletedCells&          completed_cells,
-                                const bool               scale_fracture_perm_)
-    : ScheduleGrid { ecl_grid, fpm, completed_cells }
-{
-    this->scale_fracture_perm = scale_fracture_perm_;
-}
-
 Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
                                 const FieldPropsManager&     fpm,
                                 CompletedCells&              completed_cells,

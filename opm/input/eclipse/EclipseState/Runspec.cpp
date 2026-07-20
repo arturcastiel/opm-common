@@ -921,16 +921,17 @@ Runspec::Runspec(const Deck& deck)
         }
 
         if (runspecSection.hasKeyword<ParserKeywords::GRAVDRM>()) {
+            const auto& keyword = runspecSection.get<ParserKeywords::GRAVDRM>().back();
             if (!m_dualporo) {
                 throw OpmInputError("GRAVDRM applies to dual-porosity runs only; "
                                     "specify DUALPORO or DUALPERM.",
-                                    runspecSection.get<ParserKeywords::GRAVDRM>().front().location());
+                                    keyword.location());
             }
             // The alternative model supersedes GRAVDR when both are present.
             m_gravdrm = true;
-            const auto& record = runspecSection.get<ParserKeywords::GRAVDRM>().back().getRecord(0);
-            const auto& allow = record.getItem<ParserKeywords::GRAVDRM::ALLOW_RE_INFL>().getTrimmedString(0);
-            m_gravdrm_reinfiltration = (allow != "NO");
+            const auto& record = keyword.getRecord(0);
+            m_gravdrm_reinfiltration =
+                DeckItem::to_bool(record.getItem<ParserKeywords::GRAVDRM::ALLOW_RE_INFL>().getTrimmedString(0));
         }
 
         if (runspecSection.hasKeyword<ParserKeywords::NODPPM>()) {
@@ -1195,6 +1196,11 @@ bool Runspec::dualPermeability() const noexcept
     return this->m_dualperm;
 }
 
+bool Runspec::fracturePermeabilityScalingDisabled() const noexcept
+{
+    return this->m_nodppm;
+}
+
 bool Runspec::gravityDrainage() const noexcept
 {
     return this->m_gravdr || this->m_gravdrm;
@@ -1208,11 +1214,6 @@ bool Runspec::gravityDrainageAlternative() const noexcept
 bool Runspec::gravityDrainageReInfiltration() const noexcept
 {
     return this->m_gravdrm_reinfiltration;
-}
-
-bool Runspec::fracturePermeabilityScalingDisabled() const noexcept
-{
-    return this->m_nodppm;
 }
 
 std::time_t Runspec::start_time() const noexcept

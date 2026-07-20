@@ -232,6 +232,8 @@ TOPS
  2*2000 /
 PORO
  0.20 0.01 /
+SIGMA
+ 0.12 /
 SIGMAGD
  0.04 /
 DZMTRX
@@ -241,14 +243,46 @@ DZMTRX
     EclipseGrid grid(deck);
     FieldPropsManager fpm(deck, Phases{true, true, false}, grid, TableManager());
 
+    BOOST_REQUIRE(fpm.has_double("SIGMAV"));
     BOOST_REQUIRE(fpm.has_double("SIGMAGDV"));
     BOOST_REQUIRE(fpm.has_double("DZMTRXV"));
+    for (const auto& v : fpm.get_double("SIGMAV")) {
+        BOOST_CHECK_CLOSE(v, 0.12, 1e-10);
+    }
     for (const auto& v : fpm.get_double("SIGMAGDV")) {
         BOOST_CHECK_CLOSE(v, 0.04, 1e-10);
     }
     for (const auto& v : fpm.get_double("DZMTRXV")) {
         BOOST_CHECK_CLOSE(v, 5.0, 1e-10);
     }
+}
+
+BOOST_AUTO_TEST_CASE(GravityDrainageScalarNegativeRejected) {
+    const char* deck_string = R"(
+RUNSPEC
+OIL
+WATER
+DIMENS
+ 1 1 2 /
+DUALPORO
+GRID
+DX
+ 2*100 /
+DY
+ 2*100 /
+DZ
+ 2*10 /
+TOPS
+ 2*2000 /
+PORO
+ 0.20 0.01 /
+SIGMAGD
+ -0.04 /
+)";
+    const auto deck = Parser{}.parseString(deck_string);
+    EclipseGrid grid(deck);
+    BOOST_CHECK_THROW(FieldPropsManager(deck, Phases{true, true, false}, grid, TableManager()),
+                      OpmInputError);
 }
 
 BOOST_AUTO_TEST_CASE(GravityDrainagePerCellFormWins) {
@@ -321,9 +355,8 @@ BOOST_AUTO_TEST_CASE(SigmaDeckScalar) {
     // SIGMAV (schema: "data", no "size"). FieldProps::GRID::double_keywords is strictly a
     // per-cell array registry: verify_deck_data() in FieldProps.cpp requires
     // deck_data.size() == box.size() * num_value unconditionally, with no broadcast path for
-    // a single supplied value. SIGMA is intentionally not registered there; its value is read
-    // directly from the deck record by whichever code consumes it (computing
-    // TR = darcy*K*V*sigma), the same way any other single-record scalar keyword would be.
+    // a single supplied value. SIGMA is intentionally not registered there; in dual-continuum
+    // runs applyDualPorosityScalars broadcasts its value into the SIGMAV carrier instead.
     // This test proves the raw parse of a size-1 keyword works standalone.
     std::string deck_string_sigma = R"(
 GRID
