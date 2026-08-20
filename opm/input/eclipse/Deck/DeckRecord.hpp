@@ -65,7 +65,8 @@ namespace Opm {
         const_iterator begin() const;
         const_iterator end() const;
 
-        void write(DeckOutput& writer, std::size_t item_offset = 0) const;
+        void write(DeckOutput& writer, std::size_t item_offset = 0,
+                   bool keep_trailing_defaults = false) const;
         void write_data(DeckOutput& writer, std::size_t item_offset = 0) const;
         friend std::ostream& operator<<(std::ostream& os, const DeckRecord& record);
 

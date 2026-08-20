@@ -147,10 +147,13 @@ namespace Opm {
         }
     }
 
-    void DeckRecord::write(DeckOutput& writer, std::size_t item_offset) const {
+    void DeckRecord::write(DeckOutput& writer, std::size_t item_offset,
+                          bool keep_trailing_defaults) const {
         if (item_offset == 0)
             writer.start_record( );
         this->write_data( writer, item_offset );
+        if (keep_trailing_defaults)
+            writer.flush_defaults( );
         writer.end_record( );
     }
 

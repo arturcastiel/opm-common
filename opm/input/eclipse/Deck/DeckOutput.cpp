@@ -119,6 +119,19 @@ namespace Opm {
     }
 
 
+    void DeckOutput::flush_defaults( ) {
+        if (this->default_count == 0) {
+            return;
+        }
+
+        const auto token = std::to_string(this->default_count) + "*";
+        write_sep(token.size());
+        this->os << token;
+        this->default_count = 0;
+        this->row_count++;
+    }
+
+
     void DeckOutput::start_keyword(const std::string& kw, bool split_line_arg) {
         this->os << kw << std::endl;
         this->current_width = 0;

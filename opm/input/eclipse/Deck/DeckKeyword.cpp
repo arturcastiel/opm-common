@@ -345,8 +345,15 @@ namespace Opm {
    }
 
     void DeckKeyword::write_data( DeckOutput& output ) const {
-        for (const auto& record: *this)
-            record.write( output );
+        // How many items a data keyword has is part of its meaning, so its
+        // trailing defaults cannot be left to the terminating slash the way a
+        // record keyword's can. Dropping them silently shortened HXFIN from 33
+        // entries to 22 when rst_deck rewrote Norne.
+        const bool keep_trailing_defaults = this->isDataKeyword();
+
+        for (const auto& record: *this) {
+            record.write( output, 0, keep_trailing_defaults );
+        }
     }
 
     void DeckKeyword::write_TITLE( DeckOutput& output ) const {

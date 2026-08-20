@@ -40,6 +40,13 @@ namespace Opm {
         ~DeckOutput();
         void stash_default( );
 
+        /// Emit any stashed defaults as an n* item.
+        ///
+        /// A record keyword may drop trailing defaults -- the terminating slash
+        /// defaults the rest -- but a data keyword's item count is its data, so
+        /// those have to be written out.
+        void flush_defaults( );
+
         void start_record( );
         void end_record( );
 
