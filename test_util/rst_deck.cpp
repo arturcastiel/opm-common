@@ -53,6 +53,8 @@
 
 #include <getopt.h>
 
+#include <vector>
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -314,36 +316,52 @@ void update_restart_path(Options& opt,
 std::pair<Options, std::string> load_options(int argc, char **argv)
 {
     Options opt{};
-    while (true) {
-        const int c = getopt(argc, argv, "hm:s");
-        if (c == -1) {
-            break;
+
+    // Options are accepted before or after the positional arguments, as the
+    // usage above shows. getopt cannot be left to sort that out: glibc permutes
+    // argv and finds a trailing option, while the BSD/macOS one stops at the
+    // first non-option argument and would drop it without a word. So collect
+    // the positional arguments here, restarting getopt past each of them.
+    std::vector<const char*> positional{};
+    for (int index = 1; index < argc; ) {
+        optind = index;
+
+        while (true) {
+            const int c = getopt(argc, argv, "hm:s");
+            if (c == -1) {
+                break;
+            }
+
+            switch(c) {
+            case 'm':
+                opt.mode = mode(optarg);
+                break;
+
+            case 's':
+                opt.skiprest = true;
+                break;
+
+            case 'h':
+                print_help_and_exit();
+                break;
+            }
         }
 
-        switch(c) {
-        case 'm':
-            opt.mode = mode(optarg);
-            break;
-
-        case 's':
-            opt.skiprest = true;
-            break;
-
-        case 'h':
-            print_help_and_exit();
-            break;
+        index = optind;
+        if (index < argc) {
+            positional.push_back(argv[index]);
+            ++index;
         }
     }
 
-    auto arg_offset = optind;
-    if (arg_offset >= argc) {
+    if (positional.size() < 2) {
         print_help_and_exit();
     }
 
-    opt.input_deck = argv[arg_offset];
-    const std::string restart_arg = argv[arg_offset + 1];
-    if ((argc - arg_offset) >= 3) {
-        const auto target_arg = argv[arg_offset + 2];
+    opt.input_deck = positional[0];
+    const std::string restart_arg = positional[1];
+    if (positional.size() >= 3) {
+        const auto target_arg = positional[2];
 
         if (fs::is_directory(target_arg)) {
             opt.target_path = target_arg;
@@ -368,6 +386,7 @@ std::pair<Options, std::string> load_options(int argc, char **argv)
     else if (opt.mode == Opm::FileDeck::OutputMode::COPY) {
         print_help_and_exit("When writing output to stdout you must use inline|share mode");
     }
+
 
     return {opt, restart_arg};
 }
