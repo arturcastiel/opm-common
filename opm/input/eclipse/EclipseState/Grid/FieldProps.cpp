@@ -2299,6 +2299,31 @@ void FieldProps::applyDualPorosityScalars(const GRIDSection& grid_section)
     broadcast("SIGMA",   "COUPLING", "SIGMAV");
     broadcast("SIGMAGD", "COUPLING", "SIGMAGDV");
     broadcast("DZMTRX",  "VALUE",    "DZMTRXV");
+
+    // One validation policy for all three carriers. The scalar forms are checked above as
+    // they arrive; a per-cell keyword reaches the same array by a different route (BOX,
+    // EQUALS, OPERATE, or a plain array), so it is checked here rather than wherever the
+    // value happens to be consumed. Previously only SIGMAV was validated, inside the
+    // coupling builder, and the other two per-cell forms were not validated at all.
+    for (const auto& array_kw : {"SIGMAV", "SIGMAGDV", "DZMTRXV"}) {
+        const auto it = this->double_data.find(array_kw);
+        if (it == this->double_data.end()) {
+            continue;
+        }
+
+        const auto& values = it->second.data;
+        const auto  bad    = std::find_if(values.begin(), values.end(),
+                                          [](const double v) { return v < 0.0; });
+        if (bad != values.end()) {
+            throw OpmInputError(fmt::format("The {} value cannot be negative "
+                                            "(cell {} has {}).",
+                                            array_kw,
+                                            std::distance(values.begin(), bad) + 1, *bad),
+                                grid_section.hasKeyword(array_kw)
+                                    ? grid_section[array_kw].back().location()
+                                    : KeywordLocation{});
+        }
+    }
 }
 
 void FieldProps::applyDPGRID(const GRIDSection& grid_section)
