@@ -286,9 +286,15 @@ namespace Opm {
         bool dualPorosity() const noexcept;
         bool dualPermeability() const noexcept;
         std::size_t matrixLayerCount() const noexcept;
-        bool isFractureCell(std::size_t globalIndex) const noexcept;
-        std::size_t fractureTwin(std::size_t matrixGlobalIndex) const noexcept;
-        std::size_t matrixTwin(std::size_t fractureGlobalIndex) const noexcept;
+
+        /// Twin accessors. These take a global index and are therefore total:
+        /// an out-of-range index, or a cell on the wrong half of a dual-continuum
+        /// grid, throws std::invalid_argument the same way cellActive() does.
+        /// They are deliberately not noexcept — the previous assert-only form
+        /// compiled out under NDEBUG and returned an underflowed index.
+        bool isFractureCell(std::size_t globalIndex) const;
+        std::size_t fractureTwin(std::size_t matrixGlobalIndex) const;
+        std::size_t matrixTwin(std::size_t fractureGlobalIndex) const;
 
         const std::vector<double>& getCOORD() const;
         const std::vector<double>& getZCORN() const;

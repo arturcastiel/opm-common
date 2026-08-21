@@ -375,7 +375,9 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         return this->m_dualPorosity ? this->getNZ() / 2 : this->getNZ();
     }
 
-    bool EclipseGrid::isFractureCell(std::size_t globalIndex) const noexcept {
+    bool EclipseGrid::isFractureCell(std::size_t globalIndex) const {
+        this->assertGlobalIndex(globalIndex);
+
         // Natural ordering is K-major, so the fracture half (k >= NZ/2) is
         // exactly the upper half of the global index range.
         return this->m_dualPorosity && (globalIndex >= this->getCartesianSize() / 2);
@@ -387,13 +389,31 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         return this->m_dualPermeability;
     }
 
-    std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const noexcept {
-        assert(this->m_dualPorosity && !this->isFractureCell(matrixGlobalIndex));
+    std::size_t EclipseGrid::fractureTwin(std::size_t matrixGlobalIndex) const {
+        if (! this->m_dualPorosity) {
+            throw std::invalid_argument {
+                "fractureTwin() is meaningful only for a dual-continuum grid"
+            };
+        }
+
+        if (this->isFractureCell(matrixGlobalIndex)) {
+            throw std::invalid_argument {
+                fmt::format("Global index {} is a fracture cell and has no fracture twin.",
+                            matrixGlobalIndex)
+            };
+        }
+
         return matrixGlobalIndex + this->getCartesianSize() / 2;
     }
 
-    std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const noexcept {
-        assert(this->isFractureCell(fractureGlobalIndex));
+    std::size_t EclipseGrid::matrixTwin(std::size_t fractureGlobalIndex) const {
+        if (! this->isFractureCell(fractureGlobalIndex)) {
+            throw std::invalid_argument {
+                fmt::format("Global index {} is not a fracture cell and has no matrix twin.",
+                            fractureGlobalIndex)
+            };
+        }
+
         return fractureGlobalIndex - this->getCartesianSize() / 2;
     }
 

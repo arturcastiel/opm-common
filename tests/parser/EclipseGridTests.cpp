@@ -4015,6 +4015,34 @@ BOOST_AUTO_TEST_CASE(DualPorosityRequiresEvenNZ) {
     BOOST_CHECK_NO_THROW(Opm::EclipseGrid{ even_dp });
 }
 
+BOOST_AUTO_TEST_CASE(DualPorosityTwinApiIsTotal) {
+    // The twin accessors take a global index, so they must behave the same way in a
+    // release build as in a debug one. They used to be noexcept and assert-only, which
+    // meant that under NDEBUG -- how the simulator ships -- matrixTwin() on a matrix cell
+    // returned an underflowed index instead of complaining.
+    const std::string props =
+        "DX\n 24*100 /\n"
+        "DY\n 24*100 /\n"
+        "DZ\n 24*10 /\n"
+        "TOPS\n 6*2000 6*2010 6*2000 6*2010 /\n";
+    auto deck = createDualPorosityDeck("3 2 4", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    const std::size_t half = grid.getCartesianSize() / 2;
+
+    // Out of range is rejected, not silently classified.
+    BOOST_CHECK_THROW(grid.isFractureCell(grid.getCartesianSize()), std::invalid_argument);
+
+    // Each twin accessor rejects the half it does not serve.
+    BOOST_CHECK_THROW(grid.matrixTwin(half - 1), std::invalid_argument);   // a matrix cell
+    BOOST_CHECK_THROW(grid.fractureTwin(half), std::invalid_argument);     // a fracture cell
+
+    // The supported directions are unchanged.
+    BOOST_CHECK_NO_THROW(grid.fractureTwin(half - 1));
+    BOOST_CHECK_NO_THROW(grid.matrixTwin(half));
+    BOOST_CHECK_EQUAL(grid.matrixTwin(grid.fractureTwin(0)), 0U);
+}
+
 BOOST_AUTO_TEST_CASE(DualPorosityTwinMapping) {
     // 3x2x4: matrix = layers k=0,1; fracture = layers k=2,3. Co-located:
     // fracture layer depths repeat the matrix layer depths.
