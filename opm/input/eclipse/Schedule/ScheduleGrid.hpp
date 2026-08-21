@@ -32,6 +32,7 @@ namespace Opm {
 
 class EclipseGrid;
 class FieldPropsManager;
+class Runspec;
 class NumericalAquifers;
 struct NumericalAquiferCell;
 
@@ -123,19 +124,18 @@ public:
 
     /// Constructor.
     ///
-    /// Overload which additionally states whether dual-porosity fracture
-    /// cells report their permeability scaled by the fracture porosity.
+    /// Overload for a dual-continuum run.
     ///
-    /// \param[in] scale_fracture_perm Pass the value of
-    /// Runspec::dualPorosity() && !Runspec::fracturePermeabilityScalingDisabled()
-    /// so well connection factors computed from these properties match the
-    /// scaled effective fracture permeability.
+    /// Takes the run specification rather than a precomputed flag: whether
+    /// fracture cells report a porosity-scaled permeability is a property of
+    /// the run, and deriving it here means the rule lives in one place instead
+    /// of in a doc comment that every caller has to re-type correctly.
     ScheduleGrid(const EclipseGrid&           ecl_grid,
                  const FieldPropsManager&     fpm,
                  CompletedCells&              completed_cells,
                  std::vector<CompletedCells>& completed_cells_lgr,
                  const std::unordered_map<std::string, std::size_t>& label_to_index_,
-                 bool scale_fracture_perm);
+                 const Runspec&               runspec);
 
     /// Make collection aware of numerical aquifers
     ///

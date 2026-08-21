@@ -171,7 +171,7 @@ namespace Opm {
             this->completed_cells,
             this->completed_cells_lgr,
             this->completed_cells_lgr_map,
-            runspec.dualPorosity() && !runspec.fracturePermeabilityScalingDisabled()
+            runspec
         };
 
         if (numAquifers.size() > 0) {

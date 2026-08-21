@@ -19,6 +19,8 @@
 
 #include <opm/input/eclipse/Schedule/ScheduleGrid.hpp>
 
+#include <opm/input/eclipse/EclipseState/Runspec.hpp>
+
 #include <opm/input/eclipse/EclipseState/Aquifer/NumericalAquifer/NumericalAquiferCell.hpp>
 #include <opm/input/eclipse/EclipseState/Aquifer/NumericalAquifer/NumericalAquifers.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/EclipseGrid.hpp>
@@ -93,11 +95,12 @@ Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
                                 CompletedCells&              completed_cells,
                                 std::vector<CompletedCells>& completed_cells_lgr,
                                 const std::unordered_map<std::string, std::size_t>& label_to_index_,
-                                const bool scale_fracture_perm_)
+                                const Runspec& runspec)
     : ScheduleGrid { ecl_grid, fpm, completed_cells,
                      completed_cells_lgr, label_to_index_ }
 {
-    this->scale_fracture_perm = scale_fracture_perm_;
+    this->scale_fracture_perm = runspec.dualPorosity()
+        && ! runspec.fracturePermeabilityScalingDisabled();
 }
 
 void Opm::ScheduleGrid::include_numerical_aquifers(const NumericalAquifers& num_aquifers)
