@@ -296,6 +296,18 @@ namespace Opm {
         std::size_t fractureTwin(std::size_t matrixGlobalIndex) const;
         std::size_t matrixTwin(std::size_t fractureGlobalIndex) const;
 
+        /// True when the two global indices are a matrix-fracture twin pair, in
+        /// either order. Published so that consumers stop re-deriving the test:
+        /// it was previously composed by hand in the EGRID writer here and again,
+        /// differently, in the simulator's writer and transmissibility paths.
+        bool isTwinPair(std::size_t a, std::size_t b) const;
+
+        /// The number of matrix cells implied by a set of Cartesian dimensions.
+        /// Static because a consumer may need the twin arithmetic where no grid
+        /// object is available -- on a distributed run the input grid exists on
+        /// the I/O process only, while the dimensions are known everywhere.
+        static std::size_t matrixCellCount(const std::array<int, 3>& cartDims);
+
         const std::vector<double>& getCOORD() const;
         const std::vector<double>& getZCORN() const;
         const std::vector<int>& getACTNUM( ) const;

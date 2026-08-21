@@ -4015,6 +4015,30 @@ BOOST_AUTO_TEST_CASE(DualPorosityRequiresEvenNZ) {
     BOOST_CHECK_NO_THROW(Opm::EclipseGrid{ even_dp });
 }
 
+BOOST_AUTO_TEST_CASE(DualPorosityIsTwinPair) {
+    // One published predicate, so consumers stop composing it by hand. It answers in
+    // either argument order, rejects a non-twin pair, and is false for a single-porosity
+    // grid rather than throwing.
+    const std::string props =
+        "DX\n 24*100 /\n"
+        "DY\n 24*100 /\n"
+        "DZ\n 24*10 /\n"
+        "TOPS\n 6*2000 6*2010 6*2000 6*2010 /\n";
+    auto deck = createDualPorosityDeck("3 2 4", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    const std::size_t half = grid.getCartesianSize() / 2;
+
+    BOOST_CHECK(grid.isTwinPair(0, half));          // matrix, fracture
+    BOOST_CHECK(grid.isTwinPair(half, 0));          // and the other way round
+    BOOST_CHECK(!grid.isTwinPair(0, half + 1));     // a fracture cell, but not this one's twin
+    BOOST_CHECK(!grid.isTwinPair(0, 1));            // two matrix cells
+    BOOST_CHECK(!grid.isTwinPair(half, half + 1));  // two fracture cells
+
+    // The static form is the same arithmetic, for consumers with no grid object.
+    BOOST_CHECK_EQUAL(Opm::EclipseGrid::matrixCellCount({3, 2, 4}), half);
+}
+
 BOOST_AUTO_TEST_CASE(DualPorosityTwinApiIsTotal) {
     // The twin accessors take a global index, so they must behave the same way in a
     // release build as in a debug one. They used to be noexcept and assert-only, which

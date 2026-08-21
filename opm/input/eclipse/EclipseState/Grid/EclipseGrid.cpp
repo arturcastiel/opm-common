@@ -417,6 +417,24 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
         return fractureGlobalIndex - this->getCartesianSize() / 2;
     }
 
+    bool EclipseGrid::isTwinPair(std::size_t a, std::size_t b) const {
+        if (! this->m_dualPorosity) {
+            return false;
+        }
+
+        this->assertGlobalIndex(a);
+        this->assertGlobalIndex(b);
+
+        const auto [lo, hi] = std::minmax(a, b);
+        return this->isFractureCell(hi)
+            && ! this->isFractureCell(lo)
+            && (this->matrixTwin(hi) == lo);
+    }
+
+    std::size_t EclipseGrid::matrixCellCount(const std::array<int, 3>& cartDims) {
+        return (static_cast<std::size_t>(cartDims[0]) * cartDims[1] * cartDims[2]) / 2;
+    }
+
     // The fracture system has no geometry of its own: it shares the matrix
     // geometry. The doubled internal grid keeps whatever (pillar-monotone)
     // corner depths the deck/builder produced for the fracture half — that
@@ -2273,12 +2291,10 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         std::vector<int> nnc2;
 
         for (const NNCdata& n : nnc ) {
-            // Dual porosity: the matrix-fracture coupling connections are
-            // written fracture-cell first (NNC1 = fracture, NNC2 = matrix),
-            // matching the reference file layout. Ordinary connections keep
-            // their stored order.
-            if (this->isFractureCell(n.cell2) && !this->isFractureCell(n.cell1)
-                && this->matrixTwin(n.cell2) == n.cell1)
+            // Dual porosity: the matrix-fracture coupling connections are written
+            // fracture-cell first (NNC1 = fracture, NNC2 = matrix). Ordinary
+            // connections keep their stored order.
+            if (this->isTwinPair(n.cell1, n.cell2) && this->isFractureCell(n.cell2))
             {
                 nnc1.push_back(n.cell2 + 1);
                 nnc2.push_back(n.cell1 + 1);
