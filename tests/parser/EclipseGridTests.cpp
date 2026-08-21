@@ -4280,6 +4280,33 @@ BOOST_AUTO_TEST_CASE(DualPorosityEgridSinglePorosityShapeUnchanged) {
     BOOST_CHECK_EQUAL(file.get<int>("ACTNUM").size(), 2U);
 }
 
+BOOST_AUTO_TEST_CASE(DualPorosityDepthSurvivesAllActiveReset) {
+    // The no-argument resetACTNUM() -- the all-active form, reached when a grid file
+    // carries no ACTNUM -- must maintain the twin-depth override too. It did not: only
+    // the ACTNUM-taking overload rebuilt it, so on that path every fracture cell reported
+    // its stacked geometric depth rather than its matrix twin's.
+    const std::string props =
+        "DX\n 8*100 /\n"
+        "DY\n 8*100 /\n"
+        "DZ\n 8*10 /\n"
+        "TOPS\n 4*2000 4*2010 /\n";
+    auto deck = createDualPorosityDeck("2 2 2", props, true);
+    Opm::EclipseGrid grid( deck );
+
+    const std::size_t half = grid.getCartesianSize() / 2;
+    std::vector<double> before;
+    for (std::size_t g = half; g < grid.getCartesianSize(); ++g)
+        before.push_back(grid.getCellDepth(g));
+
+    grid.resetACTNUM();
+
+    for (std::size_t g = half; g < grid.getCartesianSize(); ++g) {
+        // co-located: the fracture cell keeps its matrix twin's depth
+        BOOST_CHECK_CLOSE(grid.getCellDepth(g), grid.getCellDepth(grid.matrixTwin(g)), 1e-10);
+        BOOST_CHECK_CLOSE(grid.getCellDepth(g), before[g - half], 1e-10);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(DualPorosityDepthSurvivesActivityChange) {
     // Field-property processing re-runs resetACTNUM after construction (e.g.
     // zero-pore-volume cells get deactivated). The ACTIVE-indexed twin-depth

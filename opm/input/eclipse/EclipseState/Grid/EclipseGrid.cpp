@@ -2818,6 +2818,13 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         std::iota(this->m_global_to_active.begin(), this->m_global_to_active.end(), 0);
         this->m_active_to_global = this->m_global_to_active;
         this->active_volume = std::nullopt;
+
+        // The twin-depth override is indexed by ACTIVE cell, so it must be rebuilt
+        // whenever the active mapping changes -- exactly as the ACTNUM-taking overload
+        // does. Reached when a grid file carries no ACTNUM; without this a fracture cell
+        // reports its stacked geometric depth instead of its matrix twin's. No-op unless
+        // the grid is dual-continuum.
+        this->updateDualPorosityDepth();
     }
 
     void EclipseGrid::resetACTNUM(const int* actnum) {
