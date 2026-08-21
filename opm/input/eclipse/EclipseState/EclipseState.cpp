@@ -357,6 +357,22 @@ namespace Opm {
         const GRIDSection gridSection ( deck );
 
         m_lgrs = LgrCollection(gridSection, m_inputGrid);
+
+        // A refined region inside a dual-continuum grid is not supported. The well
+        // connection factors of refined cells are populated from their father cell
+        // without the fracture-permeability scaling the main-grid path applies, so
+        // allowing the combination would produce inconsistent factors silently.
+        // Refuse instead; the scaling rule and the refinement can be reconciled later.
+        if (this->m_runspec.dualPorosity() && (m_lgrs.size() > 0)) {
+            const auto& location = deck.hasKeyword<ParserKeywords::DUALPORO>()
+                ? deck.get<ParserKeywords::DUALPORO>().back().location()
+                : deck.get<ParserKeywords::DUALPERM>().back().location();
+
+            throw OpmInputError("Local grid refinement is not supported in a dual-continuum run: "
+                                "connection factors in refined cells would not carry the "
+                                "fracture-permeability scaling applied on the main grid.",
+                                location);
+        }
         m_inputGrid.init_lgr_cells(m_lgrs);
     }
 

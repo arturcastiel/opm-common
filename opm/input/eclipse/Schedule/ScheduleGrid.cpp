@@ -282,7 +282,10 @@ populate_props_from_num_aquifer(const NumericalAquiferCell& numAquCell,
 
     props.active_index = this->grid->getActiveIndex(cell.global_index);
 
-    // Isotropic permeability tensor in numerical aquifer cells.
+    // Isotropic permeability tensor in numerical aquifer cells. Note that the
+    // dual-continuum fracture-permeability scaling deliberately does NOT apply here:
+    // an aquifer cell's properties come from the aquifer definition rather than from
+    // the grid's property arrays, so there is no deck permeability to scale.
     props.permx = props.permy = props.permz = numAquCell.permeability;
 
     props.poro = numAquCell.porosity;
