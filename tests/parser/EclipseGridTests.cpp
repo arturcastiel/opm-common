@@ -4388,6 +4388,26 @@ BOOST_AUTO_TEST_CASE(DPGRIDCopiesMatrixGeometry) {
     BOOST_CHECK_CLOSE(grid.getCellDepth(2), 2005.0, 1e-10);     // twin depth contract
 }
 
+BOOST_AUTO_TEST_CASE(DualPorosityGdfileRejected) {
+    // A grid read back from file cannot carry the dual-continuum layout: the reader takes
+    // NZ from the file header and treats any non-zero ACTNUM entry as active, so the
+    // doubled grid would come back as a half-height single-porosity one. Refuse instead.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        "DIMENS\n 1 1 2 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "GDFILE\n 'SOMEGRID.EGRID' /\n"
+        "PORO\n 2*0.2 /\n"
+        "PERMX\n 2*1.0 /\n"
+        "\n";
+
+    Opm::Parser parser;
+    const auto deck = parser.parseString( deckData );
+    BOOST_CHECK_THROW( Opm::EclipseGrid{ deck }, Opm::OpmInputError );
+}
+
 BOOST_AUTO_TEST_CASE(DPGRIDCornerPointRejected) {
     // Corner-point input with DPGRID is not supported — both halves must be
     // written out explicitly.

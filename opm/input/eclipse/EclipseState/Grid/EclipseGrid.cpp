@@ -286,6 +286,19 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
       m_pinchMaxEmptyGap(ParserKeywords::PINCH::MAX_EMPTY_GAP::defaultValue)
 {
     if (deck.hasKeyword("GDFILE")){
+        // Refuse a dual-continuum run here, before the grid file is opened: the reader
+        // takes NZ from the file header and treats every non-zero ACTNUM entry as active,
+        // so a doubled grid would come back as a half-height single-porosity one. Refuse
+        // rather than corrupt, and refuse before touching the file so the diagnosis is
+        // about the deck rather than about a missing path.
+        if (deck.hasKeyword<ParserKeywords::DUALPORO>() ||
+            deck.hasKeyword<ParserKeywords::DUALPERM>())
+        {
+            throw OpmInputError("A dual-continuum run cannot take its grid from GDFILE; "
+                                "the stored layout does not distinguish the matrix and "
+                                "fracture halves. Specify the grid in the deck.",
+                                deck.get<ParserKeywords::GDFILE>().front().location());
+        }
 
         if (deck.hasKeyword("ACTNUM")){
             if (keywInputBeforeGdfile(deck, "ACTNUM"))  {
@@ -321,6 +334,7 @@ EclipseGrid::EclipseGrid(const Deck& deck, const int * actnum)
                                 "with corner-point input specify both halves explicitly.",
                                 deck.get<ParserKeywords::DPGRID>().front().location());
         }
+
     }
 
     if (deck.hasKeyword<ParserKeywords::MAPAXES>())
