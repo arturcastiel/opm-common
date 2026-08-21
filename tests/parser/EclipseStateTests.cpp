@@ -44,7 +44,11 @@ along with OPM.  If not, see <http://www.gnu.org/licenses/>.
 #include <opm/input/eclipse/Deck/DeckItem.hpp>
 #include <opm/input/eclipse/Deck/Deck.hpp>
 
+#include <opm/input/eclipse/EclipseState/Grid/NNC.hpp>
+#include <opm/common/utility/OpmInputError.hpp>
+
 #include <opm/input/eclipse/Parser/Parser.hpp>
+#include <opm/input/eclipse/Parser/ParserKeywords/E.hpp>
 
 #include <cstddef>
 #include <filesystem>
@@ -780,3 +784,34 @@ BOOST_AUTO_TEST_CASE(DualPorositySinglePorosityNoInjectedNNC) {
     EclipseState es(deck);
     BOOST_CHECK(es.getInputNNC().input().empty());
 }
+
+BOOST_AUTO_TEST_CASE(DualPorosityCouplingCannotBeEdited) {
+    // The coupling transmissibility is computed from the shape factor and the matrix
+    // permeability. An EDITNNC naming the same pair would rescale it silently, because
+    // edits are applied after the coupling is built. Refuse instead.
+    const char* deckData =
+        "RUNSPEC\n"
+        "OIL\nWATER\n"
+        // Two matrix layers, so a twin pair is NOT also a geometric neighbour: at one
+        // matrix layer the twins are adjacent cells and the edit is treated as an
+        // ordinary neighbour multiplier rather than an NNC edit.
+        "DIMENS\n 1 1 4 /\n"
+        "DUALPORO\n"
+        "GRID\n"
+        "DX\n 4*100 /\n"
+        "DY\n 4*100 /\n"
+        "DZ\n 4*10 /\n"
+        "TOPS\n 4*2000 /\n"
+        "PORO\n 2*0.2 2*0.01 /\n"
+        "PERMX\n 2*1.0 2*1000.0 /\n"
+        "SIGMA\n 0.1 /\n"
+        "EDIT\n"
+        "EDITNNC\n"
+        " 1 1 1 1 1 3 0.5 /\n"
+        "/\n"
+        "\n";
+
+    const auto deck = Opm::Parser{}.parseString(deckData);
+    BOOST_CHECK_THROW(Opm::EclipseState{ deck }, Opm::OpmInputError);
+}
+

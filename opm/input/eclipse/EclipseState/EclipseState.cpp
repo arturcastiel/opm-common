@@ -539,6 +539,26 @@ namespace Opm {
         }
 
         this->appendInputNNC(dp_nnc);
+
+        // A deck edit that names a matrix-fracture pair would rescale the coupling the
+        // run computes from SIGMA and the matrix permeability. The two mechanisms
+        // disagree about who owns that transmissibility, and the edit wins silently
+        // because it is applied later. Refuse rather than let a deck quietly redefine
+        // the coupling: change SIGMA/SIGMAV, which is what the value is built from.
+        for (const auto* edits : { &this->m_inputNnc.edit(), &this->m_inputNnc.editr() }) {
+            for (const auto& e : *edits) {
+                if (! grid.isTwinPair(e.cell1, e.cell2)) {
+                    continue;
+                }
+
+                throw OpmInputError(fmt::format("Cells {} and {} are a matrix-fracture pair; "
+                                                "their coupling transmissibility is computed "
+                                                "from the shape factor and cannot be edited "
+                                                "directly. Adjust SIGMA or SIGMAV instead.",
+                                                e.cell1 + 1, e.cell2 + 1),
+                                    this->m_inputNnc.edit_location(e));
+            }
+        }
     }
 
     void EclipseState::applyMULTXYZ()
