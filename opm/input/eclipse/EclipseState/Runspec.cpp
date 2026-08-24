@@ -1201,6 +1201,15 @@ bool Runspec::fracturePermeabilityScalingDisabled() const noexcept
     return this->m_nodppm;
 }
 
+bool Runspec::fracturePermeabilityScalingActive() const noexcept
+{
+    // The single source of the scaling rule. Two consumers -- the well connection
+    // factors here and the cell transmissibilities in the simulator -- previously
+    // spelled this out for themselves, in complementary boolean forms, with nothing
+    // cross-checking them. They have diverged before.
+    return this->m_dualporo && !this->m_nodppm;
+}
+
 bool Runspec::gravityDrainage() const noexcept
 {
     return this->m_gravdr || this->m_gravdrm;

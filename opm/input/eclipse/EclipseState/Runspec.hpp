@@ -648,6 +648,7 @@ public:
     bool dualPorosity() const noexcept;
     bool dualPermeability() const noexcept;
     bool fracturePermeabilityScalingDisabled() const noexcept;
+    bool fracturePermeabilityScalingActive() const noexcept;
     bool gravityDrainage() const noexcept;
     bool gravityDrainageAlternative() const noexcept;
     bool gravityDrainageReInfiltration() const noexcept;

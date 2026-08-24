@@ -99,8 +99,7 @@ Opm::ScheduleGrid::ScheduleGrid(const EclipseGrid&           ecl_grid,
     : ScheduleGrid { ecl_grid, fpm, completed_cells,
                      completed_cells_lgr, label_to_index_ }
 {
-    this->scale_fracture_perm = runspec.dualPorosity()
-        && ! runspec.fracturePermeabilityScalingDisabled();
+    this->scale_fracture_perm = runspec.fracturePermeabilityScalingActive();
 }
 
 void Opm::ScheduleGrid::include_numerical_aquifers(const NumericalAquifers& num_aquifers)

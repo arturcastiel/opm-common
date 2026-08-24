@@ -205,8 +205,8 @@ private:
 
     /// Whether dual-porosity fracture cells report their permeability
     /// scaled by the fracture porosity (EclipseGrid::isFractureCell
-    /// identifies the cells; Runspec::fracturePermeabilityScalingDisabled
-    /// turns the behaviour off at the construction site).
+    /// identifies the cells; Runspec::fracturePermeabilityScalingActive
+    /// decides the behaviour at the construction site).
     bool scale_fracture_perm{false};
 
     /// Collection of intersected cells in main grid.

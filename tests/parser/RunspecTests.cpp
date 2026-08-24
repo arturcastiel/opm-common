@@ -1087,6 +1087,46 @@ BOOST_AUTO_TEST_CASE(DualPorosity) {
     BOOST_CHECK( runspec.fracturePermeabilityScalingDisabled() );
 }
 
+BOOST_AUTO_TEST_CASE(FracturePermeabilityScalingActive) {
+    Parser parser;
+
+    // Dual continuum, scaling not disabled -- the rule is on.
+    {
+        auto deck = parser.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    )");
+        Runspec runspec( deck );
+        BOOST_CHECK( runspec.fracturePermeabilityScalingActive() );
+    }
+
+    // Dual continuum, scaling disabled by NODPPM -- off.
+    {
+        auto deck = parser.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    DUALPORO
+    NODPPM
+    )");
+        Runspec runspec( deck );
+        BOOST_CHECK( !runspec.fracturePermeabilityScalingActive() );
+    }
+
+    // Single porosity -- off, whatever NODPPM says.
+    {
+        auto deck = parser.parseString(R"(
+    RUNSPEC
+    OIL
+    WATER
+    )");
+        Runspec runspec( deck );
+        BOOST_CHECK( !runspec.fracturePermeabilityScalingActive() );
+    }
+}
+
 BOOST_AUTO_TEST_CASE(DualPermeability) {
     const std::string input = R"(
     RUNSPEC
