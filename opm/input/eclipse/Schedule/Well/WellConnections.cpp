@@ -387,7 +387,7 @@ namespace Opm {
         for (std::size_t idx = 0; idx < this->m_connections.size(); ++idx) {
             const auto& conn = this->m_connections[idx];
             const auto level = conn.get_lgr_level();
-            const auto& own = (level > 0) ? grid.getLGRCell(static_cast<std::size_t>(level) - 1) : grid;
+            const auto& own = (level > 0) ? grid.getLGRCell(grid.get_lgr_labels_by_number(level)) : grid;
             if (own.isCellActive(conn.getI(), conn.getJ(), conn.getK())) {
                 out.push_back(idx);
             }
