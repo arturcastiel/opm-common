@@ -54,9 +54,9 @@ public:
                 const DeckRecord& lgrRecord,
                 const KeywordLocation& location);
 
-    /// LGRPILLR 'BOX': refined pillars from each box's own first layer, as the
-    /// reference, instead of the column's (stacked boxes on sheared pillars then
-    /// do not conform).
+    /// Refined pillars from each box's own first layer (LGRPILLR 'BOX', the
+    /// default), or from the column's first layer (LGRPILLR 'COLUMN'), so
+    /// that boxes stacked in a column on sheared pillars conform.
     bool pillarsFromBoxLayer() const { return m_pillarsFromBoxLayer; }
 
     /// The level-zero (I,J,K) whose refinement holds cell ijk of LGR number
@@ -75,7 +75,7 @@ public:
 
 private:
     OrderedMap<Carfin, 8> m_lgrs;
-    bool m_pillarsFromBoxLayer{false};
+    bool m_pillarsFromBoxLayer{true};
 
 };
 }

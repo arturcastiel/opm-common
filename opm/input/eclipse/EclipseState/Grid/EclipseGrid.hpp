@@ -595,7 +595,7 @@ namespace Opm {
         std::array<int, 3> low_fatherIJK {};
         std::array<int, 3> up_fatherIJK {};
         std::array<Carfin::RefinedColumns, 3> m_columns {};
-        bool m_pillarsFromBoxLayer{false};
+        bool m_pillarsFromBoxLayer{true};
         double m_minpv_removed_porv{0.0};
         double m_minpv_total_porv{0.0};
 

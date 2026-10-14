@@ -9,7 +9,7 @@
       "item": 1,
       "name": "MODE",
       "value_type": "STRING",
-      "default": "COLUMN"
+      "default": "BOX"
     }
   ]
 }

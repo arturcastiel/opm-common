@@ -1164,24 +1164,27 @@ PROPS
 REGIONS
 SOLUTION
 SCHEDULE
-)", mode.empty() ? "" : fmt::format("LGRPILLR\n '{}' /", mode), k, k);
+)", mode.empty() ? ""
+   : (mode == "1*") ? "LGRPILLR\n 1* /" : fmt::format("LGRPILLR\n '{}' /", mode), k, k);
 
     const Opm::EclipseState state(Opm::Parser{}.parseString(deck));
-    BOOST_CHECK_EQUAL(state.getLgrs().pillarsFromBoxLayer(), mode == "BOX");
+    BOOST_CHECK_EQUAL(state.getLgrs().pillarsFromBoxLayer(), mode != "COLUMN");
     return state.getInputGrid().getLGRCell("LGR1").getCOORD();
 }
 
 } // Anonymous namespace
 
-// LGRPILLR: refined pillars from the column's first layer by default, so boxes
-// stacked in a column share them; 'BOX' takes the box's own, as the reference.
+// LGRPILLR: refined pillars from the box's own first layer by default ('BOX');
+// 'COLUMN' takes the column's first layer, so boxes stacked in a column share
+// them.
 BOOST_AUTO_TEST_CASE(TestLgrPillarMode)
 {
-    const auto column = lgrPillarCoord(2, "");
-    BOOST_CHECK(column == lgrPillarCoord(2, "COLUMN"));
-    BOOST_CHECK(column == lgrPillarCoord(1, ""));
-    BOOST_CHECK(column != lgrPillarCoord(2, "BOX"));
-    BOOST_CHECK(lgrPillarCoord(1, "BOX") == lgrPillarCoord(1, ""));
+    const auto box = lgrPillarCoord(2, "");
+    BOOST_CHECK(box == lgrPillarCoord(2, "BOX"));
+    BOOST_CHECK(box == lgrPillarCoord(2, "1*"));
+    BOOST_CHECK(box != lgrPillarCoord(2, "COLUMN"));
+    BOOST_CHECK(lgrPillarCoord(2, "COLUMN") == lgrPillarCoord(1, ""));
+    BOOST_CHECK(lgrPillarCoord(1, "COLUMN") == lgrPillarCoord(1, ""));
 
     BOOST_CHECK_THROW(lgrPillarCoord(2, "STACKED"), Opm::OpmInputError);
 }

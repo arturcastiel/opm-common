@@ -3288,8 +3288,9 @@ namespace Opm {
         m_zcorn = generate_refined_zcorn(parent_zcorn, parent_nxyz);
 
         // Inside a host column a refined pillar passes through the bilinear interpolation
-        // of the host's corners on the top and bottom of the column's first non-collapsed
-        // layer, so stacked boxes share pillars (LGRPILLR 'BOX': the box's own, as the reference).
+        // of the host's corners on the top and bottom of the box's first non-collapsed
+        // layer (LGRPILLR 'BOX', the default), or of the column's, so that stacked boxes
+        // share pillars (LGRPILLR 'COLUMN').
         const auto ch = CoordMapper { static_cast<std::size_t>(parent_nxyz[0]),
                                       static_cast<std::size_t>(parent_nxyz[1]) };
         const auto zh = ZcornMapper { static_cast<std::size_t>(parent_nxyz[0]),
