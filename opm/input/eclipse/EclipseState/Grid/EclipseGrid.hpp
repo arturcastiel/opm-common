@@ -486,14 +486,17 @@ namespace Opm {
                              double minpv);
 
         /// Remove the refined cells the block's own ACTNUM switches off
-        /// (Cartesian-sized, 0 = removed), as applyBlockMinpv() does.
-        void removeBlockCells(const EclipseGrid& father, const std::vector<int>& actnum);
+        /// (Cartesian-sized, 0 = removed), as applyBlockMinpv() does.  What
+        /// removes them is named if a host cell loses all its refined cells.
+        void removeBlockCells(const EclipseGrid& father, const std::vector<int>& actnum,
+                              const std::string& what = "ACTNUM");
 
         /// Pore volume the block's MINPV removed, and the block's total.
         double minpvRemovedPorv() const { return m_minpv_removed_porv; }
         double minpvTotalPorv() const { return m_minpv_total_porv; }
 
-        /// Refined cells the block's MINPV or ACTNUM removed. Empty when neither did.
+        /// Refined cells the block's MINPV or ACTNUM, or a zero pore volume,
+        /// removed. Empty when none did.
         const std::vector<int>& minpvRemoved() const { return m_minpv_removed; }
         const vec_size_t& getFatherGlobalID() const;
 
