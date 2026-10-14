@@ -3038,7 +3038,8 @@ namespace Opm {
     }
 
     void EclipseGridLGR::removeBlockCells(const EclipseGrid& father,
-                                          const std::vector<int>& actnum)
+                                          const std::vector<int>& actnum,
+                                          const std::string& what)
     {
         const auto ncells = this->getCartesianSize();
         if (m_minpv_removed.empty()) {
@@ -3050,7 +3051,7 @@ namespace Opm {
             }
         }
 
-        this->throwIfHostEmptied(father, "ACTNUM");
+        this->throwIfHostEmptied(father, what);
         this->switchOffRemovedCells();
     }
 

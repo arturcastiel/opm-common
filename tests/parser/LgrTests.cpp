@@ -912,6 +912,54 @@ ENDFIN
     BOOST_CHECK_THROW(nested("MINPV\n 10 /"), Opm::OpmInputError);
 }
 
+// A refined cell that the block's own PORO leaves without pore volume is
+// removed, as by the block's ACTNUM: here the first refined layer.
+BOOST_AUTO_TEST_CASE(TestLgrBlockZeroPoreVolumeRemoved)
+{
+    const auto state = Opm::EclipseState { Opm::Parser{}.parseString(R"(
+RUNSPEC
+DIMENS
+  3 3 1 /
+OIL
+WATER
+GRID
+CARFIN
+'LGR1'  2  2  2  2  1  1  3  3  3 /
+PORO
+  9*0.0 18*0.25 /
+ENDFIN
+DX
+  9*100 /
+DY
+  9*100 /
+DZ
+  9*10 /
+TOPS
+  9*2000 /
+PORO
+  9*0.25 /
+PERMX
+  9*100 /
+COPY
+  PERMX PERMY /
+  PERMX PERMZ /
+/
+PROPS
+REGIONS
+SOLUTION
+SCHEDULE
+)") };
+
+    const auto& lgr = state.getInputGrid().getLGRCell("LGR1");
+    BOOST_CHECK_EQUAL(lgr.getNumActive(), 18U);
+    BOOST_CHECK(!lgr.cellActive(1, 1, 0));
+    BOOST_CHECK(lgr.cellActive(1, 1, 1));
+
+    // Removed for the simulation grid as well.
+    const auto& removed = state.getLgrs().getLgr("LGR1").minpvRemoved();
+    BOOST_CHECK_EQUAL(std::count(removed.begin(), removed.end(), 1), 9);
+}
+
 namespace {
 
 // One column of two layers on sheared pillars; the lower layer thickens towards

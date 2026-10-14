@@ -116,10 +116,11 @@ namespace Opm
         void setMinpv(double minpv);
         const std::optional<double>& MINPV() const;
 
-        /// Refined cells the block's MINPV or ACTNUM removes, one entry per
-        /// refined Cartesian cell (1 = removed). Derived by EclipseState once the
-        /// refined geometry exists, and carried here so it reaches the grid
-        /// builder -- on every rank, since the collection is broadcast.
+        /// Refined cells the block's MINPV or ACTNUM, or a zero pore volume,
+        /// removes, one entry per refined Cartesian cell (1 = removed). Derived
+        /// by EclipseState once the refined geometry exists, and carried here
+        /// so it reaches the grid builder -- on every rank, since the
+        /// collection is broadcast.
         void setMinpvRemoved(std::vector<int> removed);
         const std::vector<int>& minpvRemoved() const;
 

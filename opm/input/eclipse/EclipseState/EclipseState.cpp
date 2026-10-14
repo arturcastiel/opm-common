@@ -58,6 +58,7 @@
 #include <fmt/ranges.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -122,6 +123,45 @@ namespace {
         }
 
         return block.empty() ? Opm::KeywordLocation{} : block.begin()->location();
+    }
+
+    // The refined cells that the block's own PORO, NTG or MULTPV leave without
+    // pore volume while their father cell has some, Cartesian-sized with 0 for
+    // such a cell and 1 for the others.  Empty when there is none.
+    std::vector<int> zeroPoreVolumeCells(const Opm::FieldPropsManager& fp,
+                                         const Opm::EclipseGrid& grid,
+                                         const Opm::EclipseGridLGR& lgrGrid,
+                                         const Opm::Carfin::BlockValues& values)
+    {
+        static const auto factors = std::array<std::string, 3> { "PORO", "NTG", "MULTPV" };
+        if (std::ranges::none_of(factors, [&values](const auto& name)
+                                 { return values.doubles.count(name) > 0; }))
+        {
+            return {};
+        }
+
+        const auto fathers = lgrGrid.getLGRCell_active_father(grid);
+        auto keep = std::vector<int>(lgrGrid.getCartesianSize(), 1);
+        auto any = false;
+        for (std::size_t cell = 0; cell < fathers.size(); ++cell) {
+            const auto global = lgrGrid.getGlobalIndex(cell);
+            auto own = 1.0;
+            auto father = 1.0;
+            for (const auto& name : factors) {
+                const auto inherited = fp.has_double(name)
+                    ? fp.get_double(name)[static_cast<std::size_t>(fathers[cell])] : 1.0;
+                const auto block = values.doubles.find(name);
+                own *= (block != values.doubles.end()) ? block->second[global] : inherited;
+                father *= inherited;
+            }
+
+            if ((own == 0.0) && (father != 0.0)) {
+                keep[global] = 0;
+                any = true;
+            }
+        }
+
+        return any ? keep : std::vector<int>{};
     }
 }
 
@@ -507,7 +547,7 @@ namespace Opm {
       Property values for the refined cells: each starts from its father's and
       the block's own keywords apply in local indices. Only those the simulator
       reads per refined cell are taken, the others stop the input; a block
-      ACTNUM removes cells, as MINPV.
+      ACTNUM removes cells, as MINPV, and so does a zero pore volume.
     */
     void EclipseState::applyLgrBlockValues(const Deck& deck)
     {
@@ -556,6 +596,20 @@ namespace Opm {
                 values.ints.erase(actnum);
                 OpmLog::info(fmt::format("CARFIN '{}': ACTNUM removes {} of its refined cells.",
                                          lgr.NAME(), before - lgrGrid.getNumActive()));
+            }
+
+            // A refined cell the block leaves without pore volume is removed,
+            // as by the block's ACTNUM.
+            if (const auto keep = zeroPoreVolumeCells(this->field_props, this->m_inputGrid,
+                                                      lgrGrid, values);
+                !keep.empty())
+            {
+                const auto before = lgrGrid.getNumActive();
+                lgrGrid.removeBlockCells(this->m_inputGrid, keep, "a zero pore volume");
+                lgr.setMinpvRemoved(lgrGrid.minpvRemoved());
+                OpmLog::info(fmt::format("CARFIN '{}': a zero pore volume removes {} of its "
+                                         "refined cells.", lgr.NAME(),
+                                         before - lgrGrid.getNumActive()));
             }
 
             if (!values.empty()) {
