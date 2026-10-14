@@ -3131,15 +3131,14 @@ namespace Opm {
 
     std::vector<double> EclipseGridLGR::getLGRCell_all_depth (const EclipseGrid& father_grid) const
     {
-        // Sized by active cells, to match the DX/DY/DZ written alongside it.
-        const std::size_t n = getNumActive();
+        const std::size_t n = getCartesianSize();
         const auto& lgr_label_ref = get_lgr_tag();
         std::vector<double> lgr_depths(n);
 
         const auto& local_lgr_grid = father_grid.getLGRCell(lgr_label_ref);
 
         for (std::size_t index = 0; index < n; ++index) {
-            auto [i, j, k] = getIJK(this->getGlobalIndex(index));
+            auto [i, j, k] = getIJK(index);
 
             lgr_depths[index] = local_lgr_grid.getCellDepth(i,j,k);
         }
