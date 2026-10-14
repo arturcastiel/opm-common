@@ -606,7 +606,12 @@ namespace {
                 }
             }
 
-            if (! well.isMultiSegment()) {
+            // Zero also when the well has no connection, for instance when
+            // every connection lies in an inactive cell.  Such a well has no
+            // layer range, and its head is found from the top layer.
+            const auto hasLayers = ! well.isMultiSegment() && (firstK > 0);
+
+            if (hasLayers) {
                 // Use zero-based lookup indices for non-MS wells.
                 --firstK;
             }
@@ -615,7 +620,7 @@ namespace {
             const auto topIJK = grid
                 .getLGR_fatherIJK(I - 1, J - 1, firstK, lgrTag);
 
-            if (! well.isMultiSegment()) {
+            if (hasLayers) {
                 // The well may be completed in several LGRs, so take the host
                 // layer range from every connection through its own LGR rather
                 // than from the head's.
