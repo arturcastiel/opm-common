@@ -485,6 +485,18 @@ namespace Opm {
                              const std::vector<double>& fatherPorv,
                              double minpv);
 
+        /// Apply the field's MINPV/MINPVV to a block that sets none: a refined
+        /// cell takes its share of its host cell's pore volume by volume, and
+        /// drops out below its host cell's threshold.  A host cell the field
+        /// removes takes its refined cells with it.  Records nothing when no
+        /// refined cell drops out.
+        ///
+        /// @param fatherPorv  Cartesian-sized pore volume of the father grid.
+        /// @param fatherMinpv Cartesian-sized threshold of the father grid.
+        void applyFieldMinpv(const EclipseGrid& father,
+                             const std::vector<double>& fatherPorv,
+                             const std::vector<double>& fatherMinpv);
+
         /// Remove the refined cells the block's own ACTNUM switches off
         /// (Cartesian-sized, 0 = removed), as applyBlockMinpv() does.  What
         /// removes them is named if a host cell loses all its refined cells.
@@ -495,8 +507,8 @@ namespace Opm {
         double minpvRemovedPorv() const { return m_minpv_removed_porv; }
         double minpvTotalPorv() const { return m_minpv_total_porv; }
 
-        /// Refined cells the block's MINPV or ACTNUM, or a zero pore volume,
-        /// removed. Empty when none did.
+        /// Refined cells MINPV (the block's or the field's), the block's ACTNUM
+        /// or a zero pore volume removed. Empty when none did.
         const std::vector<int>& minpvRemoved() const { return m_minpv_removed; }
         const vec_size_t& getFatherGlobalID() const;
 
@@ -567,7 +579,11 @@ namespace Opm {
 
     private:
         void save_core(Opm::EclIO::EclOutput&, const Opm::UnitSystem&) const;
-        void throwIfHostEmptied(const EclipseGrid& father, const std::string& what) const;
+        /// Stop if a host cell left active keeps no refined cell.  Host cells
+        /// for which removedByField() holds are left out: the field removes
+        /// them along with their refined cells.
+        void throwIfHostEmptied(const EclipseGrid& father, const std::string& what,
+                                const std::function<bool(std::size_t)>& removedByField = {}) const;
         /// Switch off the cells the block removed, keeping the others' activity.
         void switchOffRemovedCells();
 

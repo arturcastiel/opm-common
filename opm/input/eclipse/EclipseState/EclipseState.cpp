@@ -422,6 +422,11 @@ namespace Opm {
     }
 
     /*
+      A block that sets no MINPV takes the field's MINPV/MINPVV of each host
+      cell, against each refined cell's share of the host cell's pore volume
+      by volume.  A host cell the field removes takes its refined cells with
+      it; one it keeps must keep at least one of them.
+
       A block's MINPV replaces the field's for its refined cells, and a graded
       block normally sets one: its finest cells are orders of magnitude below the
       field threshold, which would otherwise delete exactly the cells the
@@ -446,6 +451,32 @@ namespace Opm {
         for (std::size_t index = 0; index < this->m_lgrs.size(); ++index) {
             auto& lgr = this->m_lgrs.getLgr(index);
             if (! lgr.MINPV().has_value()) {
+                // None of its own: the field's, host cell by host cell.
+                if ((lgr.PARENT_NAME() == "GLOBAL") &&
+                    (this->m_inputGrid.getMinpvMode() != MinpvMode::Inactive))
+                {
+                    if (! porv.has_value()) {
+                        porv = this->field_props.porv(/* global = */ true);
+                    }
+
+                    auto& lgrGrid = this->m_inputGrid.getLGRCell(lgr.NAME());
+                    lgrGrid.applyFieldMinpv(this->m_inputGrid, porv.value(),
+                                            this->m_inputGrid.getMinpvVector());
+
+                    // Only a removal reaches the simulation grid.
+                    if (const auto& removed = lgrGrid.minpvRemoved(); !removed.empty()) {
+                        lgr.setMinpvRemoved(removed);
+
+                        const auto pvTotal = lgrGrid.minpvTotalPorv();
+                        const auto pvFrac  = (pvTotal > 0.0)
+                            ? (100.0 * lgrGrid.minpvRemovedPorv() / pvTotal) : 0.0;
+                        OpmLog::info(fmt::format("CARFIN '{}': the field's MINPV removes {} of "
+                                                 "{} refined cells, {:.3g}% of the block's pore "
+                                                 "volume.", lgr.NAME(),
+                                                 std::count(removed.begin(), removed.end(), 1),
+                                                 lgrGrid.getCartesianSize(), pvFrac));
+                    }
+                }
                 continue;
             }
 

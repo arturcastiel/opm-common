@@ -3039,6 +3039,53 @@ namespace Opm {
         this->switchOffRemovedCells();
     }
 
+    void EclipseGridLGR::applyFieldMinpv(const EclipseGrid& father,
+                                         const std::vector<double>& fatherPorv,
+                                         const std::vector<double>& fatherMinpv)
+    {
+        const auto ncells = this->getCartesianSize();
+        m_minpv_removed.assign(ncells, 0);
+        m_minpv_removed_porv = 0.0;
+        m_minpv_total_porv = 0.0;
+
+        auto removedAny = false;
+        for (std::size_t cell = 0; cell < ncells; ++cell) {
+            const auto ijk = this->getIJK(cell);
+            const auto fatherIx = father.getGlobalIndex(
+                this->low_fatherIJK[0] + m_columns[0].parentOffset[ijk[0]],
+                this->low_fatherIJK[1] + m_columns[1].parentOffset[ijk[1]],
+                this->low_fatherIJK[2] + m_columns[2].parentOffset[ijk[2]]);
+
+            const auto fatherVolume = father.getCellVolume(fatherIx);
+            if (!this->cellActive(cell) || !(fatherVolume > 0.0)) {
+                continue;
+            }
+
+            // The host cell's threshold against the refined cell's share of
+            // the host cell's pore volume, by volume.
+            const auto porv = fatherPorv[fatherIx]
+                * (this->getCellVolume(cell) / fatherVolume);
+
+            m_minpv_total_porv += porv;
+            if (porv < fatherMinpv[fatherIx]) {
+                m_minpv_removed[cell] = 1;
+                m_minpv_removed_porv += porv;
+                removedAny = true;
+            }
+        }
+
+        if (!removedAny) {
+            m_minpv_removed.clear();
+            return;
+        }
+
+        this->throwIfHostEmptied(father, "the field's MINPV",
+                                 [&fatherPorv, &fatherMinpv](const std::size_t fatherIx)
+                                 { return fatherPorv[fatherIx] < fatherMinpv[fatherIx]; });
+
+        this->switchOffRemovedCells();
+    }
+
     void EclipseGridLGR::removeBlockCells(const EclipseGrid& father,
                                           const std::vector<int>& actnum,
                                           const std::string& what)
@@ -3058,7 +3105,8 @@ namespace Opm {
     }
 
     void EclipseGridLGR::throwIfHostEmptied(const EclipseGrid& father,
-                                            const std::string& what) const
+                                            const std::string& what,
+                                            const std::function<bool(std::size_t)>& removedByField) const
     {
         const auto ncells = this->getCartesianSize();
         // A coarse cell the field keeps must keep at least one refined cell. If
@@ -3083,7 +3131,9 @@ namespace Opm {
             }
 
             for (const auto& [fatherIx, alive] : survivors) {
-                if ((alive == 0) && father.cellActive(fatherIx)) {
+                if ((alive == 0) && father.cellActive(fatherIx) &&
+                    !(removedByField && removedByField(fatherIx)))
+                {
                     emptied.push_back(fatherIx);
                 }
             }

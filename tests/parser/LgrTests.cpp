@@ -1016,6 +1016,117 @@ SCHEDULE
 
 namespace {
 
+// A 4 x 4 x 1 grid of 100 m x 100 m x 10 m cells, PORO 0.25 (a host cell
+// holds 25000 rm3), with the given CARFIN block and field keywords.
+Opm::EclipseState fieldMinpvState(const std::string& carfin, const std::string& field)
+{
+    return Opm::EclipseState { Opm::Parser{}.parseString(fmt::format(R"(
+RUNSPEC
+DIMENS
+  4 4 1 /
+OIL
+WATER
+METRIC
+GRID
+{}
+DXV
+  4*100.0 /
+DYV
+  4*100.0 /
+DZ
+  16*10.0 /
+TOPS
+  16*2000 /
+PORO
+  16*0.25 /
+PERMX
+  16*500 /
+COPY
+  PERMX PERMY /
+  PERMX PERMZ /
+/
+{}
+PROPS
+REGIONS
+SOLUTION
+SCHEDULE
+)", carfin, field)) };
+}
+
+const std::string boxOf4Hosts = R"(CARFIN
+'LGR1'  1  2  1  2  1  1  6  6  1 /
+ENDFIN)";
+
+} // Anonymous namespace
+
+// A block without a MINPV of its own takes the field's MINPV/MINPVV of each
+// host cell, against each refined cell's share of the host's pore volume by
+// volume.
+BOOST_AUTO_TEST_CASE(TestLgrFieldMinpv)
+{
+    // Graded: the 25000 rm3 split 2500, 2500 and 20000; MINPV 5000 removes
+    // the first two refined cells.
+    {
+        const auto state = fieldMinpvState(R"(CARFIN
+'LGR1'  2  2  2  2  1  1  3  1  1 /
+HXFIN
+  0.1 0.1 0.8 /
+ENDFIN)", "MINPV\n 5000.0 /");
+
+        const auto& lgr = state.getInputGrid().getLGRCell("LGR1");
+        BOOST_CHECK_EQUAL(lgr.getNumActive(), 1U);
+        BOOST_CHECK(!lgr.cellActive(0));
+        BOOST_CHECK(!lgr.cellActive(1));
+        BOOST_CHECK(lgr.cellActive(2));
+        BOOST_CHECK(state.getLgrs().getLgr("LGR1").minpvRemoved() == std::vector<int>({1, 1, 0}));
+    }
+
+    // A host cell the field keeps (2250 rm3 >= 1000) whose nine refined cells
+    // (250 rm3 each) all fall below the threshold: stop, for MINPV and MINPVV.
+    for (const std::string threshold : { "MINPV\n 1000.0 /", "MINPVV\n 16*1000.0 /" }) {
+        BOOST_CHECK_THROW(fieldMinpvState(boxOf4Hosts, R"(BOX
+  2 2 2 2 1 1 /
+PORO
+  1*0.0225 /
+ENDBOX
+)" + threshold), std::exception);
+    }
+
+    // A host cell the field removes (100 rm3 < 1000) takes its refined cells
+    // with it.
+    {
+        const auto state = fieldMinpvState(boxOf4Hosts, R"(BOX
+  2 2 2 2 1 1 /
+PORO
+  1*0.001 /
+ENDBOX
+MINPV
+  1000.0 /)");
+        BOOST_CHECK_EQUAL(state.getInputGrid().getLGRCell("LGR1").getNumActive(), 27U);
+    }
+
+    // No refined cell below the threshold: nothing for the simulation grid.
+    {
+        const auto state = fieldMinpvState(boxOf4Hosts, "MINPV\n 1000.0 /");
+        BOOST_CHECK_EQUAL(state.getInputGrid().getLGRCell("LGR1").getNumActive(), 36U);
+        BOOST_CHECK(state.getLgrs().getLgr("LGR1").minpvRemoved().empty());
+    }
+
+    // The block's own MINPV replaces the field's.
+    {
+        const auto state = fieldMinpvState(R"(CARFIN
+'LGR1'  2  2  2  2  1  1  3  1  1 /
+HXFIN
+  0.1 0.1 0.8 /
+MINPV
+  100.0 /
+ENDFIN)", "MINPV\n 5000.0 /");
+        BOOST_CHECK_EQUAL(state.getInputGrid().getLGRCell("LGR1").getNumActive(), 3U);
+    }
+}
+
+namespace {
+
 // One column of two layers on sheared pillars; the lower layer thickens towards
 // i = 1 more than the upper one, so the two layers' host corners give different
 // refined pillar lines.
