@@ -26,6 +26,7 @@
 #include <opm/input/eclipse/EclipseState/Grid/NNC.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/EclipseGrid.hpp>
 #include <opm/io/eclipse/EclFile.hpp>
+#include <opm/io/eclipse/EGrid.hpp>
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/Python/Python.hpp>
 #include <opm/input/eclipse/Parser/Parser.hpp>
@@ -35,6 +36,8 @@
 
 
 #include <memory>
+#include <string>
+#include <vector>
 
 using namespace Opm;
 
@@ -727,6 +730,19 @@ BOOST_AUTO_TEST_CASE(same_grid_add_does_not_affect_cross_grid)
 BOOST_AUTO_TEST_SUITE_END()
 
 
+// The integer arrays of the given name in an EGRID, in file order.
+std::vector<std::vector<int>> intArrays(Opm::EclIO::EclFile& f, const std::string& name)
+{
+    std::vector<std::vector<int>> arrays;
+    const auto& names = f.arrayNames();
+    for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+        if (names[i] == name) {
+            arrays.push_back(f.get<int>(i));
+        }
+    }
+    return arrays;
+}
+
 BOOST_AUTO_TEST_SUITE(WriteNNCLG)
 
 BOOST_AUTO_TEST_CASE(write_nnc_lgr_test_nnc)
@@ -744,12 +760,18 @@ BOOST_AUTO_TEST_CASE(write_nnc_lgr_test_nnc)
                            Opm::EclIO::EclFile::Formatted{true});
 
 
-    BOOST_REQUIRE(f.hasKey("NNC1"));
-    BOOST_REQUIRE(f.hasKey("NNC2"));
+    // The global grid's NNC1/NNC2, then those of LGR1, which has no NNC
+    // of its own.
+    const auto nnc1_grids = intArrays(f, "NNC1");
+    const auto nnc2_grids = intArrays(f, "NNC2");
+    BOOST_REQUIRE_EQUAL(nnc1_grids.size(), 2u);
+    BOOST_REQUIRE_EQUAL(nnc2_grids.size(), 2u);
+    BOOST_CHECK(nnc1_grids[1].empty());
+    BOOST_CHECK(nnc2_grids[1].empty());
 
     {
-        const auto nnc1 = f.get<int>("NNC1");
-        const auto nnc2 = f.get<int>("NNC2");
+        const auto& nnc1 = nnc1_grids[0];
+        const auto& nnc2 = nnc2_grids[0];
 
         BOOST_REQUIRE_EQUAL(nnc1.size(), 2u);
         BOOST_REQUIRE_EQUAL(nnc2.size(), 2u);
@@ -786,13 +808,16 @@ BOOST_AUTO_TEST_CASE(write_nnc_lgr_test_nnc)
         BOOST_CHECK_EQUAL(nncg[3], 4);  // cell2=3 → 4
     }
 
-    // --- NNCHEAD for the cross-grid section ---
-    // save_nnc_local_global writes nnchead[0]=num_nnc (same-grid LGR count=0),
-    // nnchead[1]=grid_num (=1 for LGR1).
-    BOOST_REQUIRE(f.hasKey("NNCHEAD"));
+    // --- One NNCHEAD per grid ---
+    // The global grid's, then that of LGR1, which counts the LGR's own NNCs
+    // (none) and heads its NNC1/NNC2 and its NNCL/NNCG.
     {
-        const auto nnchead = f.get<int>("NNCHEAD");
-        BOOST_CHECK_EQUAL(nnchead[1], 1);  // grid number = 1 (LGR1)
+        const auto nnchead = intArrays(f, "NNCHEAD");
+        BOOST_REQUIRE_EQUAL(nnchead.size(), 2u);
+        BOOST_CHECK_EQUAL(nnchead[0][0], 2);
+        BOOST_CHECK_EQUAL(nnchead[0][1], 0);  // global grid
+        BOOST_CHECK_EQUAL(nnchead[1][0], 0);
+        BOOST_CHECK_EQUAL(nnchead[1][1], 1);  // grid number = 1 (LGR1)
     }
 }
 BOOST_AUTO_TEST_SUITE_END()
@@ -825,9 +850,11 @@ BOOST_AUTO_TEST_CASE(local_global_insertion_normalises_to_same_output)
     Opm::EclIO::EclFile f("cross_lg.FEGRID",
                            Opm::EclIO::EclFile::Formatted{true});
 
-    // No same-grid NNCs → NNC1/NNC2 must not appear
-    BOOST_CHECK(!f.hasKey("NNC1"));
-    BOOST_CHECK(!f.hasKey("NNC2"));
+    // No same-grid NNCs: the LGR's NNC1/NNC2 are written, empty
+    BOOST_REQUIRE(f.hasKey("NNC1"));
+    BOOST_REQUIRE(f.hasKey("NNC2"));
+    BOOST_CHECK(f.get<int>("NNC1").empty());
+    BOOST_CHECK(f.get<int>("NNC2").empty());
 
     BOOST_REQUIRE(f.hasKey("NNCL"));
     BOOST_REQUIRE(f.hasKey("NNCG"));
@@ -872,9 +899,13 @@ BOOST_AUTO_TEST_CASE(no_global_nnc_with_cross_grid_nnc)
     Opm::EclIO::EclFile f("opm-test.FEGRID",
                            Opm::EclIO::EclFile::Formatted{true});
 
-    // No same-grid NNCs for any grid.
-    BOOST_CHECK(!f.hasKey("NNC1"));
-    BOOST_CHECK(!f.hasKey("NNC2"));
+    // No same-grid NNCs for any grid: no global NNC section, and the LGR's
+    // NNC1/NNC2 are empty.
+    BOOST_CHECK_EQUAL(intArrays(f, "NNCHEAD").size(), 1u);
+    BOOST_REQUIRE(f.hasKey("NNC1"));
+    BOOST_REQUIRE(f.hasKey("NNC2"));
+    BOOST_CHECK(f.get<int>("NNC1").empty());
+    BOOST_CHECK(f.get<int>("NNC2").empty());
 
     // Cross-grid section must be present and correct.
     BOOST_REQUIRE(f.hasKey("NNCL"));
@@ -916,6 +947,33 @@ BOOST_AUTO_TEST_CASE(no_cross_grid_nnc_produces_no_nncl_nncg)
     BOOST_CHECK(!f.hasKey("NNCG"));
 }
 
+// An LGR without any NNC still has its NNC section: an NNCHEAD and empty
+// NNC1/NNC2, without NNCL/NNCG.
+BOOST_AUTO_TEST_CASE(lgr_without_nnc_has_empty_nnc_section)
+{
+    auto deck = Opm::Parser{}.parseString(opm_lgr_nnc_test);
+    EclipseState es(deck);
+    const auto& egrid = es.getInputGrid();
+
+    Opm::UnitSystem units(Opm::UnitSystem::UnitType::UNIT_TYPE_FIELD);
+    egrid.save("no_lgr_nnc.FEGRID", true, NNCCollection{}, units);
+
+    Opm::EclIO::EclFile f("no_lgr_nnc.FEGRID",
+                           Opm::EclIO::EclFile::Formatted{true});
+
+    const auto nnchead = intArrays(f, "NNCHEAD");
+    BOOST_REQUIRE_EQUAL(nnchead.size(), 1u);
+    BOOST_CHECK_EQUAL(nnchead[0][0], 0);
+    BOOST_CHECK_EQUAL(nnchead[0][1], 1);  // LGR1
+
+    BOOST_REQUIRE(f.hasKey("NNC1"));
+    BOOST_REQUIRE(f.hasKey("NNC2"));
+    BOOST_CHECK(f.get<int>("NNC1").empty());
+    BOOST_CHECK(f.get<int>("NNC2").empty());
+    BOOST_CHECK(!f.hasKey("NNCL"));
+    BOOST_CHECK(!f.hasKey("NNCG"));
+}
+
 BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
 {
     auto deck = msw_sim("LGR_BASESIM3WELLS.DATA");
@@ -945,6 +1003,10 @@ BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
         else if (array_names[i] == "NNA2")    nna2_idx.push_back(i);
     }
 
+    // One NNCHEAD per grid: global + LGR1 + LGR2 + LGR3.  An LGR's NNCHEAD
+    // heads its own NNCs (NNC1/NNC2), then its connections to the global
+    // grid (NNCL/NNCG).
+    BOOST_REQUIRE_EQUAL(nnchead_idx.size(), 4u);
     // Expect 4 NNC1/NNC2 blocks: global + LGR1 + LGR2 + LGR3
     BOOST_REQUIRE_EQUAL(nnc1_idx.size(), 4u);
     BOOST_REQUIRE_EQUAL(nnc2_idx.size(), 4u);
@@ -955,6 +1017,21 @@ BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
     BOOST_REQUIRE_EQUAL(nncheada_idx.size(), 2u);
     BOOST_REQUIRE_EQUAL(nna1_idx.size(), 2u);
     BOOST_REQUIRE_EQUAL(nna2_idx.size(), 2u);
+    for (std::size_t lgr = 1; lgr < 4; ++lgr) {
+        BOOST_CHECK_EQUAL(nnc1_idx[lgr], nnchead_idx[lgr] + 1);
+        BOOST_CHECK_EQUAL(nnc2_idx[lgr], nnchead_idx[lgr] + 2);
+        BOOST_CHECK_EQUAL(nncl_idx[lgr - 1], nnchead_idx[lgr] + 3);
+        BOOST_CHECK_EQUAL(nncg_idx[lgr - 1], nnchead_idx[lgr] + 4);
+    }
+
+    // OPM's EGRID reader finds the NNCs of each grid in that grid's section.
+    {
+        Opm::EclIO::EGrid global_grid("opm-test-allnnc.FEGRID");
+        BOOST_CHECK_EQUAL(global_grid.get_nnc_ijk().size(), 2u);
+
+        Opm::EclIO::EGrid lgr1_grid("opm-test-allnnc.FEGRID", "LGR1");
+        BOOST_CHECK_EQUAL(lgr1_grid.get_nnc_ijk().size(), 3u);
+    }
 
     // -----------------------------------------------------------------------
     // Global NNC (grid 0): entries (0,2) and (0,3) → 1-indexed: (1,3) (1,4)
@@ -1014,7 +1091,7 @@ BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
     // NNCHEAD[0]=num_same_grid_nnc=3, NNCHEAD[1]=1 (LGR1 grid number)
     // -----------------------------------------------------------------------
     {
-        const auto& nnchead = egrid_file.get<int>(nnchead_idx[2]);  // 3rd NNCHEAD block
+        const auto& nnchead = egrid_file.get<int>(nnchead_idx[1]);  // LGR1's NNCHEAD
         BOOST_CHECK_EQUAL(nnchead[0], 3);
         BOOST_CHECK_EQUAL(nnchead[1], 1);
 
@@ -1035,7 +1112,7 @@ BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
     // NNCHEAD[1]=2 (LGR2 grid number)
     // -----------------------------------------------------------------------
     {
-        const auto& nnchead = egrid_file.get<int>(nnchead_idx[4]);  // 5th NNCHEAD block
+        const auto& nnchead = egrid_file.get<int>(nnchead_idx[2]);  // LGR2's NNCHEAD
         BOOST_CHECK_EQUAL(nnchead[0], 3);
         BOOST_CHECK_EQUAL(nnchead[1], 2);
 
@@ -1056,7 +1133,7 @@ BOOST_AUTO_TEST_CASE(nnc_collection_opm_lgr_diff)
     // NNCHEAD[1]=3 (LGR3 grid number)
     // -----------------------------------------------------------------------
     {
-        const auto& nnchead = egrid_file.get<int>(nnchead_idx[6]);  // 7th NNCHEAD block
+        const auto& nnchead = egrid_file.get<int>(nnchead_idx[3]);  // LGR3's NNCHEAD
         BOOST_CHECK_EQUAL(nnchead[0], 3);
         BOOST_CHECK_EQUAL(nnchead[1], 3);
 

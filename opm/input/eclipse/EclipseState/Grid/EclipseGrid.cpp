@@ -2096,22 +2096,19 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         // is keyed by the LGR's deck number, which is the grid's level.
         for (const EclipseGridLGR& lgr : this->lgrsInPrintOrder()) {
             const std::size_t grid_num = this->get_lgr_cell_index(lgr.get_lgr_tag()) + 1;
-            //SAME GRID PLOTS HEADER THAT CONTAINS THE GRID NUMBER
-            std::size_t num_nnc;
+            // One NNCHEAD per LGR: the LGR's own NNCs (NNC1/NNC2), then its
+            // connections to the global grid (NNCL/NNCG).
             if (nnc_col.hasSameGridNNC(grid_num))
             {
-                const auto& nnc = nnc_col.getNNC(grid_num).input();
-                num_nnc = nnc.size();
-                save_nnc_same_grid(egridfile, nnc, grid_num);
+                save_nnc_same_grid(egridfile, nnc_col.getNNC(grid_num).input(), grid_num);
             }
             else {
                 save_nnc_same_grid(egridfile, {}, grid_num);
-                num_nnc = 0;
             }
 
             if (nnc_col.hasCrossGridNNC(0, grid_num)){
                 const auto& nnc_gl = nnc_col.getNNC(0, grid_num);
-                save_nnc_local_global(egridfile, nnc_gl.input(), grid_num, num_nnc);
+                save_nnc_local_global(egridfile, nnc_gl.input());
             }
         }
 
@@ -2126,17 +2123,13 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
         }
     }
 
-    void EclipseGrid::save_nnc_local_global(Opm::EclIO::EclOutput& egridfile, const std::vector<Opm::NNCdata>& nnc, std::size_t grid_num, std::size_t num_nnc) const {
-        std::vector<int> nnchead(10, 0);
+    void EclipseGrid::save_nnc_local_global(Opm::EclIO::EclOutput& egridfile, const std::vector<Opm::NNCdata>& nnc) const {
         std::vector<int> nncl;
         std::vector<int> nncg;
         for (const NNCdata& n : nnc ) {
             nncg.push_back(n.cell1 + 1);
             nncl.push_back(n.cell2 + 1);
         }
-        nnchead[0] = num_nnc;
-        nnchead[1] = grid_num;
-        egridfile.write("NNCHEAD", nnchead);
         egridfile.write("NNCL", nncl);
         egridfile.write("NNCG", nncg);
     }
@@ -2170,7 +2163,9 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
 
         nnchead[0] = nnc1.size();
         nnchead[1] = grid_num;
-        if (nnc1.size() > 0){
+        // The global grid has an NNC section only when it has NNCs.  Every
+        // LGR has one, as its NNCHEAD also heads the LGR's NNCL/NNCG.
+        if ((nnc1.size() > 0) || (grid_num > 0)) {
             egridfile.write("NNCHEAD", nnchead);
             egridfile.write("NNC1", nnc1);
             egridfile.write("NNC2", nnc2);
