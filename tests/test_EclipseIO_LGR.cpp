@@ -1201,6 +1201,125 @@ BOOST_AUTO_TEST_CASE(EclipseIOLGR_NNCInGridOrder)
     BOOST_CHECK((sections == std::vector<std::string>{"LGR2", "LGR1", "LGR2", "LGR1"}));
 }
 
+// Three LGRs whose deck order is a cycle of the order of their host cells: the
+// EGRID, the INIT and the restart file list the LGRs in deck order, and every
+// file numbers an LGR by its deck position.
+BOOST_AUTO_TEST_CASE(EclipseIOLGR_ThreeLGRsInDeckOrder)
+{
+    const auto carfin = [](const std::string& lgr, const std::string& box)
+    {
+        return "CARFIN\n'" + lgr + "' " + box + " 1 1 3 3 1 /\nENDFIN\n";
+    };
+
+    const auto trimmed = [](const std::string& s)
+    {
+        return s.substr(0, s.find_last_not_of(' ') + 1);
+    };
+
+    // Each LGR's position in the deck, and the order of the arrays in a file.
+    const auto lgr_order = [&trimmed](EclIO::EclFile& file, const std::string& head)
+    {
+        std::vector<std::string> names;
+        std::vector<int> numbers;
+        const auto list = file.getList();
+        for (auto i = 0*list.size(); i < list.size(); ++i) {
+            const auto& array = std::get<0>(list[i]);
+            const auto index = static_cast<int>(i);
+            if (array == "LGR") {
+                names.push_back(trimmed(file.get<std::string>(index).front()));
+            } else if ((array == head) && !names.empty()) {
+                numbers.push_back(file.get<int>(index)[(head == "GRIDHEAD") ? 4 : 0]);
+            }
+        }
+        return std::pair { names, numbers };
+    };
+
+    // The second deck does not name its LGRs in alphabetical order.
+    for (const auto& deck_names : { std::vector<std::string>{"LGR1", "LGR2", "LGR3"},
+                                    std::vector<std::string>{"LGRC", "LGRA", "LGRB"} })
+    {
+        // Host cells 9, 1 and 3 of the 3x3 grid, in deck order.
+        const auto deck = Parser().parseString(
+            deckStringLGRWithGridKeywords(carfin(deck_names[0], "3 3 3 3") +
+                                          carfin(deck_names[1], "1 1 1 1") +
+                                          carfin(deck_names[2], "3 3 1 1")) +
+            "SCHEDULE\nRPTRST\nBASIC=1 /\nTSTEP\n1 /\n");
+
+        WorkArea work_area("test_ecl_writer_lgr_deck_order");
+        auto es = EclipseState( deck );
+        const Schedule schedule(deck, es, std::make_shared<Python>());
+        const SummaryConfig summary_config( deck, schedule, es.fieldProps(), es.aquifer());
+        es.getIOConfig().setBaseName( "FOO" );
+        const auto& grid = es.getInputGrid();
+        EclipseIO eclWriter( es, grid, schedule, summary_config);
+
+        // The NNC collection and the restart values number the LGRs by
+        // their deck position; LGR k has the pressure k.
+        NNCCollection nnc_col;
+        for (const std::size_t lgr : {1, 2, 3}) {
+            NNCDataContainerDiffGrid global_lgr;
+            global_lgr.addNNC(4, 0, 1.0);
+            nnc_col.addNNC(0, lgr, global_lgr);
+        }
+        eclWriter.writeInitial(std::vector<data::Solution>{data::Solution{}}, {}, nnc_col);
+
+        std::vector<RestartValue> values;
+        values.emplace_back(mkSolution(grid.getNumActive()), data::Wells{},
+                            data::GroupAndNetworkValues{}, data::Aquifers{});
+        for (auto k = 0*deck_names.size(); k < deck_names.size(); ++k) {
+            const auto num_cells = grid.getLGRCell(deck_names[k]).getNumActive();
+            auto solution = mkSolution(num_cells);
+            solution.data<double>("PRESSURE").assign(num_cells, (k + 1) * 6894.75729);
+            values.emplace_back(std::move(solution), data::Wells{},
+                                data::GroupAndNetworkValues{}, data::Aquifers{});
+        }
+        eclWriter.writeTimeStep(Action::State{}, WellTestState{},
+                                SummaryState{TimeService::now(), 0.0}, UDQState{1},
+                                1, false, 86400.0, std::move(values));
+
+        // EGRID: the LGR grids, GRIDHEAD's number of each, and the grid of
+        // each LGR NNC block.
+        EclIO::EclFile egrid { "FOO.EGRID" };
+        const auto [grids, gridhead] = lgr_order(egrid, "GRIDHEAD");
+        BOOST_CHECK(grids == deck_names);
+        BOOST_CHECK((gridhead == std::vector<int>{1, 2, 3}));
+
+        std::vector<int> nnc_grids;
+        const auto egrid_list = egrid.getList();
+        for (auto i = 0*egrid_list.size(); i < egrid_list.size(); ++i) {
+            if ((std::get<0>(egrid_list[i]) == "NNCHEAD") &&
+                (egrid.get<int>(static_cast<int>(i))[1] > 0))
+            {
+                nnc_grids.push_back(egrid.get<int>(static_cast<int>(i))[1]);
+            }
+        }
+        BOOST_CHECK((nnc_grids == std::vector<int>{1, 2, 3}));
+
+        // INIT: the NNC sections, then the property sections, each numbered
+        // by its LGRHEADI.
+        EclIO::EclFile init { "FOO.INIT" };
+        const auto [sections, init_numbers] = lgr_order(init, "LGRHEADI");
+        auto twice = deck_names;
+        twice.insert(twice.end(), deck_names.begin(), deck_names.end());
+        BOOST_CHECK(sections == twice);
+        BOOST_CHECK((init_numbers == std::vector<int>{1, 2, 3, 1, 2, 3}));
+
+        // Restart: the LGR sections, their LGRHEADI numbers, and the
+        // pressure of each LGR.
+        EclIO::EclFile unrst { "FOO.UNRST" };
+        const auto [rst_sections, rst_numbers] = lgr_order(unrst, "LGRHEADI");
+        BOOST_CHECK(rst_sections == deck_names);
+        BOOST_CHECK((rst_numbers == std::vector<int>{1, 2, 3}));
+
+        EclIO::ERst rst { "FOO.UNRST" };
+        for (auto k = 0*deck_names.size(); k < deck_names.size(); ++k) {
+            const auto pressure = rst.getRestartData<float>("PRESSURE", 1, deck_names[k]);
+            BOOST_REQUIRE_EQUAL(pressure.size(), 9u);
+            BOOST_CHECK_CLOSE(pressure.front(), static_cast<float>(k + 1), 1.0e-4);
+        }
+    }
+}
+
 // An LGR over several host cells spreads its cells evenly over them: an LGR
 // cell's DX, DY and DZ are those of its host cell divided by the LGR cells per
 // host cell in that direction, its pore volume that of its host cell divided

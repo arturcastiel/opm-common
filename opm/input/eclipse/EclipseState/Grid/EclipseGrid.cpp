@@ -2596,15 +2596,24 @@ std::vector<double> EclipseGrid::createDVector(const std::array<int,3>& dims, st
             return this->getGlobalIndex(i, j, k);
         };
         EclipseGridLGR::vec_size_t father_label_sorting(lgr_children_cells.size(),0);
-        m_print_order_lgr_cells.resize(lgr_children_cells.size());
-        std::iota(m_print_order_lgr_cells.begin(), m_print_order_lgr_cells.end(), 0); //
+        // deck_order[pos]: deck position of the LGR stored at position pos.
+        EclipseGridLGR::vec_size_t deck_order(lgr_children_cells.size());
+        std::iota(deck_order.begin(), deck_order.end(), 0);
         std::ranges::transform(lgr_children_cells, father_label_sorting.begin(), first_host);
 
-        std::ranges::sort(m_print_order_lgr_cells,
+        std::ranges::sort(deck_order,
                           [&](std::size_t i1, std::size_t i2)
                           { return father_label_sorting[i1] < father_label_sorting[i2]; });
 
         std::ranges::sort(lgr_children_cells, std::less{}, first_host);
+
+        // The LGRs are stored by their first host cell, but written in deck
+        // order: m_print_order_lgr_cells[k] is the storage position of the
+        // k-th LGR of the deck.
+        m_print_order_lgr_cells.resize(deck_order.size());
+        for (std::size_t pos = 0; pos < deck_order.size(); ++pos) {
+            m_print_order_lgr_cells[deck_order[pos]] = pos;
+        }
 
         lgr_children_labels.reserve(lgr_children_cells.size());
         std::ranges::transform(lgr_children_cells, std::back_inserter(lgr_children_labels),
