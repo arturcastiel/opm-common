@@ -1039,13 +1039,22 @@ namespace {
                     const auto writeAll = es.cfg().io().writeAllTransMultipliers();
                     auto multipliers = es.getTransMult()
                     .convertToSimProps(grid.getNumActive(), writeAll);
-                    if (es.globalFieldProps().has_double("MULTPV")) {
+                    // The block's own MULTPV, else the host cell's.
+                    const auto* ownMultpv = es.globalFieldProps().lgr_double(lgr_label, "MULTPV");
+                    if ((ownMultpv == nullptr) && es.globalFieldProps().has_double("MULTPV")) {
                     multipliers.insert("MULTPV", ::Opm::UnitSystem::measure::identity,
                     es.globalFieldProps().get_double("MULTPV"),
                     ::Opm::data::TargetType::INIT);
                 }
                     // needs to be changed to support different multipliers for different LGRs if fullProperties is true
                     writeSimulatorPropertiesLGRCell(grid, multipliers, initFile, active_fathers);
+                    if (ownMultpv != nullptr) {
+                        auto multpv = std::vector<double>(lgr_grid.getNumActive());
+                        for (auto cell = 0*multpv.size(); cell < multpv.size(); ++cell) {
+                            multpv[cell] = (*ownMultpv)[lgr_grid.getGlobalIndex(cell)];
+                        }
+                        initFile.write("MULTPV", singlePrecision(multpv));
+                    }
                 }
                 writeIntegerCellPropertiesLGRCell(es, active_fathers, initFile);
 

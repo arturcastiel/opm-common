@@ -1302,3 +1302,33 @@ BOOST_AUTO_TEST_CASE(EclipseIOLGR_INIT_InactiveHostCell)
     }
     checkVectorsClose(init.getInitData<float>("PORV", "LGR1"), porv_expected, 1e-3, "PORV LGR1");
 }
+
+// A MULTPV given only inside a CARFIN block is written to the LGR's INIT
+// section; an LGR without one has none, as the main grid.
+BOOST_AUTO_TEST_CASE(EclipseIOLGR_INIT_BlockMULTPV)
+{
+    const auto deck = Parser().parseString(deckStringLGRWithGridKeywords(R"(CARFIN
+    'LGR1'  1  1  1  1  1  1  3  3  1 /
+    MULTPV
+    9*2.0 /
+    ENDFIN
+    CARFIN
+    'LGR2'  3  3  3  3  1  1  3  3  1 /
+    ENDFIN
+    )"));
+
+    WorkArea work_area("test_ecl_writer_lgr_block_multpv");
+    auto es = EclipseState( deck );
+    const Schedule schedule(deck, es, std::make_shared<Python>());
+    const SummaryConfig summary_config( deck, schedule, es.fieldProps(), es.aquifer());
+    es.getIOConfig().setBaseName( "FOO" );
+
+    EclipseIO eclWriter( es, es.getInputGrid(), schedule, summary_config);
+    eclWriter.writeInitial( );
+
+    EclIO::EInit init { "FOO.INIT" };
+    BOOST_REQUIRE(init.hasArray("MULTPV", "LGR1"));
+    checkVectorsClose(init.getInitData<float>("MULTPV", "LGR1"), std::vector<float>(9, 2.0f), 1e-6, "MULTPV LGR1");
+    BOOST_CHECK(!init.hasArray("MULTPV", "LGR2"));
+    BOOST_CHECK(!init.hasArray("MULTPV"));
+}
