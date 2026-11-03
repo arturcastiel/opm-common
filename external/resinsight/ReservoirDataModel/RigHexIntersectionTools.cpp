@@ -20,8 +20,8 @@
 #include "../ReservoirDataModel/RigCellGeometryTools.h"
 
 #include "../LibGeometry/cvfBoundingBox.h"
-#include "../ReservoirDataModel/cvfGeometryTools.h"
 #include "../LibGeometry/cvfRay.h"
+#include "../ReservoirDataModel/cvfGeometryTools.h"
 
 #include "../cafPdmCore/cafAssert.h"
 #include "../cafHexGridIntersectionTools/cafHexGridIntersectionTools.h"
