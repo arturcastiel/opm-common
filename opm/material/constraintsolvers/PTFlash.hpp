@@ -330,7 +330,9 @@ protected:
         std::array<Scalar, numComponents> composition{};
         Scalar pressure = 0.0;
         Scalar temperature = 0.0;
-        Scalar critical_distance = 0.0; //!< see criticalDistance_()
+        int phase_idx = 0; //!< the stable root of the feed
+        //! See criticalDistance_(); NaN until a bypass needs it, 0 for no reference.
+        Scalar critical_distance = 0.0;
     };
 
     //! The reference states of one thread, in slots chosen by the incoming ratios.
@@ -390,7 +392,8 @@ protected:
         auto& stability_reference = stabilityMemory_().references[referenceSlot_(K_scalar)];
         const auto incoming_K = K_scalar;
         const bool stability_bypassed = is_cold_start
-            && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state, z_scalar);
+            && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state, z_scalar,
+                                eos_type);
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
         const bool split_from_flash_first = is_cold_start && !stability_bypassed
@@ -557,7 +560,7 @@ protected:
                 }
                 if (both_trials_trivial) {
                     is_new_reference = rememberReference_(stability_reference, incoming_K,
-                                                          fluid_state, z_scalar, eos_type,
+                                                          fluid_state, z_scalar,
                                                           stable_phase_idx);
                 }
             }
@@ -1136,27 +1139,26 @@ protected:
      * numbers \f$2\sqrt{n_i}\f$ on its stable root (Michelsen 1982; as
      * MultiComponentFlash.jl, michelsen_critical_point_measure!). It is one
      * for an ideal mixture and vanishes at a critical point or on the
-     * spinodal.
+     * spinodal. It is never above one: by Gibbs-Duhem,
+     * \f$\sum_i z_i \partial\ln\varphi_i / \partial n_j = 0\f$, so the
+     * Rayleigh quotient of \f$\mathbf B\f$ at \f$\sqrt{\mathbf z}\f$ is one.
      */
-    template <class FlashFluidState, class ComponentVector>
-    static Scalar criticalDistance_(const FlashFluidState& fluid_state,
-                                    const ComponentVector& z,
-                                    const EOSType& eos_type,
-                                    const int phase_idx)
+    static Scalar criticalDistance_(const StabilityReference& reference, const EOSType& eos_type)
     {
         using DistanceEval = DenseAd::Evaluation<Scalar, numComponents>;
         using ParamCache = typename FluidSystem::template ParameterCache<DistanceEval>;
+        const auto& z = reference.composition;
+        const int phase_idx = reference.phase_idx;
         CompositionalFluidState<DistanceEval, FluidSystem> state;
-        const Scalar pressure = Opm::getValue(fluid_state.pressure(0));
-        state.setPressure(oilPhaseIdx, pressure);
-        state.setPressure(gasPhaseIdx, pressure);
-        state.setTemperature(Opm::getValue(fluid_state.temperature(0)));
+        state.setPressure(oilPhaseIdx, reference.pressure);
+        state.setPressure(gasPhaseIdx, reference.pressure);
+        state.setTemperature(reference.temperature);
 
         // The mole numbers n = z carry the derivatives; the phase holds n / sum(n).
         std::array<DistanceEval, numComponents> moles;
         DistanceEval total_moles = 0.;
         for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            moles[compIdx] = DistanceEval::createVariable(Opm::getValue(z[compIdx]), compIdx);
+            moles[compIdx] = DistanceEval::createVariable(z[compIdx], compIdx);
             total_moles += moles[compIdx];
         }
         for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -1170,9 +1172,8 @@ protected:
             const DistanceEval ln_phi
                 = log(FluidSystem::fugacityCoefficient(state, param_cache, phase_idx, compIdx));
             for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
-                curvature[compIdx][otherIdx] = std::sqrt(Opm::getValue(z[compIdx])
-                                                         * Opm::getValue(z[otherIdx]))
-                    * ln_phi.derivative(otherIdx);
+                curvature[compIdx][otherIdx]
+                    = std::sqrt(z[compIdx] * z[otherIdx]) * ln_phi.derivative(otherIdx);
             }
         }
         for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -1266,7 +1267,8 @@ protected:
      * with them finds the reference. States with the same ratios share a
      * slot, and the last one stays. Each reference stands for the states
      * around it, so whichever is found is as good a reference for a state
-     * inside its window.
+     * inside its window. Its critical distance is computed when a bypass
+     * first needs it.
      *
      * \return whether the state was remembered
      */
@@ -1275,20 +1277,16 @@ protected:
                                    const ComponentVector& K,
                                    const FlashFluidState& fluid_state,
                                    const ComponentVector& z,
-                                   const EOSType& eos_type,
                                    const int phase_idx)
     {
-        const Scalar distance = criticalDistance_(fluid_state, z, eos_type, phase_idx);
-        if (!(distance > 0.)) {
-            return false;
-        }
         for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
             reference.ratios[compIdx] = Opm::getValue(K[compIdx]);
             reference.composition[compIdx] = Opm::getValue(z[compIdx]);
         }
         reference.pressure = Opm::getValue(fluid_state.pressure(0));
         reference.temperature = Opm::getValue(fluid_state.temperature(0));
-        reference.critical_distance = distance;
+        reference.phase_idx = phase_idx;
+        reference.critical_distance = std::numeric_limits<Scalar>::quiet_NaN();
         return true;
     }
 
@@ -1314,11 +1312,12 @@ protected:
      * boundary.
      */
     template <class FlashFluidState, class ComponentVector>
-    static bool stabilityBypass_(const StabilityReference& reference,
+    static bool stabilityBypass_(StabilityReference& reference,
                                  const ComponentVector& K,
                                  const typename FlashFluidState::ValueType& L,
                                  const FlashFluidState& fluid_state,
-                                 const ComponentVector& z)
+                                 const ComponentVector& z,
+                                 const EOSType& eos_type)
     {
         if (!(L == 0. || L == 1.)) {
             return false;
@@ -1328,20 +1327,34 @@ protected:
                 return false;
             }
         }
-        const Scalar distance = reference.critical_distance;
         const Scalar pressure = Opm::getValue(fluid_state.pressure(0));
         const Scalar temperature = Opm::getValue(fluid_state.temperature(0));
-        if (!(std::abs(pressure - reference.pressure)
-                  < distance * pressure / stabilityBypassTolerance
-              && std::abs(temperature - reference.temperature)
-                  < stabilityBypassTemperatureWindow * distance)) {
-            return false;
-        }
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            if (!(std::abs(Opm::getValue(z[compIdx]) - reference.composition[compIdx])
-                  < distance / stabilityBypassTolerance)) {
+        const auto inside_window = [&](const Scalar distance) {
+            if (!(std::abs(pressure - reference.pressure)
+                      < distance * pressure / stabilityBypassTolerance
+                  && std::abs(temperature - reference.temperature)
+                      < stabilityBypassTemperatureWindow * distance)) {
                 return false;
             }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                if (!(std::abs(Opm::getValue(z[compIdx]) - reference.composition[compIdx])
+                      < distance / stabilityBypassTolerance)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // The critical distance is at most one, so a state outside the window
+        // for one needs no critical distance.
+        if (!inside_window(1.0)) {
+            return false;
+        }
+        if (std::isnan(reference.critical_distance)) {
+            const Scalar distance = criticalDistance_(reference, eos_type);
+            reference.critical_distance = distance > 0. ? distance : 0.;
+        }
+        if (!inside_window(reference.critical_distance)) {
+            return false;
         }
         OPM_FLASH_COUNT(cacheHits);
         return true;
