@@ -202,17 +202,42 @@ public:
         ParamCache param_cache(eos_type);
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
             param_cache.updatePhase(fluid_state, phaseIdx);
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fluid_state.setFugacityCoefficient(
-                    phaseIdx,
-                    compIdx,
-                    FluidSystem::fugacityCoefficient(fluid_state, param_cache, phaseIdx, compIdx));
-            }
+            updateFugacityCoefficients_(fluid_state, param_cache, phaseIdx);
         }
         return is_single_phase;
     }
 
 protected:
+    /*!
+     * \brief Stores the fugacity coefficients of all components of a phase in
+     *        the fluid state, from a parameter cache updated for the phase.
+     *
+     * A fluid system with fugacityCoefficients() evaluates the terms the
+     * components share once; otherwise each component is evaluated alone.
+     */
+    template <class FlashFluidState, class ParamCache>
+    static void updateFugacityCoefficients_(FlashFluidState& fluid_state,
+                                            const ParamCache& param_cache,
+                                            const unsigned phase_idx)
+    {
+        std::array<typename FlashFluidState::ValueType, numComponents> coefficients;
+        if constexpr (requires {
+                          FluidSystem::fugacityCoefficients(
+                              fluid_state, param_cache, phase_idx, coefficients);
+                      }) {
+            FluidSystem::fugacityCoefficients(fluid_state, param_cache, phase_idx, coefficients);
+        }
+        else {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                coefficients[compIdx] = FluidSystem::fugacityCoefficient(
+                    fluid_state, param_cache, phase_idx, compIdx);
+            }
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fluid_state.setFugacityCoefficient(phase_idx, compIdx, coefficients[compIdx]);
+        }
+    }
+
     static constexpr std::size_t numFlashUnknowns = numMisciblePhases * numMiscibleComponents + 1;
     // x, y and L, then both phase pressures and the temperature.
     using JacobianState = std::array<Scalar, numFlashUnknowns + 3>;
@@ -451,13 +476,14 @@ protected:
         }
 
         const auto sum_z_ln_phi = [&](const ParamCache& cache, const int phase_idx) {
+            std::array<FlashEval, numComponents> phis;
+            CubicEOS::computeFugacityCoefficients(feed_state, cache, phase_idx, phis);
             Scalar sum = 0.0;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 if (!(Opm::getValue(z[compIdx]) > 0.)) {
                     continue;
                 }
-                const auto phi = CubicEOS::computeFugacityCoefficient(
-                    feed_state, cache, phase_idx, compIdx);
+                const auto& phi = phis[compIdx];
                 sum += Opm::getValue(z[compIdx]) * std::log(Opm::getValue(phi));
             }
             return sum;
@@ -735,11 +761,18 @@ protected:
             reference_param_cache.updatePhase(reference_state, reference_phase_idx);
 
             // Fugacity coefficients of the trial phase and reference phase.
+            std::array<FlashEval, numComponents> trial_fugacity_coefficients;
+            std::array<FlashEval, numComponents> reference_fugacity_coefficients;
+            CubicEOS::computeFugacityCoefficients(
+                trial_state, trial_param_cache, trial_phase_idx, trial_fugacity_coefficients);
+            CubicEOS::computeFugacityCoefficients(reference_state,
+                                                  reference_param_cache,
+                                                  reference_phase_idx,
+                                                  reference_fugacity_coefficients);
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                const auto trial_fugacity_coefficient = CubicEOS::computeFugacityCoefficient(
-                    trial_state, trial_param_cache, trial_phase_idx, compIdx);
-                const auto reference_fugacity_coefficient = CubicEOS::computeFugacityCoefficient(
-                    reference_state, reference_param_cache, reference_phase_idx, compIdx);
+                const auto& trial_fugacity_coefficient = trial_fugacity_coefficients[compIdx];
+                const auto& reference_fugacity_coefficient
+                    = reference_fugacity_coefficients[compIdx];
 
                 trial_state.setFugacityCoefficient(
                     trial_phase_idx, compIdx, trial_fugacity_coefficient);
@@ -1102,11 +1135,7 @@ protected:
 
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
             paramCache.updatePhase(newton_state, phaseIdx);
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                NewtonEval fugacity_coefficient
-                    = FluidSystem::fugacityCoefficient(newton_state, paramCache, phaseIdx, compIdx);
-                newton_state.setFugacityCoefficient(phaseIdx, compIdx, fugacity_coefficient);
-            }
+            updateFugacityCoefficients_(newton_state, paramCache, phaseIdx);
         }
         bool converged = false;
         unsigned iteration = 0;
@@ -1147,11 +1176,7 @@ protected:
 
             for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
                 paramCache.updatePhase(newton_state, phaseIdx);
-                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                    NewtonEval fugacity_coefficient = FluidSystem::fugacityCoefficient(
-                        newton_state, paramCache, phaseIdx, compIdx);
-                    newton_state.setFugacityCoefficient(phaseIdx, compIdx, fugacity_coefficient);
-                }
+                updateFugacityCoefficients_(newton_state, paramCache, phaseIdx);
             }
             ++iteration;
         }
@@ -1326,12 +1351,7 @@ protected:
         UnknownParamCache unknown_param_cache(eos_type);
         for (unsigned phase_idx = 0; phase_idx < numMisciblePhases; ++phase_idx) {
             unknown_param_cache.updatePhase(unknown_derivative_state, phase_idx);
-            for (unsigned comp_idx = 0; comp_idx < numComponents; ++comp_idx) {
-                UnknownEval fugacity_coefficient = FluidSystem::fugacityCoefficient(
-                    unknown_derivative_state, unknown_param_cache, phase_idx, comp_idx);
-                unknown_derivative_state.setFugacityCoefficient(
-                    phase_idx, comp_idx, fugacity_coefficient);
-            }
+            updateFugacityCoefficients_(unknown_derivative_state, unknown_param_cache, phase_idx);
         }
 
         using UnknownResidual = Dune::FieldVector<Scalar, num_equations>;
@@ -1445,12 +1465,7 @@ protected:
         StateParamCache state_param_cache(eos_type);
         for (unsigned phase_idx = 0; phase_idx < numMisciblePhases; ++phase_idx) {
             state_param_cache.updatePhase(state_derivative_state, phase_idx);
-            for (unsigned comp_idx = 0; comp_idx < numComponents; ++comp_idx) {
-                StateEval fugacity_coefficient = FluidSystem::fugacityCoefficient(
-                    state_derivative_state, state_param_cache, phase_idx, comp_idx);
-                state_derivative_state.setFugacityCoefficient(
-                    phase_idx, comp_idx, fugacity_coefficient);
-            }
+            updateFugacityCoefficients_(state_derivative_state, state_param_cache, phase_idx);
         }
 
         using StateResidual = Dune::FieldVector<Scalar, num_equations>;
@@ -1785,11 +1800,7 @@ protected:
             // Calculate fugacity coefficient
             for (int phaseIdx=0; phaseIdx<numMisciblePhases; ++phaseIdx){
                 paramCache.updatePhase(fluid_state, phaseIdx);
-                for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                    const auto fugacity_coefficient = FluidSystem::fugacityCoefficient(
-                        fluid_state, paramCache, phaseIdx, compIdx);
-                    fluid_state.setFugacityCoefficient(phaseIdx, compIdx, fugacity_coefficient);
-                }
+                updateFugacityCoefficients_(fluid_state, paramCache, phaseIdx);
             }
 
             // Calculate fugacity ratio
