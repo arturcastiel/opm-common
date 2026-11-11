@@ -99,6 +99,15 @@ class PTFlash
     // Plain substitution steps of the two-phase split between two
     // extrapolations, see successiveSubstitutionComposition_().
     static constexpr int substitutionAccelerationInterval = 5;
+    // The hand-over from successive substitution to Newton in the hybrid
+    // method. Substitution continues while its observed convergence rate
+    // predicts convergence within maxPredictedSubstitutionSteps more steps,
+    // up to maxHybridSubstitutionSteps: a substitution step costs a fraction
+    // of a Newton step. Otherwise Newton takes over after
+    // substitutionStepsBeforeNewton steps.
+    static constexpr int substitutionStepsBeforeNewton = 5;
+    static constexpr int maxHybridSubstitutionSteps = 20;
+    static constexpr Scalar maxPredictedSubstitutionSteps = 8;
 
 public:
     /*!
@@ -1797,7 +1806,7 @@ protected:
         // Limit conditioning passes before Newton; standalone substitution runs
         // longer. With the extrapolation, the limit only stops a split that
         // does not converge.
-        const int max_iterations = run_newton_afterwards ? 5 : (extrapolate ? 1000 : 100);
+        const int max_iterations = run_newton_afterwards ? maxHybridSubstitutionSteps : (extrapolate ? 1000 : 100);
 
         // Print initial guess
         if (verbosity >= 1) {
@@ -1837,6 +1846,7 @@ protected:
         // fixed, so it computes the pure-component parameters once.
         using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
         ParamCache paramCache(eos_type);
+        Scalar previous_residual = 0.;
         for (int iteration = 0; iteration < max_iterations; ++iteration) {
             OPM_FLASH_COUNT(ssiIterations);
             // Compute (normalized) liquid and vapor mole fractions
@@ -1928,6 +1938,20 @@ protected:
 
                 // Solve Rachford-Rice to get L from updated K
                 L = RachfordRice::solve(K, z, L, 0);
+
+                // The hand-over to Newton, see substitutionStepsBeforeNewton.
+                if (run_newton_afterwards) {
+                    const Scalar residual = Opm::getValue(fugacity_residual.two_norm());
+                    const Scalar rate = iteration > 0 ? residual / previous_residual : Scalar{1.};
+                    const Scalar predicted_steps = rate > 0. && rate < 1.
+                        ? std::log(flash_tolerance / residual) / std::log(rate)
+                        : std::numeric_limits<Scalar>::infinity();
+                    previous_residual = residual;
+                    if (!(predicted_steps <= maxPredictedSubstitutionSteps)
+                        && iteration + 1 >= substitutionStepsBeforeNewton) {
+                        break;
+                    }
+                }
 
                 steps = {step, steps[0], steps[1]};
                 ++plain_steps;
