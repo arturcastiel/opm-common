@@ -469,9 +469,10 @@ protected:
         // With the stability bypass, a single-phase state close to a
         // reference state whose stability test was decisive stays
         // single-phase without a test. The reference is found by the
-        // incoming ratios.
+        // incoming ratios. A split from an earlier flash neither uses nor
+        // makes a reference, so it does not touch the memory.
         StabilityMemory* stability_memory = settings.stabilityBypass ? &stabilityMemory_() : nullptr;
-        StabilityReference* stability_reference = stability_memory
+        StabilityReference* stability_reference = stability_memory && is_cold_start
             ? &stability_memory->references[referenceSlot_(K_scalar)] : nullptr;
         const auto incoming_K = K_scalar;
         const bool stability_bypassed = single_phase_from_table
@@ -655,7 +656,8 @@ protected:
             }
         }
         // Any other outcome leaves no reference for the incoming ratios.
-        if (stability_reference && !stability_bypassed && !is_new_reference) {
+        if (stability_reference && !stability_bypassed && !is_new_reference
+            && stability_reference->critical_distance != 0.) {
             *stability_reference = StabilityReference{};
         }
         fluid_state.setLvalue(L_scalar);
