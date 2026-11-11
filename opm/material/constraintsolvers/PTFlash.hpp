@@ -2262,53 +2262,26 @@ protected:
                                  const EOSType& eos_type)
     {
         constexpr std::size_t liquid_fraction_idx = numFlashUnknowns - 1;
-        using Vector = std::array<Scalar, numComponents>;
-        using Matrix = std::array<Vector, numComponents>;
-        CompositionalFluidState<Scalar, FluidSystem> state;
-        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
-                                        static_cast<unsigned>(gasPhaseIdx)}) {
-            state.setPressure(phaseIdx, Opm::getValue(fluid_state_scalar.pressure(phaseIdx)));
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                state.setMoleFraction(
-                    phaseIdx, compIdx,
-                    Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx)));
-            }
-        }
-        state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
+        ComponentMatrix liquid_jacobian;
+        ComponentMatrix vapour_jacobian;
+        analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian);
         const Scalar liquid_fraction = Opm::getValue(fluid_state_scalar.L());
-        const Scalar pref = state.pressure(oilPhaseIdx);
 
         Dune::FieldMatrix<Scalar, numFlashUnknowns, numFlashUnknowns> jacobian(0.);
-        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
-        ParamCache param_cache(eos_type);
-        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
-                                        static_cast<unsigned>(gasPhaseIdx)}) {
-            param_cache.updatePhase(state, phaseIdx);
-            Vector coefficients;
-            Matrix derivatives;
-            FluidSystem::fugacityCoefficientsAndDerivatives(
-                state, param_cache, phaseIdx, coefficients, derivatives);
-            // d(f_i / p_ref)/dw_j of the phase, w its mole fractions; the
-            // vapour fugacity enters the residual with a minus sign.
-            const bool liquid = phaseIdx == static_cast<unsigned>(oilPhaseIdx);
-            const Scalar sign = liquid ? 1. : -1.;
-            const unsigned offset = liquid ? 0 : numComponents;
-            const Scalar pressure_ratio = state.pressure(phaseIdx) / pref;
-            for (unsigned i = 0; i < numComponents; ++i) {
-                const Scalar scaled = sign * pressure_ratio * coefficients[i];
-                const Scalar w = state.moleFraction(phaseIdx, i);
-                for (unsigned j = 0; j < numComponents; ++j) {
-                    jacobian[numComponents + i][offset + j] = scaled * w * derivatives[i][j];
-                }
-                jacobian[numComponents + i][offset + i] += scaled;
+        for (unsigned i = 0; i < numComponents; ++i) {
+            // The vapour fugacity enters the residual with a minus sign.
+            for (unsigned j = 0; j < numComponents; ++j) {
+                jacobian[numComponents + i][j] = liquid_jacobian[i][j];
+                jacobian[numComponents + i][numComponents + j] = -vapour_jacobian[i][j];
             }
         }
         for (unsigned i = 0; i < numComponents; ++i) {
             // z_i - L x_i - (1 - L) y_i, as -z_i + L x_i + (1 - L) y_i
             jacobian[i][i] = liquid_fraction;
             jacobian[i][numComponents + i] = 1. - liquid_fraction;
-            jacobian[i][liquid_fraction_idx] = state.moleFraction(oilPhaseIdx, i)
-                - state.moleFraction(gasPhaseIdx, i);
+            jacobian[i][liquid_fraction_idx]
+                = Opm::getValue(fluid_state_scalar.moleFraction(oilPhaseIdx, i))
+                - Opm::getValue(fluid_state_scalar.moleFraction(gasPhaseIdx, i));
             // sum x - sum y
             jacobian[liquid_fraction_idx][i] = 1.;
             jacobian[liquid_fraction_idx][numComponents + i] = -1.;
@@ -2408,6 +2381,60 @@ protected:
     //! The state variables the fugacities depend on: pressure [and temperature].
     static constexpr int numStateColumns = isThermal ? 2 : 1;
     using FugacityStateColumns = Dune::FieldMatrix<Scalar, numComponents, numStateColumns>;
+
+    /*!
+     * \brief The composition blocks of fugacityDerivatives_() on values, from
+     *        the analytic composition derivatives of the fugacity
+     *        coefficients of the fluid system:
+     *        \f$A^L = \partial (f^L / p) / \partial \mathbf x\f$ and
+     *        \f$A^V = \partial (f^V / p) / \partial \mathbf y\f$, with
+     *        \f$\partial (f_i / p) / \partial w_j = (p_\alpha / p)\, \phi_i
+     *        (\delta_{ij} + w_i\, \partial \ln\phi_i / \partial w_j)\f$
+     *        for the mole fractions \f$\mathbf w\f$ of phase \f$\alpha\f$.
+     */
+    template <typename FlashFluidStateScalar>
+    static void analyticFugacityJacobians_(const FlashFluidStateScalar& fluid_state_scalar,
+                                           const EOSType& eos_type,
+                                           ComponentMatrix& liquid_jacobian,
+                                           ComponentMatrix& vapour_jacobian)
+    {
+        using Vector = std::array<Scalar, numComponents>;
+        using Matrix = std::array<Vector, numComponents>;
+        CompositionalFluidState<Scalar, FluidSystem> state;
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            state.setPressure(phaseIdx, Opm::getValue(fluid_state_scalar.pressure(phaseIdx)));
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setMoleFraction(
+                    phaseIdx, compIdx,
+                    Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx)));
+            }
+        }
+        state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
+        const Scalar pref = state.pressure(oilPhaseIdx);
+
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            param_cache.updatePhase(state, phaseIdx);
+            Vector coefficients;
+            Matrix derivatives;
+            FluidSystem::fugacityCoefficientsAndDerivatives(
+                state, param_cache, phaseIdx, coefficients, derivatives);
+            ComponentMatrix& jacobian
+                = phaseIdx == static_cast<unsigned>(oilPhaseIdx) ? liquid_jacobian : vapour_jacobian;
+            const Scalar pressure_ratio = state.pressure(phaseIdx) / pref;
+            for (unsigned i = 0; i < numComponents; ++i) {
+                const Scalar scaled = pressure_ratio * coefficients[i];
+                const Scalar w = state.moleFraction(phaseIdx, i);
+                for (unsigned j = 0; j < numComponents; ++j) {
+                    jacobian[i][j] = scaled * w * derivatives[i][j];
+                }
+                jacobian[i][i] += scaled;
+            }
+        }
+    }
 
     /*!
      * \brief The fugacity rows of the Jacobians of the flash residuals at a
@@ -2638,6 +2665,13 @@ protected:
                     vapour_jacobian[row][col] = -jacobian[numComponents + row][numComponents + col];
                 }
             }
+            fugacityDerivatives_<false>(
+                fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+        }
+        else if constexpr (hasFugacityDerivatives_) {
+            // The fugacity rows of dF/du on values; only those of dF/ds need
+            // automatic differentiation.
+            analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian);
             fugacityDerivatives_<false>(
                 fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
         }
