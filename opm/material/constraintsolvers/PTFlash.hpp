@@ -148,7 +148,7 @@ class PTFlash
     // critical distance of the reference state, and the number of reference
     // states each thread remembers. MultiComponentFlash.jl uses 10 and 10;
     // these are the widest windows that changed no phase state on the
-    // benchmark maps (10 and 10 changed 45 states, 50 and 0.5 changed 2).
+    // benchmark maps (10 and 10 changed 44 states, 50 and 0.5 changed 2).
     static constexpr Scalar stabilityBypassTolerance = 100;
     static constexpr Scalar stabilityBypassTemperatureWindow = 0.3;
     static constexpr std::size_t stabilityMemorySize = std::size_t{1} << 16;
