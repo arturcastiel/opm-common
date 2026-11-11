@@ -96,6 +96,9 @@ class PTFlash
     // trivial solution with all equilibrium ratios at one.
     static constexpr Scalar substitutionTolerance = 1e-10;
     static constexpr Scalar trivialSolutionTolerance = 1e-5;
+    // Starting ratios this close to the trivial solution, by the same
+    // measure, test nothing: the stability test starts from Wilson instead.
+    static constexpr Scalar trivialStartTolerance = 1e-2;
     // Plain substitution steps of the two-phase split between two
     // extrapolations, see successiveSubstitutionComposition_().
     static constexpr int substitutionAccelerationInterval = 5;
@@ -137,6 +140,12 @@ public:
 
         const auto [is_single_phase, newton_jacobian]
             = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+
+        // The equilibrium ratios the next flash of a nearby state starts
+        // from, see flashScalar_().
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fluid_state.setKvalue(compIdx, scalar_state.K(compIdx));
+        }
 
         // Transfer the converged values before reconstructing their derivatives.
         for (int compIdx=0; compIdx<numComponents; ++compIdx){
@@ -187,7 +196,11 @@ public:
      * -# for a single-phase mixture, the phase label.
      *
      * The state also receives the fugacity coefficients of the phase
-     * compositions it returns, which are the feed for a single phase.
+     * compositions it returns, which are the feed for a single phase. A
+     * single phase also returns in \f$K\f$ the ratios that the stability test
+     * of a nearby state best starts from: those of the trial phase that ended
+     * closest to instability, see phaseStabilityTest_(), or the ratios of a
+     * negative flash.
      *
      * \return Whether the mixture is single-phase.
      */
@@ -406,6 +419,10 @@ protected:
                 }
             }
         }
+        // The start of the next flash of a nearby state.
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fluid_state.setKvalue(compIdx, K_scalar[compIdx]);
+        }
         fluid_state.setLvalue(L_scalar);
         return {is_single_phase, newton_jacobian};
     }
@@ -579,7 +596,12 @@ protected:
      * \f$K_i = y_i / x_i\f$ for the two-phase flash.
      *
      * \param[out] isStable Whether the mixture stays in one phase.
-     * \param[in,out] K Starting ratios in, refined ratios out for a two-phase mixture.
+     * \param[in,out] K Starting ratios in. Out, for a two-phase mixture the
+     *        refined ratios; for a stable one the start of the next test of a
+     *        nearby state: the converged ratios of the trial that ended
+     *        closest to instability (largest \f$S\f$), whose stationary point
+     *        moves little with the state, or the Wilson estimates where both
+     *        trials collapsed onto the mixture.
      * \param[in,out] fluid_state The mixture; a stable one gets \f$z\f$ as both phase compositions.
      * \param z The mixture composition.
      * \param eos_type The equation of state.
@@ -591,6 +613,14 @@ protected:
     static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
     {
         OPM_FLASH_COUNT(stabilityTests);
+        // Ratios carried over from a nearby state can sit at the trivial
+        // solution, where both trials stop at once, e.g. those of a
+        // near-critical negative flash.
+        if (trivialSolutionMeasure_(K) < trivialStartTolerance) {
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                K[compIdx] = fluid_state.wilsonK_(compIdx);
+            }
+        }
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
         ComponentVector liquid_trial_composition, vapour_trial_composition;
         typename FlashFluidState::ValueType liquid_trial_sum, vapour_trial_sum;
@@ -643,6 +673,17 @@ protected:
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
                 fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
+            }
+            // The start of the next test of a nearby state.
+            if (!vapour_trial_is_trivial || !liquid_trial_is_trivial) {
+                const bool from_vapour_trial = !vapour_trial_is_trivial
+                    && (liquid_trial_is_trivial || !(liquid_trial_sum > vapour_trial_sum));
+                K = from_vapour_trial ? vapour_trial_k : liquid_trial_k;
+            }
+            else {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    K[compIdx] = fluid_state.wilsonK_(compIdx);
+                }
             }
         }
         // The two stationary trial compositions seed the equilibrium ratios.
