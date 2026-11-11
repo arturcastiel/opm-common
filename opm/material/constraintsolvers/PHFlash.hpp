@@ -273,23 +273,37 @@ struct PHFlash {
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 searchState.setMoleFraction(compIdx, getValue(fluidState.moleFraction(compIdx)));
             }
-            auto evaluateWithSlope = [&](const Scalar T) -> std::optional<SlopedTrial> {
+            auto evaluateWithSlope = [&](const Scalar T,
+                                         const bool reuseSplit) -> std::optional<SlopedTrial> {
                 const auto r = flashedResidual(searchState, SearchEval::createVariable(T, 0),
                                                hSpec, cfg, warmStart, twoPhaseMethod,
-                                               ptTolerance, eosType, verbosity);
+                                               ptTolerance, eosType, verbosity, reuseSplit);
                 if (!r) {
                     return std::nullopt;
                 }
                 return SlopedTrial{Trial{T, *r}, slopeAlongFlash(searchState, cfg, eosType)};
             };
             if (const auto solution = newton(evaluateWithSlope, incoming, tLo, tHi, idealGasCp, cfg)) {
-                const auto residual = residualAt(solution->temperature);
-                if (residual && std::abs(*residual) <= cfg.enthalpyTolerance
-                    && !(solution->slope > 0.0
-                         && std::abs(*residual) > confirmSteps * cfg.temperatureTolerance
-                                                  * solution->slope))
-                {
-                    return true;
+                // The flash of the state confirms the solution; one that is
+                // off by more than the temperature tolerance, but within
+                // confirmSteps of it, takes one more Newton step on the
+                // full flash (a warm-started trial differs from it within
+                // the tolerance of the isothermal flash).
+                const Scalar slope = solution->slope;
+                Scalar temperature = solution->temperature;
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    const auto residual = residualAt(temperature);
+                    if (!residual || std::abs(*residual) > cfg.enthalpyTolerance) {
+                        break;
+                    }
+                    if (!(slope > 0.0)
+                        || std::abs(*residual) <= cfg.temperatureTolerance * slope) {
+                        return true;
+                    }
+                    if (std::abs(*residual) > confirmSteps * cfg.temperatureTolerance * slope) {
+                        break;
+                    }
+                    temperature = std::clamp(temperature - *residual / slope, tLo, tHi);
                 }
             }
         }
@@ -358,8 +372,21 @@ private:
     //! Limit on one Newton step [K] before a bracket is found.
     static constexpr Scalar maxNewtonStep = 50.0;
 
+    //! Distance [K] within which the Newton search passes a cached split on
+    //! with its L (see WarmStart).
+    static constexpr Scalar splitWindow = 5.0;
+
+    //! A Newton trial reached by a longer step [K] than this passes the
+    //! cached split on. A shorter step usually precedes convergence: that
+    //! trial keeps rule 1, so that the solution is the root of the residual
+    //! of the full flash, which the flash of the state at the solution
+    //! evaluates, and not of a warm-started one, which differs from it
+    //! within the tolerance of the isothermal flash.
+    static constexpr Scalar splitReuseStep = 0.1;
+
     //! The flash of the state at the Newton solution confirms it when its
-    //! residual is within this many temperature tolerances times dr/dT.
+    //! residual is within one temperature tolerance times dr/dT; within this
+    //! many, it takes one more Newton step.
     static constexpr Scalar confirmSteps = 10.0;
 
     /*!
@@ -381,6 +408,16 @@ private:
      *      correctness guard. The two ends of the interval are evaluated back
      *      to back and therefore always start cold.
      *
+     * The Newton search from the incoming temperature relaxes rule 1: there
+     * a split within splitWindow also passes its L, and the flash skips its
+     * stability test. The flash goes on to the negative flash, which labels
+     * a mixture that has left the two-phase region as one phase, and PTFlash
+     * retests the stability of a split that collapses onto coincident
+     * phases. The flash of the state at the Newton solution keeps rule 1:
+     * its stability test verifies the solution, and a solution it does not
+     * confirm hands over to the bracket search, which keeps rule 1
+     * throughout.
+     *
      * Only a two-phase split with strictly positive x and y is cached
      * (single-phase ratios carry no information, and a zero mole fraction
      * would cache K = 0). The cached ratios are y/x of the converged state;
@@ -392,9 +429,11 @@ private:
             : maxStep(window)
         {}
 
-        //! Seed a flash at T from the cached ratios; false if they do not apply.
+        //! Seed a flash at T from the cached ratios; false if they do not
+        //! apply. With reuseSplit, a split within splitWindow also passes
+        //! its L, so that the flash skips its stability test.
         template <class FluidState>
-        bool seed(FluidState& fluidState, const Scalar T) const
+        bool seed(FluidState& fluidState, const Scalar T, const bool reuseSplit) const
         {
             using ValueType = typename FluidState::ValueType;
 
@@ -404,7 +443,13 @@ private:
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 fluidState.setKvalue(compIdx, ValueType(K[compIdx]));
             }
-            fluidState.setLvalue(ValueType(-1.0)); // rule 1
+            if (reuseSplit && splitReusable && std::abs(T - temperature) <= splitWindow) {
+                OPM_FLASH_COUNT(cacheHits);
+                fluidState.setLvalue(ValueType(liquidFraction));
+            }
+            else {
+                fluidState.setLvalue(ValueType(-1.0)); // rule 1
+            }
             return true;
         }
 
@@ -418,6 +463,8 @@ private:
                 return;
             }
             temperature = T;
+            liquidFraction = L;
+            splitReusable = true;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 const Scalar x = getValue(
                     fluidState.moleFraction(FluidSystem::oilPhaseIdx, compIdx));
@@ -432,7 +479,11 @@ private:
         }
 
         //! Cache the equilibrium ratios a two-phase incoming state carries
-        //! (L in (0, 1), every K positive and finite) for a flash at T.
+        //! (L in (0, 1), every K positive and finite) for a flash at T. They
+        //! seed K only: unlike the converged ratios of a trial, they can be
+        //! far from the split at T (Wilson estimates, an old time step), and
+        //! a flash that skips its stability test from a poor K can take
+        //! hundreds of iterations near a critical point.
         template <class FluidState>
         void storeIncoming(const FluidState& fluidState, const Scalar T)
         {
@@ -443,6 +494,8 @@ private:
                 valid = K[compIdx] > 0.0 && std::isfinite(K[compIdx]);
             }
             temperature = T;
+            liquidFraction = L;
+            splitReusable = false;
         }
 
         void drop()
@@ -454,6 +507,8 @@ private:
         Scalar maxStep;
         bool valid = false;
         std::array<Scalar, numComponents> K{};
+        Scalar liquidFraction = -1.0;
+        bool splitReusable = false;
         Scalar temperature = 0.0;
     };
 
@@ -463,6 +518,7 @@ private:
      *
      * A warm-started flash that fails drops the seed and retries cold. A
      * temperature that carries a derivative passes it on to the split.
+     * reuseSplit passes a cached split on with its L (see WarmStart).
      *
      * \return r(T), or nothing where the isothermal flash or the enthalpy
      *         throws std::runtime_error or Dune::FMatrixError, or where r is
@@ -477,7 +533,8 @@ private:
                                                  const PTFlashMethod twoPhaseMethod,
                                                  const Scalar ptTolerance,
                                                  const EOSType& eosType,
-                                                 const int verbosity)
+                                                 const int verbosity,
+                                                 const bool reuseSplit = false)
     {
         using Flash = PTFlash<Scalar, FluidSystem, true>;
         using ValueType = typename FluidState::ValueType;
@@ -487,7 +544,7 @@ private:
         fluidState.setTemperature(temperature);
 
         bool solved = false;
-        if (warmStart.seed(fluidState, T)) {
+        if (warmStart.seed(fluidState, T, reuseSplit)) {
             try {
                 Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
                 solved = true;
@@ -613,7 +670,7 @@ private:
                                                 const Cp& idealGasCp,
                                                 const Config& cfg)
     {
-        auto current = evaluate(t0);
+        auto current = evaluate(t0, /*reuseSplit=*/true);
         if (!current) {
             return std::nullopt;
         }
@@ -672,7 +729,14 @@ private:
                 }
                 step = std::min(step, maxNewtonStep);
                 if (!(direction * (end - c.temperature) > 0.0)) {
-                    return std::nullopt; // at the end, without a sign change
+                    // At the end without a sign change: a root on the end
+                    // itself can show a residual of either sign, which the
+                    // flash at the solution decides.
+                    if (newtonStep && std::abs(target - c.temperature)
+                                          <= confirmSteps * cfg.temperatureTolerance) {
+                        return NewtonSolution{end, slope};
+                    }
+                    return std::nullopt;
                 }
                 target = direction * (end - c.temperature) > step ? c.temperature + direction * step
                                                                   : end;
@@ -680,7 +744,7 @@ private:
             stepBeforeLast = lastStep;
             lastStep = target - c.temperature;
 
-            auto next = evaluate(target);
+            auto next = evaluate(target, std::abs(target - c.temperature) > splitReuseStep);
             if (!next) {
                 return std::nullopt;
             }
