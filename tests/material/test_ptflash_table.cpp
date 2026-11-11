@@ -23,7 +23,8 @@
  *        changes where the two-phase split starts: the answers are those of
  *        the flash without the table, with either interpolation, from a new
  *        and from a filled table. The table is cleared when the fluid
- *        system changes.
+ *        system changes. In its approximate mode the answers keep the phase
+ *        state and stay close to those of the flash.
  */
 #include "config.h"
 
@@ -41,6 +42,7 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -187,4 +189,46 @@ BOOST_AUTO_TEST_CASE(TableIsClearedWhenTheFluidChanges)
     Flash::solve(fs, Opm::PTFlashMethod::SsiNewton, flashTolerance, eosType);
     Settings::get().mode = Opm::PTFlashTableMode::Off;
     BOOST_CHECK_LE(Table::get().vertices(), 16u);
+}
+
+BOOST_AUTO_TEST_CASE(ApproximateTableStaysClose)
+{
+    makeFluid(0.0411);
+    Settings::get().interpolation = Settings::Interpolation::Multilinear;
+    Table::get().reset();
+    const auto expected = flashAll(Opm::PTFlashTableMode::Off);
+    flashAll(Opm::PTFlashTableMode::Approximate);
+    Opm::FlashStatistics::get().reset();
+    const auto approximate = flashAll(Opm::PTFlashTableMode::Approximate);
+    // From the filled table, most answers are taken without iterating.
+    BOOST_CHECK_GT(2 * Opm::FlashStatistics::get().cacheHits, static_cast<long>(expected.size()));
+
+    int changedPhaseState = 0;
+    Scalar maxDifference = 0.0;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (expected[i].singlePhase != approximate[i].singlePhase) {
+            ++changedPhaseState;
+            continue;
+        }
+        const auto& a = expected[i].state;
+        const auto& b = approximate[i].state;
+        maxDifference = std::max(maxDifference, std::abs(Opm::getValue(a.L()) - Opm::getValue(b.L())));
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            for (const auto phaseIdx : {oilPhaseIdx, gasPhaseIdx}) {
+                const auto& x = b.moleFraction(phaseIdx, compIdx);
+                maxDifference = std::max(maxDifference,
+                                         std::abs(Opm::getValue(a.moleFraction(phaseIdx, compIdx))
+                                                  - Opm::getValue(x)));
+                for (int d = 0; d < Evaluation::numVars; ++d) {
+                    BOOST_CHECK(std::isfinite(x.derivative(d)));
+                }
+            }
+        }
+    }
+    BOOST_TEST_MESSAGE("approximate: phase state changed " << changedPhaseState << ", largest difference "
+                       << maxDifference);
+    BOOST_CHECK_EQUAL(changedPhaseState, 0);
+    BOOST_CHECK_LT(maxDifference, 0.05);
+    BOOST_CHECK_GT(maxDifference, 0.0);
+    Settings::get().interpolation = Settings::Interpolation::Automatic;
 }
