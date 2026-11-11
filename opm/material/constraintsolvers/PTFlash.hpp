@@ -862,6 +862,15 @@ protected:
                     K = trial_K;
                     L = trial_L;
                     newton_jacobian = std::move(jacobian);
+                    // Substitution from Wilson's ratios reaches a stationary
+                    // point below the feed, not necessarily the stable split:
+                    // where the liquid is unstable, the split from the
+                    // stability test of the feed replaces it if its Gibbs
+                    // energy is lower.
+                    if (!liquidPhaseIsStable_(fluid_state, incoming_state, eos_type, verbosity)) {
+                        replaceByLowerSplit_(K, L, newton_jacobian, fluid_state, incoming_state, z,
+                                             twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+                    }
                     return true;
                 }
             }
@@ -872,6 +881,133 @@ protected:
         }
         fluid_state = incoming_state;
         return false;
+    }
+
+    /*!
+     * \brief The Gibbs energy of a split relative to RT,
+     *        \f$\sum_\alpha n_\alpha \sum_i w_{\alpha i} \ln (w_{\alpha i} \varphi_{\alpha i})\f$,
+     *        with \f$n\f$ = L for the liquid and 1 - L for the vapour.
+     */
+    template <class FlashFluidState>
+    static Scalar splitGibbsEnergy_(FlashFluidState& fluid_state,
+                                    const Scalar L,
+                                    const EOSType& eos_type)
+    {
+        using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        ParamCache param_cache(eos_type);
+        Scalar energy = 0.0;
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx), static_cast<unsigned>(gasPhaseIdx)}) {
+            OPM_FLASH_COUNT(eosUpdates);
+            param_cache.updatePhase(fluid_state, phaseIdx);
+            updateFugacityCoefficients_(fluid_state, param_cache, phaseIdx);
+            const Scalar amount = phaseIdx == static_cast<unsigned>(oilPhaseIdx) ? L : 1.0 - L;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar w = Opm::getValue(fluid_state.moleFraction(phaseIdx, compIdx));
+                if (w > 0.) {
+                    const Scalar phi = Opm::getValue(fluid_state.fugacityCoefficient(phaseIdx, compIdx));
+                    energy += amount * w * std::log(w * phi);
+                }
+            }
+        }
+        return energy;
+    }
+
+    /*!
+     * \brief The split from the stability test of the feed in place of a
+     *        given one (K, L, the fluid state and the Newton Jacobian) when
+     *        its Gibbs energy is lower. The given split is kept when the test
+     *        finds the feed stable or its split fails.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static void replaceByLowerSplit_(ComponentVector& K,
+                                     typename FlashFluidState::ValueType& L,
+                                     std::optional<NewtonJacobian>& newton_jacobian,
+                                     FlashFluidState& fluid_state,
+                                     const FlashFluidState& incoming_state,
+                                     const ComponentVector& z,
+                                     const PTFlashMethod twoPhaseMethod,
+                                     const Scalar flash_tolerance,
+                                     const EOSType& eos_type,
+                                     const int verbosity)
+    {
+        FlashFluidState other_state = incoming_state;
+        ComponentVector other_K;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            other_K[compIdx] = incoming_state.K(compIdx);
+        }
+        bool feed_is_stable = false;
+        phaseStabilityTest_(feed_is_stable, other_K, other_state, z, eos_type, verbosity);
+        if (feed_is_stable) {
+            return;
+        }
+        try {
+            OPM_FLASH_COUNT(rachfordRiceSolves);
+            typename FlashFluidState::ValueType other_L = RachfordRice::solve(other_K, z, 0);
+            if (!(other_L > 0. && other_L < 1.)) {
+                return;
+            }
+            auto other_jacobian = flash_2ph(z, twoPhaseMethod, other_K, other_L, other_state,
+                                            flash_tolerance, eos_type, verbosity);
+            const Scalar other_fraction = Opm::getValue(other_L);
+            if (!(other_fraction > 0. && other_fraction < 1.) || phasesCoincide_(other_state)) {
+                return;
+            }
+            FlashFluidState given_state = fluid_state;
+            if (splitGibbsEnergy_(other_state, other_fraction, eos_type)
+                < splitGibbsEnergy_(given_state, Opm::getValue(L), eos_type) - stabilityTolerance) {
+                K = other_K;
+                L = other_L;
+                newton_jacobian = std::move(other_jacobian);
+                fluid_state = other_state;
+            }
+        }
+        catch (const NumericalProblem&) {
+        }
+        catch (const Dune::FMatrixError&) {
+        }
+    }
+
+    /*!
+     * \brief Whether a liquid-like trial phase grown from the liquid of a
+     *        converged split, with the ratios of the incoming state, finds
+     *        it stable.
+     *
+     * A split below the Gibbs energy of the feed proves the feed unstable,
+     * but the split that substitution reaches from Wilson's ratios is only a
+     * stationary point: where the feed can split in more than one way (two
+     * liquids, or a vapour with either liquid), it can be one with a higher
+     * Gibbs energy than the stable split. The phases of the stable split
+     * share a tangent plane that no composition lies below, so a liquid that
+     * is unstable marks a split that may not be the stable one (or a feed
+     * with three phases). The split from Wilson's ratios is a vapour and a
+     * light liquid, and the phase it misses is a denser liquid, which the
+     * liquid-like trial finds; a vapour-like trial adds nothing on the
+     * stress test of random fluids (bench/stress3.cpp) and costs as much.
+     */
+    template <class FlashFluidState>
+    static bool liquidPhaseIsStable_(const FlashFluidState& fluid_state,
+                                     const FlashFluidState& incoming_state,
+                                     const EOSType& eos_type,
+                                     const int verbosity)
+    {
+        FlashFluidState liquid_state = fluid_state;
+        Dune::FieldVector<Scalar, numComponents> liquid, trial_K;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            liquid[compIdx] = Opm::getValue(fluid_state.moleFraction(oilPhaseIdx, compIdx));
+            trial_K[compIdx] = Opm::getValue(incoming_state.K(compIdx));
+        }
+        using ValueType = typename FlashFluidState::ValueType;
+        using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
+        ParamCache param_cache(eos_type);
+        std::array<ValueType, numComponents> reference_coefficients;
+        const FeedRoot root = feedStableRoot_(liquid_state, liquid, param_cache, reference_coefficients);
+        bool is_trivial = false;
+        Dune::FieldVector<Scalar, numComponents> trial_composition;
+        ValueType trial_sum = 0.0;
+        checkStability_(liquid_state, is_trivial, trial_K, trial_composition, trial_sum, liquid,
+                        /*is_vapour_trial=*/false, root.phase_idx, reference_coefficients, param_cache,
+                        verbosity);
+        return is_trivial || trial_sum < 1.0 + stabilityTolerance;
     }
 
     /*!
