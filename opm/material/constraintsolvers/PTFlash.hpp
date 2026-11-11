@@ -113,6 +113,15 @@ class PTFlash
     // may make, see checkStability_().
     static constexpr int stabilityAccelerationInterval = 5;
     static constexpr Scalar maxStabilityExtrapolation = 1.0;
+    // Substitution steps a cold start takes on the split before the
+    // stability test, see flashFirst_(): without a phase below the tangent
+    // plane of the feed, and in all.
+    static constexpr int flashFirstIterations = 2;
+    static constexpr int flashFirstMaxIterations = 3;
+    // The clamps of CubicEOS::computeFugacityCoefficient(); a clamped value
+    // does not give a tangent-plane distance.
+    static constexpr Scalar maxFugacityCoefficient = 1e10;
+    static constexpr Scalar minFugacityCoefficient = 1e-10;
 
 public:
     /*!
@@ -308,7 +317,12 @@ protected:
         // Here, a cold start means there is no usable previous two-phase split
         // (L is outside (0, 1)); a warm start reuses previous K and L values.
         const bool is_cold_start = L_scalar <= 0 || L_scalar >= 1;
-        if (is_cold_start) {
+        // A cold start first tries the split itself; one that lowers the
+        // Gibbs energy below the feed's makes the stability test unnecessary.
+        const bool split_from_flash_first = is_cold_start
+            && flashFirst_(K_scalar, L_scalar, newton_jacobian, fluid_state, z_scalar,
+                           twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+        if (is_cold_start && !split_from_flash_first) {
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
@@ -321,7 +335,7 @@ protected:
                                      fluid_state.pressure(0), fluid_state.temperature(0)));
         }
         // Update the composition if cell is two-phase
-        if (!is_single_phase) {
+        if (!is_single_phase && !split_from_flash_first) {
             // Only the first split of a warm start skips the stability test.
             bool is_warm_split = !is_cold_start;
             const auto try_solve_split = [&](const auto& on_failure) {
@@ -605,6 +619,212 @@ protected:
         }
 
         return L;
+    }
+
+    /*!
+     * \brief The tangent plane of the Gibbs energy at the feed,
+     *        \f$d_i = \ln z_i + \ln\varphi_i(\mathbf z)\f$, on the stable cubic
+     *        root of the feed (the lower \f$\sum_i z_i d_i\f$).
+     *
+     * \return nothing where a fugacity coefficient is at its clamp
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static std::optional<Dune::FieldVector<Scalar, numComponents>>
+    feedTangentPlane_(const FlashFluidState& fluid_state,
+                      const ComponentVector& z,
+                      const EOSType& eos_type)
+    {
+        using ParamCache =
+            typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        using PlaneVector = Dune::FieldVector<Scalar, numComponents>;
+        FlashFluidState feed_state = fluid_state;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            feed_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
+            feed_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
+        }
+        std::optional<PlaneVector> plane;
+        Scalar plane_gibbs = 0.0;
+        for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
+            ParamCache param_cache(eos_type);
+            param_cache.updatePhase(feed_state, phaseIdx);
+            PlaneVector phase_plane(0.0);
+            Scalar phase_gibbs = 0.0;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar z_i = Opm::getValue(z[compIdx]);
+                if (!(z_i > 0.)) {
+                    continue;
+                }
+                const Scalar phi = Opm::getValue(
+                    FluidSystem::fugacityCoefficient(feed_state, param_cache, phaseIdx, compIdx));
+                if (!(phi > minFugacityCoefficient && phi < maxFugacityCoefficient)) {
+                    return std::nullopt;
+                }
+                phase_plane[compIdx] = std::log(z_i * phi);
+                phase_gibbs += z_i * phase_plane[compIdx];
+            }
+            if (!plane || phase_gibbs < plane_gibbs) {
+                plane = phase_plane;
+                plane_gibbs = phase_gibbs;
+            }
+        }
+        return plane;
+    }
+
+    /*!
+     * \brief Flash first, stability on demand.
+     *
+     * A cold start without a phase state (the incoming \f$L\f$ is neither 0
+     * nor 1) first takes substitution steps of the two-phase split from the
+     * incoming ratios, the order Michelsen recommends and thermopack
+     * (tp_solver.f90, twoPhaseTPflash) and neqsim (TPflash.java) use. After
+     * each step both phases are measured against the tangent plane
+     * \f$\mathbf d\f$ of the feed,
+     *
+     * \f[ \mathrm{tpd}(\mathbf w) = \sum_i w_i \left(\ln w_i + \ln\varphi_i(\mathbf w) - d_i\right). \f]
+     *
+     * The Gibbs energy of the split exceeds that of the feed by
+     * \f$L\,\mathrm{tpd}(\mathbf x) + (1 - L)\,\mathrm{tpd}(\mathbf y)\f$.
+     * When this is below \f$-\f$stabilityTolerance, a phase lies below the
+     * tangent plane: the feed is unstable, which is all the stability test
+     * could establish, so the test is skipped and the split, already below
+     * the feed, is finished by \p twoPhaseMethod.
+     *
+     * Each step needs an interior Rachford-Rice root and fugacity
+     * coefficients off their clamps. After flashFirstIterations steps the
+     * attempt continues, up to flashFirstMaxIterations, only while a phase is
+     * below the plane. A split whose phase is below the plane but whose
+     * Gibbs energy is not yet below the feed is not finished from here:
+     * Newton from such a start can take hundreds of steps where the
+     * stability test's ratios converge in a few.
+     *
+     * Without acceptance, or when the finished split is not a distinct
+     * interior one, the fluid state is restored and the caller runs the
+     * stability test from the incoming ratios, as without this step. An
+     * incoming \f$L\f$ of 0 or 1 is a single-phase result of the previous
+     * call; such a state is most likely still single-phase and goes to the
+     * stability test directly.
+     *
+     * \return whether the split was accepted; K, L, the fluid state and the
+     *         Newton Jacobian then hold it
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool flashFirst_(ComponentVector& K,
+                            typename FlashFluidState::ValueType& L,
+                            std::optional<NewtonJacobian>& newton_jacobian,
+                            FlashFluidState& fluid_state,
+                            const ComponentVector& z,
+                            const PTFlashMethod twoPhaseMethod,
+                            const Scalar flash_tolerance,
+                            const EOSType& eos_type,
+                            const int verbosity)
+    {
+        using ValueType = typename FlashFluidState::ValueType;
+        using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
+
+        if (L == 0. || L == 1.) {
+            return false;
+        }
+        const FlashFluidState incoming_state = fluid_state;
+        ComponentVector trial_K = K;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(Opm::getValue(z[compIdx]) > 0.)) {
+                trial_K[compIdx] = 1.;
+            }
+        }
+        ValueType trial_L = 0.;
+        std::optional<Dune::FieldVector<Scalar, numComponents>> feed_plane;
+        bool feed_is_unstable = false;
+        for (int iteration = 0; iteration < flashFirstMaxIterations; ++iteration) {
+            try {
+                OPM_FLASH_COUNT(rachfordRiceSolves);
+                trial_L = RachfordRice::solve(trial_K, z, 0);
+            }
+            catch (const NumericalProblem&) {
+                break;
+            }
+            if (!(trial_L > 0. && trial_L < 1.)) {
+                break;
+            }
+            OPM_FLASH_COUNT(ssiIterations);
+            computeLiquidVapor_(fluid_state, trial_L, trial_K, z);
+            bool is_clamped = false;
+            ParamCache param_cache(eos_type);
+            for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
+                param_cache.updatePhase(fluid_state, phaseIdx);
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const auto phi = FluidSystem::fugacityCoefficient(
+                        fluid_state, param_cache, phaseIdx, compIdx);
+                    fluid_state.setFugacityCoefficient(phaseIdx, compIdx, phi);
+                    is_clamped = is_clamped || !(Opm::getValue(phi) > minFugacityCoefficient
+                                                 && Opm::getValue(phi) < maxFugacityCoefficient);
+                }
+            }
+            if (is_clamped) {
+                break;
+            }
+            if (!feed_plane) {
+                feed_plane = feedTangentPlane_(incoming_state, z, eos_type);
+                if (!feed_plane) {
+                    break;
+                }
+            }
+            const auto tangent_plane_distance = [&](const unsigned phaseIdx) {
+                Scalar distance = 0.0;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar w = Opm::getValue(fluid_state.moleFraction(phaseIdx, compIdx));
+                    if (Opm::getValue(z[compIdx]) > 0. && w > 0.) {
+                        const Scalar phi
+                            = Opm::getValue(fluid_state.fugacityCoefficient(phaseIdx, compIdx));
+                        distance += w * (std::log(w * phi) - (*feed_plane)[compIdx]);
+                    }
+                }
+                return distance;
+            };
+            const Scalar liquid_distance = tangent_plane_distance(oilPhaseIdx);
+            const Scalar vapour_distance = tangent_plane_distance(gasPhaseIdx);
+            const Scalar liquid_fraction = Opm::getValue(trial_L);
+            if (liquid_fraction * liquid_distance + (1. - liquid_fraction) * vapour_distance
+                < -stabilityTolerance) {
+                feed_is_unstable = true;
+                break;
+            }
+            const bool phase_below_plane = liquid_distance < -stabilityTolerance
+                || vapour_distance < -stabilityTolerance;
+            if (!phase_below_plane && iteration + 1 >= flashFirstIterations) {
+                break;
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                if (Opm::getValue(z[compIdx]) > 0.) {
+                    trial_K[compIdx] *= fluid_state.fugacity(oilPhaseIdx, compIdx)
+                        / fluid_state.fugacity(gasPhaseIdx, compIdx);
+                }
+            }
+        }
+
+        if (feed_is_unstable) {
+            if (verbosity >= 1) {
+                OpmLog::debug("A phase of the split below the tangent plane of the feed: "
+                              "unstable, no stability test.");
+            }
+            try {
+                auto jacobian = flash_2ph(z, twoPhaseMethod, trial_K, trial_L, fluid_state,
+                                          flash_tolerance, eos_type, verbosity);
+                const Scalar liquid_fraction = Opm::getValue(trial_L);
+                if (liquid_fraction > 0. && liquid_fraction < 1.
+                    && !phasesCoincide_(fluid_state)) {
+                    K = trial_K;
+                    L = trial_L;
+                    newton_jacobian = std::move(jacobian);
+                    return true;
+                }
+            }
+            catch (const NumericalProblem&) {
+            }
+            catch (const Dune::FMatrixError&) {
+            }
+        }
+        fluid_state = incoming_state;
+        return false;
     }
 
     /*!
