@@ -106,7 +106,9 @@ namespace Opm {
  * Continuation advances in \f$\ln p\f$, carries stationary trial amounts from
  * one pressure to the next, and brackets the sign change of \f$\ln S_Y\f$.
  * A failed scan does not establish that no root exists: near a critical point,
- * the two-phase interval can be narrower than the pressure sampling step.
+ * the two-phase interval can be narrower than the pressure sampling step. A
+ * scan that has found no two-phase trial stops below 10^4 Pa (above 10^9 Pa
+ * for the lower dew point), so a boundary outside that window is not reported.
  * A damped Newton stationary solve completes fixed-pressure substitutions that
  * stall near criticality. During continuation, a failed trial point does not
  * discard an existing bracket: alternate interior points are tried, and a
@@ -285,6 +287,16 @@ private:
     // Step in ln Y used to finite-difference the Jacobian; this perturbs Y
     // relatively rather than by a fixed absolute amount.
     static constexpr Scalar jacobianStep_ = 1.0e-5;
+    // The pressure window [Pa] of a scan that has not found a two-phase
+    // trial: the scan down from above gives up below the lower end, the scan
+    // up from below above the upper end. Without it, a mixture without a
+    // saturation pressure, such as a gas far above its cricondentherm, is
+    // scanned over tens of decades of pressure, and the trials at pressures
+    // of a few pascal converge so slowly that each needs the full
+    // substitution and a Newton completion: such mixtures cost a thousand
+    // times a resolved one.
+    static constexpr Scalar minScanPressure_ = 1.0e4;
+    static constexpr Scalar maxScanPressure_ = 1.0e9;
 
     // Rescale a composition to sum to one. The boundary residual is measured
     // against one, so a composition that sums to 1 + d cannot meet that test
@@ -1226,6 +1238,12 @@ private:
 
         for (int outer = 0; outer < maxPressureIterations; ++outer) {
             if (!positiveFinite_(p)) {
+                return Outcome::GaveUp;
+            }
+            // A boundary outside the scan window is not reported, unless a
+            // two-phase trial has already been found.
+            if (outer > 0 && !haveIn
+                && (fromAbove ? p < minScanPressure_ : p > maxScanPressure_)) {
                 return Outcome::GaveUp;
             }
             fs.setPressure(oilPhaseIdx, p);
