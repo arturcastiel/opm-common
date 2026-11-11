@@ -348,16 +348,18 @@ protected:
         Scalar T = decay<Scalar>(fluidState.temperature(phaseIdx));
         Scalar p = decay<Scalar>(fluidState.pressure(phaseIdx));
 
-        // The other phase may hold them already.
+        // Kept when current; otherwise the other phase may hold them already.
         switch (phaseIdx)
         {
         case oilPhaseIdx:
-            if (!oilPhaseParams_.takePure(gasPhaseParams_, T, p)) {
+            if (!oilPhaseParams_.pureIsCurrent(T, p)
+                && !oilPhaseParams_.takePure(gasPhaseParams_, T, p)) {
                 oilPhaseParams_.updatePure(T, p);
             }
             break;
         case gasPhaseIdx:
-            if (!gasPhaseParams_.takePure(oilPhaseParams_, T, p)) {
+            if (!gasPhaseParams_.pureIsCurrent(T, p)
+                && !gasPhaseParams_.takePure(oilPhaseParams_, T, p)) {
                 gasPhaseParams_.updatePure(T, p);
             }
             break;
