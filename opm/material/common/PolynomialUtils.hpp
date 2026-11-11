@@ -311,62 +311,6 @@ unsigned invertCubicPolynomial(SolContainer* sol,
     return 3;
 }
 
-//! \cond SKIP_THIS
-// The roots cubicRoots() computes for a depressed cubic t^3 + p t + q with a
-// non-negative discriminant discr = 4 p^3 + 27 q^2, x = t - b / (3 a).
-template <class Scalar, class SolContainer>
-unsigned cubicRootsNonNegativeDiscriminant_(SolContainer* sol,
-                                            Scalar a,
-                                            Scalar b,
-                                            Scalar p,
-                                            Scalar q,
-                                            Scalar discr)
-{
-    if (discr > 0.0) {
-
-        // Find one real root of a depressed cubic using hyperbolic method. Different solutions depending on
-        // sign of p
-        Scalar t = 0;
-        if (p < 0) {
-            // Help calculation
-            Scalar theta = (1.0 / 3.0) * acosh( ((-3.0 * abs(q)) / (2.0 * p)) * sqrt(-3.0 / p) );
-
-            // Root
-            t = ( (-2.0 * abs(q)) / q ) * sqrt(-p / 3.0) * cosh(theta);
-        }
-        else if (p > 0) {
-            // Help calculation
-            Scalar theta = (1.0 / 3.0) * asinh( ((3.0 * q) / (2.0 * p)) * sqrt(3.0 / p) );
-            // Root
-            t = -2.0 * sqrt(p / 3.0) * sinh(theta);
-
-        }
-        else {
-            throw std::runtime_error(" p = 0 in cubic root solver!");
-        }
-
-        // Transform t to output solution
-        sol[0] = t - b / (3.0 * a);
-        return 1;
-
-    }
-    else {
-        // The discriminant, 4*p^3 + 27*q^2 = 0, thus we have simple (real) roots
-        // If p = 0 then also q = 0, and t = 0 is a triple root
-        if (p == 0) {
-            sol[0] = sol[1] = sol[2] = 0.0 - b / (3.0 * a);
-        }
-        // If p != 0, the we have a simple root and a double root
-        else {
-            sol[0] = (3.0 * q / p) - b / (3.0 * a);
-            sol[1] = sol[2] = (-3.0 * q) / (2.0 * p) - b / (3.0 * a);
-            std::sort(sol, sol + 3);
-        }
-        return 3;
-    }
-}
-//! \endcond
-
 /*!
  * \ingroup Math
  * \brief Invert a cubic polynomial analytically
@@ -422,10 +366,89 @@ unsigned cubicRoots(SolContainer* sol,
 
         return 3;
     }
+    else if (discr > 0.0) {
+
+        // Find one real root of a depressed cubic using hyperbolic method. Different solutions depending on
+        // sign of p
+        Scalar t = 0;
+        if (p < 0) {
+            // Help calculation
+            Scalar theta = (1.0 / 3.0) * acosh( ((-3.0 * abs(q)) / (2.0 * p)) * sqrt(-3.0 / p) );
+
+            // Root
+            t = ( (-2.0 * abs(q)) / q ) * sqrt(-p / 3.0) * cosh(theta);
+        }
+        else if (p > 0) {
+            // Help calculation
+            Scalar theta = (1.0 / 3.0) * asinh( ((3.0 * q) / (2.0 * p)) * sqrt(3.0 / p) );
+            // Root
+            t = -2.0 * sqrt(p / 3.0) * sinh(theta);
+
+        }
+        else {
+            throw std::runtime_error(" p = 0 in cubic root solver!");
+        }
+
+        // Transform t to output solution
+        sol[0] = t - b / (3.0 * a);
+        return 1;
+
+    }
     else {
-        return cubicRootsNonNegativeDiscriminant_(sol, a, b, p, q, discr);
+        // The discriminant, 4*p^3 + 27*q^2 = 0, thus we have simple (real) roots
+        // If p = 0 then also q = 0, and t = 0 is a triple root
+        if (p == 0) {
+            sol[0] = sol[1] = sol[2] = 0.0 - b / (3.0 * a);
+        }
+        // If p != 0, the we have a simple root and a double root
+        else {
+            sol[0] = (3.0 * q / p) - b / (3.0 * a);
+            sol[1] = sol[2] = (-3.0 * q) / (2.0 * p) - b / (3.0 * a);
+            std::sort(sol, sol + 3);
+        }
+        return 3;
     }
 }
+
+//! \cond SKIP_THIS
+// The smallest or largest of the three real roots of cubicRoots() for a
+// depressed cubic t^3 + p t + q with a negative discriminant, see
+// cubicExtremeRoot().
+template <class Scalar, class SolContainer>
+unsigned cubicExtremeOfThreeRoots_(SolContainer* sol,
+                                   const Scalar& a,
+                                   const Scalar& b,
+                                   const Scalar& p,
+                                   const Scalar& q,
+                                   bool largest)
+{
+    Scalar theta = (1.0 / 3.0) * acos( ((3.0 * q) / (2.0 * p)) * sqrt(-3.0 / p) );
+    const Scalar radius = 2.0 * sqrt(-p / 3.0);
+    const Scalar shift = b / (3.0 * a);
+
+    // Away from a double root (theta near 0 or pi/3) and from a triple root
+    // (radius small against the shift), the roots differ by far more than
+    // their rounding errors, so the extreme one is known without sorting.
+    constexpr double angleMargin = 1e-6;
+    const double angle = scalarValue(theta);
+    const bool separated = scalarValue(radius) > 1e-6 * std::abs(scalarValue(shift));
+    if (separated && largest && angle < std::numbers::pi / 3.0 - angleMargin) {
+        sol[2] = radius * cos( theta ) - shift;
+        return 3;
+    }
+    if (separated && !largest && angle > angleMargin) {
+        sol[0] = radius * cos( theta - ((4.0 * std::numbers::pi) / 3.0) ) - shift;
+        return 3;
+    }
+
+    // All three, sorted, as cubicRoots().
+    sol[0] = radius * cos( theta ) - shift;
+    sol[1] = radius * cos( theta - ((2.0 * std::numbers::pi) / 3.0) ) - shift;
+    sol[2] = radius * cos( theta - ((4.0 * std::numbers::pi) / 3.0) ) - shift;
+    std::sort(sol, sol + 3);
+    return 3;
+}
+//! \endcond
 
 /*!
  * \ingroup Math
@@ -463,36 +486,53 @@ unsigned cubicExtremeRoot(SolContainer* sol,
     Scalar p = (3.0 * a * c - b * b) / (3.0 * a * a);
     Scalar q = (2.0 * b * b * b - 9.0 * a * b * c + 27.0 * d * a * a) / (27.0 * a * a * a);
     Scalar discr = 4.0 * p * p * p + 27.0 * q * q;
-    if (!(discr < 0.0)) {
-        return cubicRootsNonNegativeDiscriminant_(sol, a, b, p, q, discr);
+    if (discr < 0.0) {
+        return cubicExtremeOfThreeRoots_(sol, a, b, p, q, largest);
     }
+    else if (discr > 0.0) {
 
-    Scalar theta = (1.0 / 3.0) * acos( ((3.0 * q) / (2.0 * p)) * sqrt(-3.0 / p) );
-    const Scalar radius = 2.0 * sqrt(-p / 3.0);
-    const Scalar shift = b / (3.0 * a);
+        // Find one real root of a depressed cubic using hyperbolic method. Different solutions depending on
+        // sign of p
+        Scalar t = 0;
+        if (p < 0) {
+            // Help calculation
+            Scalar theta = (1.0 / 3.0) * acosh( ((-3.0 * abs(q)) / (2.0 * p)) * sqrt(-3.0 / p) );
 
-    // Away from a double root (theta near 0 or pi/3) and from a triple root
-    // (radius small against the shift), the roots differ by far more than
-    // their rounding errors, so the extreme one is known without sorting.
-    constexpr double angleMargin = 1e-6;
-    const double angle = scalarValue(theta);
-    const bool separated = scalarValue(radius) > 1e-6 * std::abs(scalarValue(shift));
-    if (separated && largest && angle < std::numbers::pi / 3.0 - angleMargin) {
-        sol[2] = radius * cos( theta ) - shift;
+            // Root
+            t = ( (-2.0 * abs(q)) / q ) * sqrt(-p / 3.0) * cosh(theta);
+        }
+        else if (p > 0) {
+            // Help calculation
+            Scalar theta = (1.0 / 3.0) * asinh( ((3.0 * q) / (2.0 * p)) * sqrt(3.0 / p) );
+            // Root
+            t = -2.0 * sqrt(p / 3.0) * sinh(theta);
+
+        }
+        else {
+            throw std::runtime_error(" p = 0 in cubic root solver!");
+        }
+
+        // Transform t to output solution
+        sol[0] = t - b / (3.0 * a);
+        return 1;
+
+    }
+    else {
+        // The discriminant, 4*p^3 + 27*q^2 = 0, thus we have simple (real) roots
+        // If p = 0 then also q = 0, and t = 0 is a triple root
+        if (p == 0) {
+            sol[0] = sol[1] = sol[2] = 0.0 - b / (3.0 * a);
+        }
+        // If p != 0, the we have a simple root and a double root
+        else {
+            sol[0] = (3.0 * q / p) - b / (3.0 * a);
+            sol[1] = sol[2] = (-3.0 * q) / (2.0 * p) - b / (3.0 * a);
+            std::sort(sol, sol + 3);
+        }
         return 3;
     }
-    if (separated && !largest && angle > angleMargin) {
-        sol[0] = radius * cos( theta - ((4.0 * std::numbers::pi) / 3.0) ) - shift;
-        return 3;
-    }
-
-    // All three, sorted, as cubicRoots().
-    sol[0] = radius * cos( theta ) - shift;
-    sol[1] = radius * cos( theta - ((2.0 * std::numbers::pi) / 3.0) ) - shift;
-    sol[2] = radius * cos( theta - ((4.0 * std::numbers::pi) / 3.0) ) - shift;
-    std::sort(sol, sol + 3);
-    return 3;
 }
+
 } // end Opm
 
 #endif
