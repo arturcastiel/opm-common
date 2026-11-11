@@ -318,6 +318,8 @@ protected:
                                           const int verbosity)
     {
         std::optional<NewtonJacobian> newton_jacobian;
+        // The stable feed root of the last stability test.
+        std::optional<FeedRoot> stable_feed_root;
         // States without a physical two-phase fraction require stability
         // analysis. Every completed split is classified below.
         bool is_single_phase = false;
@@ -342,7 +344,7 @@ protected:
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
-            phaseStabilityTest_(
+            stable_feed_root = phaseStabilityTest_(
                 is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
         }
         if (verbosity >= 1) {
@@ -433,7 +435,7 @@ protected:
                 for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
                     K_scalar[compIdx] = fluid_state.wilsonK_(compIdx);
                 }
-                phaseStabilityTest_(
+                stable_feed_root = phaseStabilityTest_(
                     is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
                 if (!is_single_phase) {
                     OPM_FLASH_COUNT(splitRetries);
@@ -467,8 +469,9 @@ protected:
                 // by the root with the lower Gibbs energy. A single root larger
                 // than the pseudo-critical volume of the feed is a vapour; a
                 // smaller one is labelled by Li's correlation.
-                const auto [stable_phase_idx, has_two_roots, molar_volume]
-                    = feedStableRoot_(fluid_state, z_scalar, eos_type);
+                // The stability test that found the feed stable has its root.
+                const auto [stable_phase_idx, has_two_roots, molar_volume] = stable_feed_root
+                    ? *stable_feed_root : feedStableRoot_(fluid_state, z_scalar, eos_type);
                 if (has_two_roots) {
                     L_scalar = stable_phase_idx == static_cast<int>(oilPhaseIdx) ? 1.0 : 0.0;
                     if (verbosity >= 1) {
@@ -525,8 +528,30 @@ protected:
                                     const EOSType& eos_type)
     {
         using FlashEval = typename FlashFluidState::ValueType;
-        using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
+        ParamCache feed_cache(eos_type);
+        std::array<FlashEval, numComponents> stable_coefficients;
+        return feedStableRoot_(fluid_state, z, feed_cache, stable_coefficients);
+    }
+
+    /*!
+     * \brief feedStableRoot_() on a given parameter cache, also returning the
+     *        fugacity coefficients of the feed on its stable root, the
+     *        reference of the stability trials.
+     *
+     * The cache is left updated for the feed on both roots; a later update
+     * for another composition at the same temperature and pressure keeps
+     * its pure-component parameters.
+     */
+    template <class FlashFluidState, class ComponentVector, class ParamCache>
+    static FeedRoot feedStableRoot_(const FlashFluidState& fluid_state,
+                                    const ComponentVector& z,
+                                    ParamCache& feed_cache,
+                                    std::array<typename FlashFluidState::ValueType, numComponents>&
+                                        stable_coefficients)
+    {
+        using FlashEval = typename FlashFluidState::ValueType;
+        using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
 
         constexpr int oil = static_cast<int>(oilPhaseIdx);
         constexpr int gas = static_cast<int>(gasPhaseIdx);
@@ -536,7 +561,6 @@ protected:
             feed_state.setMoleFraction(gas, compIdx, z[compIdx]);
         }
         // One cache holds both phases, which share the pure-component parameters.
-        ParamCache feed_cache(eos_type);
         feed_cache.updatePhase(feed_state, oil);
         feed_cache.updatePhase(feed_state, gas);
 
@@ -545,12 +569,11 @@ protected:
         const Scalar liquid_volume = Opm::getValue(feed_cache.molarVolume(oil));
         const Scalar vapour_volume = Opm::getValue(feed_cache.molarVolume(gas));
         if (!(liquid_volume < (1.0 - 1e-6) * vapour_volume)) {
+            CubicEOS::computeFugacityCoefficients(feed_state, feed_cache, oil, stable_coefficients);
             return {oil, false, vapour_volume};
         }
 
-        const auto sum_z_ln_phi = [&](const ParamCache& cache, const int phase_idx) {
-            std::array<FlashEval, numComponents> phis;
-            CubicEOS::computeFugacityCoefficients(feed_state, cache, phase_idx, phis);
+        const auto sum_z_ln_phi = [&](const std::array<FlashEval, numComponents>& phis) {
             Scalar sum = 0.0;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 if (!(Opm::getValue(z[compIdx]) > 0.)) {
@@ -561,7 +584,14 @@ protected:
             }
             return sum;
         };
-        const bool vapour_is_stable = sum_z_ln_phi(feed_cache, gas) < sum_z_ln_phi(feed_cache, oil);
+        std::array<FlashEval, numComponents> liquid_coefficients;
+        CubicEOS::computeFugacityCoefficients(feed_state, feed_cache, gas, stable_coefficients);
+        CubicEOS::computeFugacityCoefficients(feed_state, feed_cache, oil, liquid_coefficients);
+        const bool vapour_is_stable
+            = sum_z_ln_phi(stable_coefficients) < sum_z_ln_phi(liquid_coefficients);
+        if (!vapour_is_stable) {
+            stable_coefficients = liquid_coefficients;
+        }
         return {vapour_is_stable ? gas : oil, true, vapour_is_stable ? vapour_volume : liquid_volume};
     }
 
@@ -859,9 +889,10 @@ protected:
      * \param z The mixture composition.
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
+     * \return The stable cubic root of the feed, which labels a stable one.
      */
     template <class FlashFluidState, class ComponentVector>
-    static void phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
+    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
     {
         OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
@@ -870,8 +901,15 @@ protected:
         ComponentVector vapour_trial_k = K;
         ComponentVector liquid_trial_k = K;
 
-        // Both trials are measured against the feed on its stable root.
-        const int reference_phase_idx = feedStableRoot_(fluid_state, z, eos_type).phase_idx;
+        // Both trials are measured against the feed on its stable root,
+        // evaluated once. One parameter cache serves the feed and both
+        // trials: temperature and pressure are fixed.
+        using ParamCache =
+            typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        ParamCache param_cache(eos_type);
+        std::array<typename FlashFluidState::ValueType, numComponents> reference_coefficients;
+        const FeedRoot feed_root = feedStableRoot_(fluid_state, z, param_cache, reference_coefficients);
+        const int reference_phase_idx = feed_root.phase_idx;
 
         // Grow a vapour-like trial phase.
         if (verbosity == 3 || verbosity == 4) {
@@ -885,7 +923,8 @@ protected:
                         z,
                         /*is_vapour_trial=*/true,
                         reference_phase_idx,
-                        eos_type,
+                        reference_coefficients,
+                        param_cache,
                         verbosity);
         const bool vapour_trial_finds_no_instability
             = (vapour_trial_sum < (1.0 + stabilityTolerance)) || vapour_trial_is_trivial;
@@ -902,7 +941,8 @@ protected:
                         z,
                         /*is_vapour_trial=*/false,
                         reference_phase_idx,
-                        eos_type,
+                        reference_coefficients,
+                        param_cache,
                         verbosity);
         const bool liquid_trial_finds_no_instability
             = (liquid_trial_sum < (1.0 + stabilityTolerance)) || liquid_trial_is_trivial;
@@ -952,6 +992,7 @@ protected:
                 }
             }
         }
+        return feed_root;
     }
 
     template <class ComponentVector>
@@ -1036,6 +1077,41 @@ protected:
         using FlashEval = typename FlashFluidState::ValueType;
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
+        FlashFluidState reference_state = fluid_state;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
+        }
+        ParamCache param_cache(eos_type);
+        param_cache.updatePhase(reference_state, reference_phase_idx);
+        std::array<FlashEval, numComponents> reference_coefficients;
+        CubicEOS::computeFugacityCoefficients(
+            reference_state, param_cache, reference_phase_idx, reference_coefficients);
+        checkStability_(fluid_state, isTrivial, K, trial_composition, trial_sum, z,
+                        is_vapour_trial, reference_phase_idx, reference_coefficients,
+                        param_cache, verbosity);
+    }
+
+    /*!
+     * \brief checkStability_() with the fugacity coefficients of the feed on
+     *        its stable root given, and a parameter cache at the temperature
+     *        and pressure of the flash, which the trial updates.
+     */
+    template <class FlashFluidState, class ComponentVector, class ParamCache>
+    static void checkStability_(const FlashFluidState& fluid_state,
+                                bool& isTrivial,
+                                ComponentVector& K,
+                                ComponentVector& trial_composition,
+                                typename FlashFluidState::ValueType& trial_sum,
+                                const ComponentVector& z,
+                                bool is_vapour_trial,
+                                const int reference_phase_idx,
+                                const std::array<typename FlashFluidState::ValueType, numComponents>&
+                                    reference_coefficients,
+                                ParamCache& trial_param_cache,
+                                int verbosity)
+    {
+        using FlashEval = typename FlashFluidState::ValueType;
+        using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
 
         // The trial composition is evaluated on its candidate phase root. The
         // feed composition supplies the reference fugacities on its stable
@@ -1058,28 +1134,11 @@ protected:
             OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", "Iteration", "K-Norm", "R-Norm"));
         }
 
-        // The parameter cache lives across the iterations: temperature and
-        // pressure are fixed, so it computes the pure-component parameters once.
-        ParamCache trial_param_cache(eos_type);
-
-        // The reference phase is the feed on its stable root throughout: its
-        // fugacity coefficients are evaluated once, not in every iteration.
-        // They are stored in the reference state, so the cache is free for
-        // the trial phase afterwards.
-        {
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
-            }
-            trial_param_cache.updatePhase(reference_state, reference_phase_idx);
-            std::array<FlashEval, numComponents> reference_fugacity_coefficients;
-            CubicEOS::computeFugacityCoefficients(reference_state,
-                                                  trial_param_cache,
-                                                  reference_phase_idx,
-                                                  reference_fugacity_coefficients);
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                reference_state.setFugacityCoefficient(
-                    reference_phase_idx, compIdx, reference_fugacity_coefficients[compIdx]);
-            }
+        // The reference phase is the feed on its stable root throughout.
+        for (int compIdx=0; compIdx<numComponents; ++compIdx){
+            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
+            reference_state.setFugacityCoefficient(
+                reference_phase_idx, compIdx, reference_coefficients[compIdx]);
         }
         // The last three plain steps in ln K, newest first, and the plain
         // point to return to when an extrapolation does not lower tm.
