@@ -494,8 +494,8 @@ namespace Opm {
 
             const auto fugCoeff =
                 CubicEOS::computeFugacityCoefficient(fluidState, paramCache, phaseIdx, compIdx);
-            const auto translation =
-                exp(-volumeShift(compIdx) * paramCache.Bi(phaseIdx, compIdx));
+            // exp(-s_c B_c), computed with B_c by the parameter cache.
+            const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
 
             return decay<LhsEval>(fugCoeff * translation);
         }
