@@ -150,7 +150,9 @@ public:
         Evaluation Vm = 0;
         Valgrind::SetUndefined(Vm);
         Evaluation Z[3] = {0.0, 0.0, 0.0};
-        int numSol = cubicRoots(Z, a1, a2, a3, a4);
+        // Only the root of the phase is used: the largest for the vapour,
+        // the smallest for the liquid.
+        int numSol = cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
 
         // pick correct root
         const Evaluation RT_p = R * T / p;
