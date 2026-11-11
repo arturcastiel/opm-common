@@ -1108,7 +1108,7 @@ protected:
             // collapse the split. The feed is then the other phase. The trial
             // is the vapour if it is richer than the feed in the components
             // with the larger starting ratios, else the liquid.
-            if (trivialSolutionMeasure_(K) < trivialSolutionTolerance) {
+            if (isTrivialSolution_(K)) {
                 const auto& trial_composition = vapour_trial_sum > liquid_trial_sum
                     ? vapour_trial_composition : liquid_trial_composition;
                 Scalar lightness = 0.;
@@ -1144,6 +1144,29 @@ protected:
             measure += log_ratio * log_ratio;
         }
         return measure;
+    }
+
+    /*!
+     * \brief Whether trivialSolutionMeasure_() is below
+     *        trivialSolutionTolerance.
+     *
+     * A single ratio outside [0.99, 1.01] puts the measure above
+     * \f$\ln^2 1.01 > 9.9 \cdot 10^{-5}\f$, and so above the tolerance; the
+     * logarithms are taken only where all ratios are inside. The answer is
+     * that of the measure.
+     */
+    template <class ComponentVector>
+    static bool isTrivialSolution_(const ComponentVector& equilibrium_ratios)
+    {
+        static_assert(trivialSolutionTolerance < 9.9e-5,
+                      "the band [0.99, 1.01] must lie inside the trivial-solution tolerance");
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const Scalar equilibrium_ratio = Opm::getValue(equilibrium_ratios[compIdx]);
+            if (!(equilibrium_ratio >= 0.99 && equilibrium_ratio <= 1.01)) {
+                return false;
+            }
+        }
+        return trivialSolutionMeasure_(equilibrium_ratios) < trivialSolutionTolerance;
     }
 
     /*!
@@ -1360,16 +1383,15 @@ protected:
                 const auto substitution_error = Opm::getValue(substitution_factor[compIdx]) - 1.0;
                 substitution_residual += substitution_error * substitution_error;
             }
-            const Scalar trivial_residual = trivialSolutionMeasure_(K);
 
             // Print iteration info
             if (verbosity >= 3) {
-                OpmLog::debug(fmt::format(
-                    "{:>10}{:>16}{:>16}", iteration, trivial_residual, substitution_residual));
+                OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", iteration,
+                                          trivialSolutionMeasure_(K), substitution_residual));
             }
 
             // Check convergence
-            isTrivial = (trivial_residual < trivialSolutionTolerance);
+            isTrivial = isTrivialSolution_(K);
             if (isTrivial || substitution_residual < substitutionTolerance) {
                 return;
             }
@@ -1591,8 +1613,7 @@ protected:
             ++active_components;
             equilibrium_ratios[compIdx] = vapour_mole_fraction / liquid_mole_fraction;
         }
-        return active_components >= 2
-            && trivialSolutionMeasure_(equilibrium_ratios) < trivialSolutionTolerance;
+        return active_components >= 2 && isTrivialSolution_(equilibrium_ratios);
     }
 
     //! Whether the fluid system gives, with the fugacity coefficients of a
