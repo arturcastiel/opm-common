@@ -297,11 +297,23 @@ protected:
         }
         // Update the composition if cell is two-phase
         if (!is_single_phase) {
+            // Only the first split of a warm start skips the stability test.
+            bool is_warm_split = !is_cold_start;
             const auto try_solve_split = [&](const auto& on_failure) {
                 newton_jacobian.reset();
                 try {
                     OPM_FLASH_COUNT(rachfordRiceSolves);
                     L_scalar = RachfordRice::solve(K_scalar, z_scalar, L_scalar, verbosity);
+                    // Stored ratios whose split lies outside (0, 1) predict a
+                    // single phase from an earlier state. Substitution from
+                    // them can settle on a negative-flash fixed point of the
+                    // new state that is not its answer, so only the stability
+                    // test decides.
+                    if (is_warm_split && !(L_scalar > 0. && L_scalar < 1.)) {
+                        OPM_THROW_NOLOG(NumericalProblem,
+                                        fmt::format("The stored equilibrium ratios imply no "
+                                                    "split (L = {})", L_scalar));
+                    }
                     newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
                                                 fluid_state, flash_tolerance, eos_type, verbosity);
                     return true;
@@ -365,6 +377,7 @@ protected:
                     is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
                 if (!is_single_phase) {
                     OPM_FLASH_COUNT(splitRetries);
+                    is_warm_split = false;
                     // Stability found a distinct trial phase and returned a
                     // fresh K estimate. Retry the split once from that state.
                     try_solve_split([](const auto& error) {
