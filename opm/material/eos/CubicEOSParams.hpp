@@ -79,7 +79,7 @@ public:
         Valgrind::CheckDefined(temperature);
         Valgrind::CheckDefined(pressure);
 
-        if (pureUpToDate_ && temperature == pureTemperature_ && pressure == purePressure_) {
+        if (pureIsCurrent(temperature, pressure)) {
             return;
         }
         pureUpToDate_ = false;
@@ -130,6 +130,15 @@ public:
         pureTemperature_ = temperature;
         purePressure_ = pressure;
         pureUpToDate_ = true;
+    }
+
+    /*!
+     * \brief Whether the pure-component parameters are those of this
+     *        temperature and pressure.
+     */
+    bool pureIsCurrent(const Scalar& temperature, const Scalar& pressure) const
+    {
+        return pureUpToDate_ && temperature == pureTemperature_ && pressure == purePressure_;
     }
 
     /*!
