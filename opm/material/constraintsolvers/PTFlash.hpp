@@ -29,6 +29,7 @@
 #ifndef OPM_CHI_FLASH_HPP
 #define OPM_CHI_FLASH_HPP
 
+#include <opm/material/constraintsolvers/FlashStatistics.hpp>
 #include <opm/material/constraintsolvers/PTFlashMethod.hpp>
 #include <opm/material/constraintsolvers/RachfordRice.hpp>
 #include <opm/material/fluidmatrixinteractions/NullMaterial.hpp>
@@ -274,6 +275,7 @@ protected:
             const auto try_solve_split = [&](const auto& on_failure) {
                 newton_jacobian.reset();
                 try {
+                    OPM_FLASH_COUNT(rachfordRiceSolves);
                     L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
                     newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
                                                 fluid_state, flash_tolerance, eos_type, verbosity);
@@ -337,6 +339,7 @@ protected:
                 phaseStabilityTest_(
                     is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
                 if (!is_single_phase) {
+                    OPM_FLASH_COUNT(splitRetries);
                     // Stability found a distinct trial phase and returned a
                     // fresh K estimate. Retry the split once from that state.
                     try_solve_split([](const auto& error) {
@@ -554,6 +557,7 @@ protected:
     template <class FlashFluidState, class ComponentVector>
     static void phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
     {
+        OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
         ComponentVector liquid_trial_composition, vapour_trial_composition;
         typename FlashFluidState::ValueType liquid_trial_sum, vapour_trial_sum;
@@ -705,6 +709,7 @@ protected:
         // of the tangent-plane-distance function.
         constexpr int max_iterations = 20000;
         for (int iteration = 0; iteration < max_iterations; ++iteration) {
+            OPM_FLASH_COUNT(stabilityIterations);
             // Mole numbers of the trial phase, then its normalised composition.
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 trial_composition[compIdx]
@@ -1105,6 +1110,7 @@ protected:
         unsigned iteration = 0;
         constexpr unsigned max_iterations = 1000;
         while (iteration < max_iterations) {
+            OPM_FLASH_COUNT(newtonIterations);
             assembleNewton_<CompositionalFluidState<NewtonEval, FluidSystem>,
                             ComponentVector,
                             num_unknowns,
@@ -1766,6 +1772,7 @@ protected:
         FieldType plain_L = L;
         FieldType gibbs_before = 0.;
         for (int iteration = 0; iteration < max_iterations; ++iteration) {
+            OPM_FLASH_COUNT(ssiIterations);
             // Compute (normalized) liquid and vapor mole fractions
             computeLiquidVapor_(fluid_state, L, K, z);
 

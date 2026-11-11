@@ -31,6 +31,7 @@
 #define OPM_PTFlash_PARAMETER_CACHE_HPP
 
 #include <opm/common/Exceptions.hpp>
+#include <opm/material/constraintsolvers/FlashStatistics.hpp>
 
 #include <opm/material/common/Valgrind.hpp>
 #include <opm/material/fluidsystems/ParameterCacheBase.hpp>
@@ -114,6 +115,7 @@ public:
         if (waterEnabled && phaseIdx == static_cast<unsigned int>(waterPhaseIdx)) {
             return;
         }
+        OPM_FLASH_COUNT(eosUpdates);
 
         assert ((phaseIdx == static_cast<unsigned int>(oilPhaseIdx)) ||
                 (phaseIdx == static_cast<unsigned int>(gasPhaseIdx)));

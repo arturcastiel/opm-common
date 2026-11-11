@@ -1404,6 +1404,7 @@ list(APPEND PUBLIC_HEADER_FILES
   opm/material/constraintsolvers/MiscibleMultiPhaseComposition.hpp
   opm/material/constraintsolvers/MixtureEnthalpy.hpp
   opm/material/constraintsolvers/NcpFlash.hpp
+  opm/material/constraintsolvers/FlashStatistics.hpp
   opm/material/constraintsolvers/PHFlash.hpp
   opm/material/constraintsolvers/PTFlash.hpp
   opm/material/constraintsolvers/PTFlashMethod.hpp

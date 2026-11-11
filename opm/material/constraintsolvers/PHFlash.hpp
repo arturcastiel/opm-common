@@ -382,6 +382,7 @@ private:
         using Flash = PTFlash<Scalar, FluidSystem, true>;
         using ValueType = typename FluidState::ValueType;
 
+        OPM_FLASH_COUNT(phEvaluations);
         fluidState.setTemperature(ValueType(T));
 
         bool solved = false;
