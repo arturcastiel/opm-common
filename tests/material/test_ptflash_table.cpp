@@ -232,3 +232,19 @@ BOOST_AUTO_TEST_CASE(ApproximateTableStaysClose)
     BOOST_CHECK_GT(maxDifference, 0.0);
     Settings::get().interpolation = Settings::Interpolation::Automatic;
 }
+
+BOOST_AUTO_TEST_CASE(AcceptanceTestBoundsTheApproximateAnswers)
+{
+    // A tight acceptance converges every two-phase answer the table cannot
+    // give to that accuracy; single-phase cells still answer from the table.
+    makeFluid(0.0411);
+    Settings::get().interpolation = Settings::Interpolation::Multilinear;
+    Settings::get().acceptance = 1e-6;
+    Table::get().reset();
+    const auto expected = flashAll(Opm::PTFlashTableMode::Off);
+    flashAll(Opm::PTFlashTableMode::Approximate);
+    const auto guarded = flashAll(Opm::PTFlashTableMode::Approximate);
+    checkSame(expected, guarded);
+    Settings::get().acceptance = 0.0;
+    Settings::get().interpolation = Settings::Interpolation::Automatic;
+}

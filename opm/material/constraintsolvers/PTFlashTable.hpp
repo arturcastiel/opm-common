@@ -83,6 +83,9 @@ struct PTFlashTableSettings
     double temperatureMin = 250.0; //!< [K], the 1/T axis
     double temperatureMax = 700.0;
     bool printStatistics = false; //!< table sizes on stderr when a table is cleared
+    //! Approximate mode: the largest |ln(f_L / f_V)| a two-phase answer may
+    //! have; above it the split is converged from there. Zero: no test.
+    double acceptance = 0.0;
     //! Interpolate on the d + 1 vertices of the Kuhn simplex of a state
     //! instead of the 2^d vertices of its cell; by default from d = 5
     //! (four components) on, where a cell has 32 or more vertices.
@@ -90,7 +93,8 @@ struct PTFlashTableSettings
     Interpolation interpolation = Interpolation::Automatic;
 
     //! OPM_FLASH_OBL = off | exact | approx, OPM_FLASH_OBL_N = intervals,
-    //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_STATS = 1.
+    //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_ACCEPT =
+    //! acceptance, OPM_FLASH_OBL_STATS = 1.
     static PTFlashTableSettings& get()
     {
         static PTFlashTableSettings settings = fromEnvironment();
@@ -123,6 +127,9 @@ struct PTFlashTableSettings
             else if (value == "multilinear") {
                 settings.interpolation = Interpolation::Multilinear;
             }
+        }
+        if (const char* acceptance = std::getenv("OPM_FLASH_OBL_ACCEPT")) {
+            settings.acceptance = std::atof(acceptance);
         }
         if (const char* stats = std::getenv("OPM_FLASH_OBL_STATS")) {
             settings.printStatistics = std::string(stats) == "1";
