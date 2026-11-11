@@ -76,7 +76,8 @@ enum class PTFlashTableMode {
 //! The table settings, read once from the environment.
 struct PTFlashTableSettings
 {
-    PTFlashTableMode mode = PTFlashTableMode::Exact;
+    //! Off unless asked for: OPM_FLASH_OBL, or set here before the first flash.
+    PTFlashTableMode mode = PTFlashTableMode::Off;
     int intervals = 32; //!< intervals per axis over the nominal ranges below
     double pressureMin = 1e5; //!< [Pa], the ln p axis
     double pressureMax = 500e5;
