@@ -31,6 +31,7 @@
 
 #include <opm/material/constraintsolvers/FlashStatistics.hpp>
 #include <opm/material/constraintsolvers/PTFlashMethod.hpp>
+#include <opm/material/constraintsolvers/PTFlashTable.hpp>
 #include <opm/material/constraintsolvers/RachfordRice.hpp>
 #include <opm/material/fluidmatrixinteractions/NullMaterial.hpp>
 #include <opm/material/fluidmatrixinteractions/MaterialTraits.hpp>
@@ -317,6 +318,17 @@ protected:
                                           const EOSType& eos_type,
                                           const int verbosity)
     {
+        if constexpr (std::is_same_v<typename FluidState::ValueType, Scalar>) {
+            // Plain Newton has no globalisation for a start that is not the
+            // stability test's, so it keeps the flash without the table.
+            if (PTFlashTableSettings::get().mode != PTFlashTableMode::Off
+                && twoPhaseMethod != PTFlashMethod::Newton && !FlashTable::get().building()) {
+                if (auto result = flashFromTable_(fluid_state, twoPhaseMethod, flash_tolerance,
+                                                  eos_type, verbosity)) {
+                    return *result;
+                }
+            }
+        }
         std::optional<NewtonJacobian> newton_jacobian;
         // The stable feed root of the last stability test.
         std::optional<FeedRoot> stable_feed_root;
@@ -497,6 +509,119 @@ protected:
         }
         fluid_state.setLvalue(L_scalar);
         return {is_single_phase, newton_jacobian};
+    }
+
+    using FlashTable = PTFlashTable<Scalar, FluidSystem>;
+
+    /*!
+     * \brief The flash through the table of PTFlashTable.hpp, or nothing when
+     *        the flash without the table has to answer.
+     *
+     * In an all-two-phase cell the split starts from the interpolated K
+     * without a stability test, and is kept only if it converges to a
+     * distinct split with 0 < L < 1; otherwise the state is restored.
+     */
+    template <typename FluidState>
+    static std::optional<ScalarFlashResult> flashFromTable_(FluidState& fluid_state,
+                                                            PTFlashMethod twoPhaseMethod,
+                                                            const Scalar flash_tolerance,
+                                                            const EOSType& eos_type,
+                                                            const int verbosity)
+    {
+        using ScalarVector = Dune::FieldVector<Scalar, numComponents>;
+        using TablePhase = typename FlashTable::Phase;
+        auto& table = FlashTable::get();
+        ScalarVector z_scalar;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z_scalar[compIdx] = fluid_state.moleFraction(compIdx);
+        }
+        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type),
+                                              static_cast<int>(twoPhaseMethod), flash_tolerance),
+                      z_scalar);
+        typename FlashTable::Location location;
+        if (!table.locate(fluid_state.pressure(oilPhaseIdx), fluid_state.temperature(0), z_scalar,
+                          location)) {
+            return std::nullopt;
+        }
+        const auto vertex_flash = [&](Scalar p, Scalar T, const auto& z) {
+            return vertexFlash_(p, T, z, twoPhaseMethod, flash_tolerance, eos_type);
+        };
+        const auto useful = [](TablePhase phase) {
+            return phase == TablePhase::TwoPhase;
+        };
+        std::array<Scalar, numComponents> ln_K;
+        const TablePhase phase = table.evaluate(location, vertex_flash, useful, ln_K);
+
+        if (phase == TablePhase::TwoPhase) {
+            ScalarVector K_scalar;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                K_scalar[compIdx] = std::exp(ln_K[compIdx]);
+            }
+            OPM_FLASH_COUNT(cacheHits);
+            const FluidState input_state = fluid_state;
+            try {
+                OPM_FLASH_COUNT(rachfordRiceSolves);
+                Scalar L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
+                auto newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
+                                                 fluid_state, flash_tolerance, eos_type, verbosity);
+                if (L_scalar > 0. && L_scalar < 1. && !phasesCoincide_(fluid_state)) {
+                    fluid_state.setLvalue(L_scalar);
+                    return ScalarFlashResult{false, newton_jacobian};
+                }
+            }
+            catch (const NumericalProblem&) {
+            }
+            catch (const Dune::FMatrixError&) {
+            }
+            OPM_FLASH_COUNT(splitRetries);
+            fluid_state = input_state;
+        }
+        return std::nullopt;
+    }
+
+    //! A table vertex: the flash without the table from Wilson K at (p, T, z).
+    template <class Composition>
+    static typename FlashTable::Vertex vertexFlash_(Scalar p, Scalar T, const Composition& z,
+                                                    PTFlashMethod twoPhaseMethod,
+                                                    const Scalar flash_tolerance,
+                                                    const EOSType& eos_type)
+    {
+        using TablePhase = typename FlashTable::Phase;
+        CompositionalFluidState<Scalar, FluidSystem> state;
+        state.setPressure(oilPhaseIdx, p);
+        state.setPressure(gasPhaseIdx, p);
+        state.setTemperature(T);
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            state.setMoleFraction(compIdx, z[compIdx]);
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            state.setKvalue(compIdx, state.wilsonK_(compIdx));
+        }
+        state.setLvalue(-1.0);
+        typename FlashTable::Vertex vertex;
+        try {
+            const bool single_phase
+                = flashScalar_(state, twoPhaseMethod, flash_tolerance, eos_type, 0).single_phase;
+            vertex.L = state.L();
+            if (single_phase) {
+                vertex.phase = vertex.L >= 0.5 ? TablePhase::Liquid : TablePhase::Vapour;
+                return vertex;
+            }
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar x = state.moleFraction(oilPhaseIdx, compIdx);
+                const Scalar y = state.moleFraction(gasPhaseIdx, compIdx);
+                if (!(x > 0.) || !(y > 0.)) {
+                    return vertex;
+                }
+                vertex.lnK[compIdx] = std::log(y / x);
+            }
+            vertex.phase = TablePhase::TwoPhase;
+        }
+        catch (const std::runtime_error&) {
+        }
+        catch (const Dune::FMatrixError&) {
+        }
+        return vertex;
     }
 
     //! The stable cubic root of a feed, see feedStableRoot_().
