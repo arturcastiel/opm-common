@@ -43,6 +43,8 @@
  * - Exact: in an all-two-phase cell the interpolated K start the split and
  *   the stability test is skipped; a split that does not converge to a
  *   distinct interior split is redone by the flash without the table.
+ * - Skip: as Exact, and in a cell whose vertices are all single-phase with
+ *   one label the answer is that phase, without a stability test.
  * - Approximate: in an all-two-phase cell the answer is Rachford-Rice on the
  *   interpolated K; in a cell whose vertices are all single-phase with one
  *   label the answer is that phase; elsewhere the flash without the table.
@@ -82,13 +84,38 @@ namespace Opm {
 enum class PTFlashTableMode {
     Off,         //!< every flash is solved without the table
     Exact,       //!< all-two-phase cells give the start of the split
+    Skip,        //!< Exact, and all-single-phase cells answer single-phase
     Approximate, //!< cells with one phase state give the answer
 };
 
-//! The table settings, read once from the environment.
+/*!
+ * \brief The optional speed-ups of PTFlash and PHFlash, read once per
+ *        process.
+ *
+ * Everything is off by default: the flash is then the flash without these
+ * options. get() reads the environment at its first call; a program can
+ * also set the fields of get() before its first flash. Nothing here is read
+ * again in the flash itself.
+ *
+ * | variable | values | default | what it does |
+ * |---|---|---|---|
+ * | OPM_FLASH_OBL | off, exact, skip, approx | off | the table of PTFlashTable, see PTFlashTableMode |
+ * | OPM_FLASH_OBL_N | intervals per axis | 32 | the table's resolution |
+ * | OPM_FLASH_OBL_NEGATIVE | 0, 1 | 1 | boundary cells from negative-flash vertices |
+ * | OPM_FLASH_OBL_MARGIN | ln K error | 0.05 | margin of a single-phase verdict in a boundary cell |
+ * | OPM_FLASH_OBL_PH | never, cold, always | cold | P-H search starts from the table's enthalpy |
+ * | OPM_FLASH_OBL_ACCEPT | tolerance | 0 | approx: largest |ln(f_L/f_V)| of an interpolated split |
+ * | OPM_FLASH_OBL_INTERP | multilinear, simplex | by size | interpolation; simplex from four components |
+ * | OPM_FLASH_OBL_STATS | 0, 1 | 0 | table size and use on stderr |
+ * | OPM_FLASH_BYPASS | 0, 1 | 0 | stability bypass of PTFlash::stabilityBypass_() |
+ *
+ * Recommended: OPM_FLASH_OBL=skip OPM_FLASH_BYPASS=1. The sub-options of
+ * the table act only when OPM_FLASH_OBL is not off. Skip and approx are
+ * approximate in principle (a single-phase answer without a stability
+ * test); exact changes only where splits start.
+ */
 struct PTFlashTableSettings
 {
-    //! Off unless asked for: OPM_FLASH_OBL, or set here before the first flash.
     PTFlashTableMode mode = PTFlashTableMode::Off;
     int intervals = 32; //!< intervals per axis over the nominal ranges below
     double pressureMin = 1e5; //!< [Pa], the ln p axis
@@ -98,7 +125,7 @@ struct PTFlashTableSettings
     bool printStatistics = false; //!< table sizes on stderr when a table is cleared
     //! Boundary cells: single-phase vertices next to two-phase ones also
     //! store a negative flash, see PTFlashTable.
-    bool negativeFlash = false;
+    bool negativeFlash = true;
     //! Boundary cells: a state whose interpolated split stays outside
     //! [0, 1] when every ln K is off by this much is single-phase without a
     //! stability test (not in the exact mode).
@@ -107,7 +134,7 @@ struct PTFlashTableSettings
     //! the table's vertices matches: Never, Cold (a state without a phase
     //! state from an earlier flash, L outside [0, 1]) or Always.
     enum class EnthalpyStart { Never, Cold, Always };
-    EnthalpyStart enthalpyStart = EnthalpyStart::Never;
+    EnthalpyStart enthalpyStart = EnthalpyStart::Cold;
     //! Approximate mode: the largest |ln(f_L / f_V)| a two-phase answer may
     //! have; above it the split is converged from there. Zero: no test.
     double acceptance = 0.0;
@@ -116,11 +143,11 @@ struct PTFlashTableSettings
     //! (four components) on, where a cell has 32 or more vertices.
     enum class Interpolation { Automatic, Multilinear, Simplex };
     Interpolation interpolation = Interpolation::Automatic;
+    //! PTFlash: a single-phase state near a reference state whose stability
+    //! test was decisive stays single-phase without a test (the critical
+    //! distance of MultiComponentFlash.jl). Not a table option.
+    bool stabilityBypass = false;
 
-    //! OPM_FLASH_OBL = off | exact | approx, OPM_FLASH_OBL_N = intervals,
-    //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_ACCEPT =
-    //! acceptance, OPM_FLASH_OBL_STATS = 1, OPM_FLASH_OBL_NEGATIVE = 1,
-    //! OPM_FLASH_OBL_MARGIN = margin, OPM_FLASH_OBL_PH = cold | always.
     static PTFlashTableSettings& get()
     {
         static PTFlashTableSettings settings = fromEnvironment();
@@ -130,51 +157,48 @@ struct PTFlashTableSettings
     static PTFlashTableSettings fromEnvironment()
     {
         PTFlashTableSettings settings;
-        if (const char* mode = std::getenv("OPM_FLASH_OBL")) {
-            const std::string value(mode);
-            if (value == "off" || value == "0") {
-                settings.mode = PTFlashTableMode::Off;
-            }
-            else if (value == "exact") {
-                settings.mode = PTFlashTableMode::Exact;
-            }
-            else if (value == "approx") {
-                settings.mode = PTFlashTableMode::Approximate;
-            }
+        const auto read = [](const char* name) -> std::string {
+            const char* value = std::getenv(name);
+            return value ? std::string(value) : std::string();
+        };
+        const std::string mode = read("OPM_FLASH_OBL");
+        if (mode == "exact") {
+            settings.mode = PTFlashTableMode::Exact;
         }
-        if (const char* n = std::getenv("OPM_FLASH_OBL_N")) {
-            settings.intervals = std::max(1, std::atoi(n));
+        else if (mode == "skip") {
+            settings.mode = PTFlashTableMode::Skip;
         }
-        if (const char* interpolation = std::getenv("OPM_FLASH_OBL_INTERP")) {
-            const std::string value(interpolation);
-            if (value == "simplex") {
-                settings.interpolation = Interpolation::Simplex;
-            }
-            else if (value == "multilinear") {
-                settings.interpolation = Interpolation::Multilinear;
-            }
+        else if (mode == "approx") {
+            settings.mode = PTFlashTableMode::Approximate;
         }
-        if (const char* acceptance = std::getenv("OPM_FLASH_OBL_ACCEPT")) {
-            settings.acceptance = std::atof(acceptance);
+        if (const std::string n = read("OPM_FLASH_OBL_N"); !n.empty()) {
+            settings.intervals = std::max(1, std::atoi(n.c_str()));
         }
-        if (const char* stats = std::getenv("OPM_FLASH_OBL_STATS")) {
-            settings.printStatistics = std::string(stats) == "1";
+        const std::string interpolation = read("OPM_FLASH_OBL_INTERP");
+        if (interpolation == "simplex") {
+            settings.interpolation = Interpolation::Simplex;
         }
-        if (const char* negative = std::getenv("OPM_FLASH_OBL_NEGATIVE")) {
-            settings.negativeFlash = std::string(negative) == "1";
+        else if (interpolation == "multilinear") {
+            settings.interpolation = Interpolation::Multilinear;
         }
-        if (const char* margin = std::getenv("OPM_FLASH_OBL_MARGIN")) {
-            settings.margin = std::atof(margin);
+        if (const std::string acceptance = read("OPM_FLASH_OBL_ACCEPT"); !acceptance.empty()) {
+            settings.acceptance = std::atof(acceptance.c_str());
         }
-        if (const char* start = std::getenv("OPM_FLASH_OBL_PH")) {
-            const std::string value(start);
-            if (value == "cold") {
-                settings.enthalpyStart = EnthalpyStart::Cold;
-            }
-            else if (value == "always") {
-                settings.enthalpyStart = EnthalpyStart::Always;
-            }
+        settings.printStatistics = read("OPM_FLASH_OBL_STATS") == "1";
+        if (const std::string negative = read("OPM_FLASH_OBL_NEGATIVE"); !negative.empty()) {
+            settings.negativeFlash = negative == "1";
         }
+        if (const std::string margin = read("OPM_FLASH_OBL_MARGIN"); !margin.empty()) {
+            settings.margin = std::atof(margin.c_str());
+        }
+        const std::string start = read("OPM_FLASH_OBL_PH");
+        if (start == "never") {
+            settings.enthalpyStart = EnthalpyStart::Never;
+        }
+        else if (start == "always") {
+            settings.enthalpyStart = EnthalpyStart::Always;
+        }
+        settings.stabilityBypass = read("OPM_FLASH_BYPASS") == "1";
         return settings;
     }
 };

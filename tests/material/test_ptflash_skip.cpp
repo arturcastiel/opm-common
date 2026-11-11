@@ -176,6 +176,8 @@ BOOST_AUTO_TEST_CASE(SinglePhaseColdStartIsTested)
 // with other ratios finds no reference.
 BOOST_AUTO_TEST_CASE(BypassOnlyInsideTheWindowOfItsReference)
 {
+    // The bypass is an option, off by default.
+    Opm::PTFlashTableSettings::get().stabilityBypass = true;
     const Composition z{0.1, 0.89, 0.01};
     const Scalar pressure = 20e5;
     const Scalar temperature = 500.0;
@@ -216,6 +218,7 @@ BOOST_AUTO_TEST_CASE(BypassOnlyInsideTheWindowOfItsReference)
     const auto split_work = flash(two_phase, single);
     BOOST_CHECK(!single);
     BOOST_CHECK_EQUAL(split_work.stabilityTests, 1);
+    Opm::PTFlashTableSettings::get().stabilityBypass = false;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
