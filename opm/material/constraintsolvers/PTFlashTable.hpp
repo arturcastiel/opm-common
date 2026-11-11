@@ -39,7 +39,9 @@
  * thermal/compositional nonlinear flow and transport with buoyancy, SPE J. 23
  * (2018).
  *
- * PTFlash consults the table when PTFlashTableSettings::get().mode is not Off:
+ * PTFlash consults the table when PTFlashTableSettings::get().mode is not Off,
+ * for a flash without a split from an earlier flash (L outside (0, 1); with
+ * PTFlashTableSettings::warmStartFromTable, for every flash):
  * - Exact: in an all-two-phase cell the interpolated K start the split and
  *   the stability test is skipped; a split that does not converge to a
  *   distinct interior split is redone by the flash without the table.
@@ -107,6 +109,7 @@ enum class PTFlashTableMode {
  * | OPM_FLASH_OBL_NEGATIVE | 0, 1 | 1 | boundary cells from negative-flash vertices |
  * | OPM_FLASH_OBL_MARGIN | ln K error | 0.05 | margin of a single-phase verdict in a boundary cell |
  * | OPM_FLASH_OBL_PH | never, cold, always | cold | P-H search starts from the table's enthalpy |
+ * | OPM_FLASH_OBL_WARM | 0, 1 | 0 | a split from an earlier flash also starts from the table |
  * | OPM_FLASH_OBL_ACCEPT | tolerance | 0 | approx: largest |ln(f_L/f_V)| of an interpolated split |
  * | OPM_FLASH_OBL_INTERP | multilinear, simplex | by size | interpolation; simplex from four components |
  * | OPM_FLASH_OBL_STATS | 0, 1 | 0 | table size and use on stderr |
@@ -146,6 +149,11 @@ struct PTFlashTableSettings
     //! (four components) on, where a cell has 32 or more vertices.
     enum class Interpolation { Automatic, Multilinear, Simplex };
     Interpolation interpolation = Interpolation::Automatic;
+    //! A P-T flash with a split from an earlier flash (0 < L < 1) starts
+    //! from its own ratios, which a simulator keeps between Newton
+    //! iterations and are closer than the table's; with this, from the
+    //! table too.
+    bool warmStartFromTable = false;
     //! PTFlash: a single-phase state near a reference state whose stability
     //! test was decisive stays single-phase without a test (the critical
     //! distance of MultiComponentFlash.jl). Not a table option.
@@ -201,6 +209,7 @@ struct PTFlashTableSettings
         else if (start == "always") {
             settings.enthalpyStart = EnthalpyStart::Always;
         }
+        settings.warmStartFromTable = read("OPM_FLASH_OBL_WARM") == "1";
         settings.stabilityBypass = read("OPM_FLASH_BYPASS") == "1";
         return settings;
     }

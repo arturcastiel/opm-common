@@ -436,9 +436,12 @@ protected:
         bool single_phase_from_table = false;
         if constexpr (std::is_same_v<typename FluidState::ValueType, Scalar>) {
             // Plain Newton has no globalisation for a start that is not the
-            // stability test's, so it keeps the flash without the table.
+            // stability test's, so it keeps the flash without the table. A
+            // split from an earlier flash keeps its own ratios unless asked.
             if (settings.mode != PTFlashTableMode::Off
-                && twoPhaseMethod != PTFlashMethod::Newton && !FlashTable::get().building()) {
+                && twoPhaseMethod != PTFlashMethod::Newton && !FlashTable::get().building()
+                && (settings.warmStartFromTable
+                    || !(fluid_state.L() > 0. && fluid_state.L() < 1.))) {
                 if (auto result = flashFromTable_(fluid_state, twoPhaseMethod, flash_tolerance,
                                                   eos_type, verbosity, single_phase_from_table)) {
                     return *result;

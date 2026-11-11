@@ -356,6 +356,62 @@ BOOST_AUTO_TEST_CASE(EnthalpyOfTheVerticesStartsThePHSearch)
     Settings::get().acceptance = 0.0;
 }
 
+BOOST_AUTO_TEST_CASE(SplitsFromAnEarlierFlashKeepTheirRatios)
+{
+    // A flash seeded with the split of an earlier flash (a Newton iteration
+    // of a simulator: 0.1 % higher pressure) starts from its own ratios and
+    // does not ask the table: the flash without the table, bit for bit.
+    // Asked to, it starts from the table, with the same answers.
+    makeFluid(0.0411);
+    Table::get().reset();
+    const auto cold = flashAll(Opm::PTFlashTableMode::Off);
+    const auto warmAll = [&](const Opm::PTFlashTableMode mode, const bool fromTable) {
+        Settings::get().mode = mode;
+        Settings::get().warmStartFromTable = fromTable;
+        std::vector<Answer> answers;
+        for (const auto& answer : cold) {
+            if (answer.singlePhase) {
+                continue;
+            }
+            auto fs = answer.state;
+            const auto p
+                = Evaluation::createVariable(1.001 * Opm::getValue(fs.pressure(oilPhaseIdx)), 0);
+            fs.setPressure(oilPhaseIdx, p);
+            fs.setPressure(gasPhaseIdx, p);
+            const bool single
+                = Flash::solve(fs, Opm::PTFlashMethod::SsiNewton, flashTolerance, eosType);
+            answers.push_back({single, fs});
+        }
+        Settings::get().mode = Opm::PTFlashTableMode::Off;
+        Settings::get().warmStartFromTable = false;
+        return answers;
+    };
+    const auto queries = [] {
+        using Outcome = Table::Outcome;
+        long sum = 0;
+        for (int o = 0; o < static_cast<int>(Outcome::Count); ++o) {
+            sum += Table::get().count(static_cast<Outcome>(o));
+        }
+        return sum;
+    };
+    const auto expected = warmAll(Opm::PTFlashTableMode::Off, false);
+    BOOST_REQUIRE_GT(expected.size(), 50u);
+
+    Table::get().reset();
+    const long before = queries();
+    const auto own = warmAll(Opm::PTFlashTableMode::Skip, false);
+    BOOST_CHECK_EQUAL(queries(), before);
+    BOOST_REQUIRE_EQUAL(expected.size(), own.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        BOOST_CHECK_EQUAL(expected[i].singlePhase, own[i].singlePhase);
+        BOOST_CHECK_EQUAL(Opm::getValue(expected[i].state.L()), Opm::getValue(own[i].state.L()));
+    }
+
+    const auto fromTable = warmAll(Opm::PTFlashTableMode::Skip, true);
+    BOOST_CHECK_GT(queries(), 0);
+    checkSame(expected, fromTable);
+}
+
 BOOST_AUTO_TEST_CASE(OptionsAreOffByDefault)
 {
     // Without the environment every option is off, so the flash is the
@@ -365,4 +421,5 @@ BOOST_AUTO_TEST_CASE(OptionsAreOffByDefault)
     BOOST_CHECK(!defaults.stabilityBypass);
     BOOST_CHECK(defaults.negativeFlash);
     BOOST_CHECK(defaults.enthalpyStart == Settings::EnthalpyStart::Cold);
+    BOOST_CHECK(!defaults.warmStartFromTable);
 }
