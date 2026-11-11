@@ -132,6 +132,32 @@ public:
         pureUpToDate_ = true;
     }
 
+    /*!
+     * \brief Takes the pure-component parameters of another phase when that
+     *        phase holds them for this temperature, pressure and equation of
+     *        state; they do not depend on the phase.
+     *
+     * \return Whether they were taken.
+     */
+    template <unsigned otherPhaseIdx>
+    bool takePure(const CubicEOSParams<Scalar, FluidSystem, otherPhaseIdx>& other,
+                  const Scalar& temperature,
+                  const Scalar& pressure)
+    {
+        if (!other.pureUpToDate_ || other.EosType_ != EosType_
+            || !(temperature == other.pureTemperature_) || !(pressure == other.purePressure_)) {
+            return false;
+        }
+        Ai_ = other.Ai_;
+        Bi_ = other.Bi_;
+        aCache_ = other.aCache_;
+        translation_ = other.translation_;
+        pureTemperature_ = other.pureTemperature_;
+        purePressure_ = other.purePressure_;
+        pureUpToDate_ = true;
+        return true;
+    }
+
     template <class FluidState>
     void updateMix(const FluidState& fs)
     {
@@ -287,12 +313,14 @@ protected:
 private:
     void updateACache_()
     {
+        // A_ij is symmetric, since A_i A_j = A_j A_i in floating point too.
         for (unsigned compIIdx = 0; compIIdx < numComponents; ++ compIIdx) {
-            for (unsigned compJIdx = 0; compJIdx < numComponents; ++ compJIdx) {
+            for (unsigned compJIdx = compIIdx; compJIdx < numComponents; ++ compJIdx) {
                 // interaction coefficient as given in SPE5
                 Scalar Psi = FluidSystem::interactionCoefficient(compIIdx, compJIdx);
 
                 aCache_[compIIdx][compJIdx] = sqrt(Ai(compIIdx) * Ai(compJIdx)) * (1 - Psi);
+                aCache_[compJIdx][compIIdx] = aCache_[compIIdx][compJIdx];
             }
         }
     }
@@ -344,6 +372,8 @@ private:
         }
     }
 
+    template <class, class, unsigned>
+    friend class CubicEOSParams;
 };  // class CubicEOSParams
 
 }  // namespace Opm

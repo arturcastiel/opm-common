@@ -172,6 +172,22 @@ void checkPureParametersKept()
                 }
             }
         }
+        // The other phase takes them only at the same (T, p) and equation.
+        Opm::CubicEOSParams<Value, FluidSystem, FluidSystem::gasPhaseIdx> gas;
+        gas.setEOSType(eos);
+        Value lastPressure = 2e7;
+        if constexpr (std::is_same_v<Value, Eval>) {
+            lastPressure = Eval::createVariable(2e7, 0);
+        }
+        BOOST_CHECK(!gas.takePure(reused, Value(420.0), Value(8e6)));
+        BOOST_CHECK(gas.takePure(reused, Value(420.0), lastPressure));
+        for (unsigned i = 0; i < numComponents; ++i) {
+            BOOST_CHECK(sameBits(gas.Ai(i), reused.Ai(i)));
+            BOOST_CHECK(sameBits(gas.volumeTranslationFactor(i), reused.volumeTranslationFactor(i)));
+            for (unsigned j = 0; j < numComponents; ++j) {
+                BOOST_CHECK(sameBits(gas.aCache(i, j), reused.aCache(i, j)));
+            }
+        }
         // A change of the equation of state recomputes at the same (T, p).
         const auto other = eos == EOSType::PR ? EOSType::SRK : EOSType::PR;
         reused.setEOSType(other);

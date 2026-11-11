@@ -348,10 +348,19 @@ protected:
         Scalar T = decay<Scalar>(fluidState.temperature(phaseIdx));
         Scalar p = decay<Scalar>(fluidState.pressure(phaseIdx));
 
+        // The other phase may hold them already.
         switch (phaseIdx)
         {
-        case oilPhaseIdx: oilPhaseParams_.updatePure(T, p); break;
-        case gasPhaseIdx: gasPhaseParams_.updatePure(T, p); break;
+        case oilPhaseIdx:
+            if (!oilPhaseParams_.takePure(gasPhaseParams_, T, p)) {
+                oilPhaseParams_.updatePure(T, p);
+            }
+            break;
+        case gasPhaseIdx:
+            if (!gasPhaseParams_.takePure(oilPhaseParams_, T, p)) {
+                gasPhaseParams_.updatePure(T, p);
+            }
+            break;
         }
     }
 
@@ -430,6 +439,10 @@ protected:
             const Scalar RT_p = Constants<Scalar>::R * T / p;
 
             for (unsigned compIdx = 0; compIdx < FluidSystem::numComponents; ++compIdx) {
+                // A component without a shift adds nothing.
+                if (FluidSystem::volumeShift(compIdx) == 0) {
+                    continue;
+                }
                 const Scalar b = decay<Scalar>(Bi(phaseIdx, compIdx)) * RT_p;
                 shift += decay<Scalar>(fluidState.moleFraction(phaseIdx, compIdx))
                        * FluidSystem::volumeShift(compIdx) * b;
