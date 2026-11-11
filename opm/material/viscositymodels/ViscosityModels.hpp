@@ -34,6 +34,7 @@
 #include <opm/input/eclipse/Units/Units.hpp>
 
 #include <array>
+#include <type_traits>
 #include <cmath>
 
 namespace Opm
@@ -106,7 +107,7 @@ public:
             xsum_p_ca += x * p_ca;
 
             const LhsEval xrM = x * std::sqrt(Mm);
-            const LhsEval mys = stielThodosLowPressureComponentViscosity_(T, T_c, Mm, p_ca);
+            const LhsEval mys = componentLowPressureViscosity_(T, compIdx, T_c, Mm, p_ca);
             my0 += xrM * mys;
             sumxrM += xrM;
         }
@@ -214,6 +215,44 @@ private:
             return 34.0e-5 * Opm::pow(T_r, 0.94) / zeta;
         }
         return 17.78e-5 * Opm::pow(4.58 * T_r - 1.67, 0.625) / zeta;
+    }
+
+    // stielThodosLowPressureComponentViscosity_() of a component, from the
+    // calling thread's memory of its last value when the temperature has no
+    // derivatives and neither it nor the component's constants have changed.
+    // The term costs four powers per component and phase, and is the same in
+    // every cell of an isothermal run. The value is the one the computation
+    // gives, to the last bit.
+    template <class LhsEval>
+    static LhsEval componentLowPressureViscosity_(const LhsEval& T,
+                                                  const unsigned compIdx,
+                                                  const Scalar T_c,
+                                                  const Scalar Mm,
+                                                  const Scalar p_ca)
+    {
+        if constexpr (!std::is_floating_point_v<LhsEval>) {
+            for (int i = 0; i < T.size(); ++i) {
+                if (T.derivative(i) != 0.0) {
+                    return stielThodosLowPressureComponentViscosity_(T, T_c, Mm, p_ca);
+                }
+            }
+        }
+        struct Memory
+        {
+            Scalar T{-1.0};
+            Scalar T_c{-1.0};
+            Scalar Mm{-1.0};
+            Scalar p_ca{-1.0};
+            Scalar value{};
+        };
+        static thread_local std::array<Memory, FluidSystem::numComponents> memory;
+        Memory& last = memory[compIdx];
+        const Scalar temperature = Opm::getValue(T);
+        if (!(last.T == temperature && last.T_c == T_c && last.Mm == Mm && last.p_ca == p_ca)) {
+            last = Memory{temperature, T_c, Mm, p_ca,
+                          stielThodosLowPressureComponentViscosity_(temperature, T_c, Mm, p_ca)};
+        }
+        return LhsEval(last.value);
     }
 
     static const std::array<Scalar, 5>& lbcCoefficients_()

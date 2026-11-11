@@ -378,6 +378,35 @@ BOOST_AUTO_TEST_CASE(WithoutAShiftTheTwoViscosityPathsAgree)
     BOOST_CHECK_CLOSE(viaMolarDensity, viaCompressFactor, 1.0e-8);
 }
 
+BOOST_AUTO_TEST_CASE(TheRememberedComponentViscosityIsTheComputedOne)
+{
+    // The low-pressure term of each component is remembered between calls at
+    // a temperature without derivatives. The viscosity must be the one
+    // computed afresh, to the last bit, also after the temperature changed
+    // and changed back; a temperature with a derivative is not remembered.
+    using Evaluation = Opm::DenseAd::Evaluation<Scalar, 1>;
+    const auto viscosity = [](const Evaluation& T) {
+        Opm::CompositionalFluidState<Evaluation, UnshiftedSystem> fs;
+        fs.setTemperature(T);
+        fs.setPressure(UnshiftedSystem::gasPhaseIdx, Evaluation(pressure));
+        for (int c = 0; c < numComponents; ++c) {
+            fs.setMoleFraction(UnshiftedSystem::gasPhaseIdx, c, Evaluation(z[c]));
+        }
+        typename UnshiftedSystem::template ParameterCache<Evaluation> paramCache(eosType);
+        paramCache.updatePhase(fs, UnshiftedSystem::gasPhaseIdx);
+        return UnshiftedSystem::viscosity(fs, paramCache, UnshiftedSystem::gasPhaseIdx);
+    };
+    const Evaluation computed = viscosity(Evaluation::createVariable(temperature, 0));
+    const Evaluation first = viscosity(Evaluation(temperature));
+    const Evaluation other = viscosity(Evaluation(temperature + 10.0));
+    const Evaluation again = viscosity(Evaluation(temperature));
+    BOOST_CHECK_EQUAL(first.value(), computed.value());
+    BOOST_CHECK_EQUAL(again.value(), computed.value());
+    BOOST_CHECK_NE(other.value(), computed.value());
+    BOOST_CHECK_EQUAL(again.derivative(0), 0.0);
+    BOOST_CHECK_NE(computed.derivative(0), 0.0);
+}
+
 BOOST_AUTO_TEST_CASE(TheShiftedPathCarriesItsDerivatives)
 {
     // Compare pressure and composition derivatives with central differences.
