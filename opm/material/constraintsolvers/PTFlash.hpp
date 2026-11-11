@@ -731,10 +731,28 @@ protected:
             OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", "Iteration", "K-Norm", "R-Norm"));
         }
 
-        // The parameter caches live across the iterations: temperature and
-        // pressure are fixed, so they compute the pure-component parameters once.
+        // The parameter cache lives across the iterations: temperature and
+        // pressure are fixed, so it computes the pure-component parameters once.
         ParamCache trial_param_cache(eos_type);
-        ParamCache reference_param_cache(eos_type);
+
+        // The reference phase is the feed on its stable root throughout: its
+        // fugacity coefficients are evaluated once, not in every iteration.
+        {
+            for (int compIdx=0; compIdx<numComponents; ++compIdx){
+                reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
+            }
+            ParamCache reference_param_cache(eos_type);
+            reference_param_cache.updatePhase(reference_state, reference_phase_idx);
+            std::array<FlashEval, numComponents> reference_fugacity_coefficients;
+            CubicEOS::computeFugacityCoefficients(reference_state,
+                                                  reference_param_cache,
+                                                  reference_phase_idx,
+                                                  reference_fugacity_coefficients);
+            for (int compIdx=0; compIdx<numComponents; ++compIdx){
+                reference_state.setFugacityCoefficient(
+                    reference_phase_idx, compIdx, reference_fugacity_coefficients[compIdx]);
+            }
+        }
 
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
@@ -753,31 +771,15 @@ protected:
                 trial_state.setMoleFraction(trial_phase_idx, compIdx, trial_composition[compIdx]);
             }
 
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
-            }
-
             trial_param_cache.updatePhase(trial_state, trial_phase_idx);
-            reference_param_cache.updatePhase(reference_state, reference_phase_idx);
 
-            // Fugacity coefficients of the trial phase and reference phase.
+            // Fugacity coefficients of the trial phase.
             std::array<FlashEval, numComponents> trial_fugacity_coefficients;
-            std::array<FlashEval, numComponents> reference_fugacity_coefficients;
             CubicEOS::computeFugacityCoefficients(
                 trial_state, trial_param_cache, trial_phase_idx, trial_fugacity_coefficients);
-            CubicEOS::computeFugacityCoefficients(reference_state,
-                                                  reference_param_cache,
-                                                  reference_phase_idx,
-                                                  reference_fugacity_coefficients);
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                const auto& trial_fugacity_coefficient = trial_fugacity_coefficients[compIdx];
-                const auto& reference_fugacity_coefficient
-                    = reference_fugacity_coefficients[compIdx];
-
                 trial_state.setFugacityCoefficient(
-                    trial_phase_idx, compIdx, trial_fugacity_coefficient);
-                reference_state.setFugacityCoefficient(
-                    reference_phase_idx, compIdx, reference_fugacity_coefficient);
+                    trial_phase_idx, compIdx, trial_fugacity_coefficients[compIdx]);
             }
 
             // The substitution factors R_i of the brief.
