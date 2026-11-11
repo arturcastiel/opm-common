@@ -353,7 +353,10 @@ protected:
             // A warm start must be reassessed from Wilson estimates because its
             // stored K may be a trivial fixed point. For a cold start, a
             // coincident split contradicts the preceding instability result.
-            const bool phases_coincide = split_succeeded && !is_single_phase
+            // Coincident phases solve the equations for any L, so a warm
+            // start that ends on them is reassessed whatever its L, also one
+            // the negative-flash test would call single-phase.
+            const bool phases_coincide = split_succeeded && (!is_single_phase || !is_cold_start)
                 && phasesCoincide_(fluid_state);
             if (phases_coincide && is_cold_start) {
                 OPM_THROW_NOLOG(NumericalProblem,
@@ -366,6 +369,8 @@ protected:
                                   "reassessing phase stability.");
                 }
 
+                is_single_phase = false;
+                is_negative_flash = false;
                 // A uniform K vector also represents coincident normalised
                 // compositions and can be a trivial fixed point of the
                 // stability trials. Restart from Wilson estimates to obtain an
