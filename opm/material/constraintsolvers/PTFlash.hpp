@@ -926,7 +926,8 @@ protected:
                             "Newton did not finish the composition update ({}); "
                             "switching back to successive substitution.", error.what()));
                     }
-                    converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity);
+                    converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity,
+                                                                   /*extrapolate=*/true);
                 };
                 try {
                     newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar,
@@ -1136,37 +1137,11 @@ protected:
         using ParamCache = typename FluidSystem::template ParameterCache<NewtonEval>;
         ParamCache paramCache(eos_type);
 
-        for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
-            paramCache.updatePhase(newton_state, phaseIdx);
-            updateFugacityCoefficients_(newton_state, paramCache, phaseIdx);
-        }
-        bool converged = false;
-        unsigned iteration = 0;
-        constexpr unsigned max_iterations = 1000;
-        while (iteration < max_iterations) {
+        // The state at the current unknowns, with its fugacity coefficients,
+        // residual and Jacobian; returns the residual norm, infinite where it
+        // is not finite.
+        const auto evaluate = [&]() {
             OPM_FLASH_COUNT(newtonIterations);
-            assembleNewton_<CompositionalFluidState<NewtonEval, FluidSystem>,
-                            ComponentVector,
-                            num_unknowns,
-                            num_equations>(newton_state, z, jacobian, residual);
-            if (verbosity >= 1) {
-                OpmLog::debug(fmt::format(" newton residual is {}", residual.two_norm()));
-            }
-            converged = residual.two_norm() < tolerance;
-            if (converged) {
-                break;
-            }
-
-            jacobian.solve(newton_step, residual);
-            constexpr Scalar damping_factor = 1.0;
-            // updating x and y
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                liquid_composition[compIdx] -= newton_step[compIdx] * damping_factor;
-                vapour_composition[compIdx]
-                    -= newton_step[compIdx + numComponents] * damping_factor;
-            }
-            liquid_fraction -= newton_step[num_equations - 1] * damping_factor;
-
             for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
                 newton_state.setMoleFraction(
                     FluidSystem::oilPhaseIdx, compIdx, liquid_composition[compIdx]);
@@ -1176,11 +1151,60 @@ protected:
                                        vapour_composition[compIdx] / liquid_composition[compIdx]);
             }
             newton_state.setLvalue(liquid_fraction);
-
             for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
                 paramCache.updatePhase(newton_state, phaseIdx);
                 updateFugacityCoefficients_(newton_state, paramCache, phaseIdx);
             }
+            assembleNewton_<CompositionalFluidState<NewtonEval, FluidSystem>,
+                            ComponentVector,
+                            num_unknowns,
+                            num_equations>(newton_state, z, jacobian, residual);
+            const Scalar norm = residual.two_norm();
+            return std::isfinite(norm) ? norm : std::numeric_limits<Scalar>::infinity();
+        };
+
+        bool converged = false;
+        unsigned iteration = 0;
+        constexpr unsigned max_iterations = 1000;
+        // Newton that has not halved its residual for this many steps is not
+        // converging to the root it started near: it wanders, or stalls on a
+        // local minimum of the residual norm where the Jacobian is nearly
+        // singular, and would only stop at the iteration limit. Stop it, so
+        // that the hybrid method falls back to substitution from the same
+        // ratios at once. Converging Newton halves the residual every step.
+        constexpr unsigned max_steps_without_progress = 10;
+        constexpr Scalar progress_factor = 0.5;
+        unsigned steps_without_progress = 0;
+
+        Scalar residual_norm = evaluate();
+        Scalar progress_residual = residual_norm;
+        while (iteration < max_iterations) {
+            if (verbosity >= 1) {
+                OpmLog::debug(fmt::format(" newton residual is {}", residual_norm));
+            }
+            converged = residual_norm < tolerance;
+            if (converged) {
+                break;
+            }
+            if (residual_norm < progress_factor * progress_residual) {
+                progress_residual = residual_norm;
+                steps_without_progress = 0;
+            }
+            else if (++steps_without_progress >= max_steps_without_progress
+                     || !std::isfinite(residual_norm)) {
+                OPM_THROW_NOLOG(NumericalProblem,
+                                fmt::format(" Newton composition update did not halve its "
+                                            "residual in {} iterations (residual {})",
+                                            max_steps_without_progress, residual_norm));
+            }
+
+            jacobian.solve(newton_step, residual);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                liquid_composition[compIdx] -= newton_step[compIdx];
+                vapour_composition[compIdx] -= newton_step[compIdx + numComponents];
+            }
+            liquid_fraction -= newton_step[num_equations - 1];
+            residual_norm = evaluate();
             ++iteration;
         }
         if (verbosity >= 1) {
