@@ -74,62 +74,30 @@ public:
                                               unsigned phaseIdx,
                                               unsigned compIdx)
     {
-        // note that we normalize the component mole fractions, so
-        // that their sum is 100%. This increases numerical stability
-        // considerably if the fluid state is not physical.
+        return componentFugacityCoefficient_(
+            phaseFugacityTerms_<LhsEval>(fs, params, phaseIdx), fs, params, phaseIdx, compIdx);
+    }
 
-        // extract variables
-        LhsEval Vm = params.molarVolume(phaseIdx);
-        LhsEval T = fs.temperature(phaseIdx);
-        LhsEval p = fs.pressure(phaseIdx); // molar volume in [bar]
-        LhsEval A = params.A(phaseIdx);
-        LhsEval B = params.B(phaseIdx);
-        LhsEval Bi = params.Bi(phaseIdx, compIdx);
-        LhsEval m1 = params.m1(phaseIdx);
-        LhsEval m2 = params.m2(phaseIdx);
-
-        // Calculate Bi / B
-        LhsEval Bi_B = Bi / B;
-
-        // Calculate the compressibility factor
-        LhsEval RT = R * T;
-        LhsEval Z = p * Vm / RT; // compressibility factor
-
-        // calculate sum(A_ij * x_j)
-        LhsEval A_s = 0.0;
-        for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
-            A_s += params.aCache(phaseIdx, compIdx, compJIdx) * fs.moleFraction(phaseIdx, compJIdx);
+    /*!
+     * \brief The fugacity coefficients of all components of a phase.
+     *
+     * The same values as computeFugacityCoefficient() for each component;
+     * the terms that do not depend on the component, among them both
+     * logarithms, are evaluated once for the phase.
+     *
+     * \param fugCoeffs Receives the coefficient of component i at index i.
+     */
+    template <class FluidState, class Params, class Coefficients>
+    static void computeFugacityCoefficients(const FluidState& fs,
+                                            const Params& params,
+                                            unsigned phaseIdx,
+                                            Coefficients& fugCoeffs)
+    {
+        using LhsEval = typename FluidState::ValueType;
+        const auto terms = phaseFugacityTerms_<LhsEval>(fs, params, phaseIdx);
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fugCoeffs[compIdx] = componentFugacityCoefficient_(terms, fs, params, phaseIdx, compIdx);
         }
-
-        // calculate fugacity coefficient
-        LhsEval alpha;
-        LhsEval beta;
-        LhsEval gamma;
-        LhsEval ln_phi;
-        LhsEval fugCoeff;
-
-        alpha = -log(Z - B) + Bi_B * (Z - 1);
-        beta  = log((Z + m2 * B) / (Z + m1 * B)) * A / ((m1 - m2) * B);
-        gamma = (2 / A) * A_s - Bi_B;
-        ln_phi = alpha + (beta * gamma);
-
-        fugCoeff = exp(ln_phi);
-
-        ////////
-        // limit the fugacity coefficient to a reasonable range:
-        //
-        // on one side, we want the mole fraction to be at
-        // least 10^-3 if the fugacity is at the current pressure
-        //
-        fugCoeff = min(maxFugacityCoefficient, fugCoeff);
-        //
-        // on the other hand, if the mole fraction of the component is 100%, we want the
-        // fugacity to be at least 10^-3 Pa
-        //
-        fugCoeff = max(minFugacityCoefficient, fugCoeff);
-        ///////////
-
-        return fugCoeff;
     }
 
     /*!
@@ -206,6 +174,98 @@ public:
         assert(Vm > 0);
         return Vm;
 
+    }
+
+private:
+    //! The terms of \f$\ln \phi_i\f$ shared by all components of a phase.
+    template <class LhsEval>
+    struct PhaseFugacityTerms
+    {
+        LhsEval B; //!< \f$B\f$
+        LhsEval Z; //!< compressibility factor of the cached molar volume
+        LhsEval negLogZB; //!< \f$-\ln(Z - B)\f$
+        LhsEval Zm1; //!< \f$Z - 1\f$
+        LhsEval beta; //!< \f$\frac{A}{(m_1 - m_2) B} \ln\frac{Z + m_2 B}{Z + m_1 B}\f$
+        LhsEval twoOverA; //!< \f$2 / A\f$
+    };
+
+    template <class LhsEval, class FluidState, class Params>
+    static PhaseFugacityTerms<LhsEval> phaseFugacityTerms_(const FluidState& fs,
+                                                           const Params& params,
+                                                           unsigned phaseIdx)
+    {
+        // note that we normalize the component mole fractions, so
+        // that their sum is 100%. This increases numerical stability
+        // considerably if the fluid state is not physical.
+
+        // extract variables
+        LhsEval Vm = params.molarVolume(phaseIdx);
+        LhsEval T = fs.temperature(phaseIdx);
+        LhsEval p = fs.pressure(phaseIdx); // molar volume in [bar]
+        LhsEval A = params.A(phaseIdx);
+        LhsEval B = params.B(phaseIdx);
+        LhsEval m1 = params.m1(phaseIdx);
+        LhsEval m2 = params.m2(phaseIdx);
+
+        // Calculate the compressibility factor
+        LhsEval RT = R * T;
+        LhsEval Z = p * Vm / RT; // compressibility factor
+
+        PhaseFugacityTerms<LhsEval> terms;
+        terms.negLogZB = -log(Z - B);
+        terms.Zm1 = Z - 1;
+        terms.beta = log((Z + m2 * B) / (Z + m1 * B)) * A / ((m1 - m2) * B);
+        terms.twoOverA = 2 / A;
+        terms.B = B;
+        terms.Z = Z;
+        return terms;
+    }
+
+    template <class LhsEval, class FluidState, class Params>
+    static LhsEval componentFugacityCoefficient_(const PhaseFugacityTerms<LhsEval>& terms,
+                                                 const FluidState& fs,
+                                                 const Params& params,
+                                                 unsigned phaseIdx,
+                                                 unsigned compIdx)
+    {
+        LhsEval Bi = params.Bi(phaseIdx, compIdx);
+
+        // Calculate Bi / B
+        LhsEval Bi_B = Bi / terms.B;
+
+        // calculate sum(A_ij * x_j)
+        LhsEval A_s = 0.0;
+        for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+            A_s += params.aCache(phaseIdx, compIdx, compJIdx) * fs.moleFraction(phaseIdx, compJIdx);
+        }
+
+        // calculate fugacity coefficient
+        LhsEval alpha;
+        LhsEval gamma;
+        LhsEval ln_phi;
+        LhsEval fugCoeff;
+
+        alpha = terms.negLogZB + Bi_B * terms.Zm1;
+        gamma = terms.twoOverA * A_s - Bi_B;
+        ln_phi = alpha + (terms.beta * gamma);
+
+        fugCoeff = exp(ln_phi);
+
+        ////////
+        // limit the fugacity coefficient to a reasonable range:
+        //
+        // on one side, we want the mole fraction to be at
+        // least 10^-3 if the fugacity is at the current pressure
+        //
+        fugCoeff = min(maxFugacityCoefficient, fugCoeff);
+        //
+        // on the other hand, if the mole fraction of the component is 100%, we want the
+        // fugacity to be at least 10^-3 Pa
+        //
+        fugCoeff = max(minFugacityCoefficient, fugCoeff);
+        ///////////
+
+        return fugCoeff;
     }
 
 };  // class CubicEOS
