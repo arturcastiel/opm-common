@@ -138,6 +138,48 @@ class SaturationPressure
 public:
     using CompVec = std::array<Scalar, numComponents>;
 
+    /// The start of a search from a nearby state, such as the same cell at
+    /// the previous output: its saturation pressure and the composition of
+    /// its incipient phase.
+    struct Start
+    {
+        Scalar pressure{};
+        CompVec incipient{};
+    };
+
+    /// bubblePressure() from \p start: the search begins at the start's
+    /// pressure, with the equilibrium ratios of its incipient phase, instead
+    /// of at the Wilson estimate. Its answer is taken if it lies within a
+    /// factor 1 +/- maxStartChange_ of the start's pressure; otherwise, or if
+    /// it fails, the search from the Wilson estimate decides.
+    [[nodiscard]] static bool bubblePressure(const CompVec& liquid,
+                                             const Scalar temp,
+                                             const EOSType eosType,
+                                             const Start& start,
+                                             Scalar& press,
+                                             CompVec& vapor)
+    {
+        if (startedSolve_(normalized_(liquid), temp, eosType, Mode::Bubble, start, press, vapor)) {
+            return true;
+        }
+        return bubblePressure(liquid, temp, eosType, press, vapor);
+    }
+
+    /// dewPressure() from \p start, an upper (retrograde) dew point: as the
+    /// bubblePressure() from a start.
+    [[nodiscard]] static bool dewPressure(const CompVec& vapor,
+                                          const Scalar temp,
+                                          const EOSType eosType,
+                                          const Start& start,
+                                          Scalar& press,
+                                          CompVec& liquid)
+    {
+        if (startedSolve_(normalized_(vapor), temp, eosType, Mode::DewUpper, start, press, liquid)) {
+            return true;
+        }
+        return dewPressure(vapor, temp, eosType, press, liquid);
+    }
+
     /// Computes the bubble-point pressure of a liquid with composition \p liquid at
     /// temperature \p temp, along with the equilibrium \p vapor composition.
     /// On failure, \p press and \p vapor are both unchanged.
@@ -1088,6 +1130,36 @@ private:
         return false;
     }
 
+    // The largest relative change of the saturation pressure from its start
+    // that a started search may report. A boundary further away is left to
+    // the search from the Wilson estimate, which approaches it from the side
+    // its branch prescribes.
+    static constexpr Scalar maxStartChange_ = 0.2;
+
+    /// solve_() from \p start; publishes its answer only if it converged
+    /// within maxStartChange_ of the start's pressure.
+    static bool startedSolve_(const CompVec& z,
+                              const Scalar temp,
+                              const EOSType eosType,
+                              const Mode mode,
+                              const Start& start,
+                              Scalar& press,
+                              CompVec& incipient)
+    {
+        if (!positiveFinite_(start.pressure)) {
+            return false;
+        }
+        Scalar p{};
+        CompVec w{};
+        if (solve_(z, temp, eosType, mode, p, w, &start) != Outcome::Converged
+            || !(std::abs(p - start.pressure) <= maxStartChange_ * start.pressure)) {
+            return false;
+        }
+        press = p;
+        incipient = w;
+        return true;
+    }
+
     /*!
      * \brief Search one bubble- or dew-pressure branch.
      *
@@ -1140,6 +1212,8 @@ private:
      * \param[in] mode Branch and scan direction.
      * \param[out] press Saturation pressure; unchanged unless converged.
      * \param[out] incipient Equilibrium composition of the incipient phase.
+     * \param[in] start Optional start, whose pressure and incipient-phase
+     *                  ratios replace the Wilson estimate.
      * \return Outcome::Converged for a certified boundary, otherwise
      *         Outcome::GaveUp.
      */
@@ -1148,7 +1222,8 @@ private:
                           const EOSType eosType,
                           const Mode mode,
                           Scalar& press,
-                          CompVec& incipient)
+                          CompVec& incipient,
+                          const Start* start = nullptr)
     {
         if (!positiveFinite_(temp)) {
             return Outcome::GaveUp;
@@ -1163,7 +1238,10 @@ private:
         // pressure. The upper dew search starts from the same high estimate as
         // the bubble search.
         Scalar p = 0.0;
-        if (mode == Mode::DewLower) {
+        if (start) {
+            p = start->pressure;
+        }
+        else if (mode == Mode::DewLower) {
             for (int c = 0; c < numComponents; ++c) {
                 p += z[c] / wilsonKp[c];
             }
@@ -1182,6 +1260,16 @@ private:
             return K;
         };
         CompVec K = wilsonK(p);
+        // A start gives the ratios of its incipient phase to the feed, y / x,
+        // where both are present.
+        if (start) {
+            for (int c = 0; c < numComponents; ++c) {
+                const Scalar w = start->incipient[c];
+                if (z[c] > 0.0 && positiveFinite_(w)) {
+                    K[c] = bubble ? w / z[c] : z[c] / w;
+                }
+            }
+        }
 
         // The known phase holds z; the incipient phase composition is derived from K.
         const auto knownPhaseIdx = bubble ? oilPhaseIdx : gasPhaseIdx;
