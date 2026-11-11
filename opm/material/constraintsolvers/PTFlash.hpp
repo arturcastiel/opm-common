@@ -55,14 +55,20 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -152,6 +158,11 @@ public:
                                  Opm::getValue(fluid_state.pressure(FluidSystem::gasPhaseIdx)));
 
         scalar_state.setTemperature(Opm::getValue(fluid_state.temperature(0)));
+
+        if (predictSettings_().enabled) {
+            return solveFromRecords_(fluid_state, scalar_state, twoPhaseMethod, flash_tolerance,
+                                     eos_type, verbosity);
+        }
 
         const auto [is_single_phase, newton_jacobian]
             = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
@@ -275,6 +286,9 @@ protected:
     static constexpr std::size_t numFlashUnknowns = numMisciblePhases * numMiscibleComponents + 1;
     // x, y and L, then both phase pressures and the temperature.
     using JacobianState = std::array<Scalar, numFlashUnknowns + 3>;
+    //! (dF/du)^-1 dF/ds of a two-phase result, u = (x, y, L) and
+    //! s = (p, T, z): minus the sensitivities du/ds.
+    using Sensitivity = Dune::FieldMatrix<Scalar, numFlashUnknowns, numComponents + 2>;
 
     //! The composition Jacobian dF/d(x, y, L) where newtonComposition_()
     //! converged, and the state it was assembled at.
@@ -291,6 +305,527 @@ protected:
         bool single_phase;
         std::optional<NewtonJacobian> newton_jacobian;
     };
+
+    /*
+     * Fewer full flashes: research switch, off by default. The environment
+     * variable OPM_FLASH_PREDICT holds a comma-separated list of
+     *
+     *   predict  A two-phase warm start whose incoming K and L are the answer
+     *            of a remembered flash is predicted from that answer by a
+     *            first-order step in s = (p, T, z) along its sensitivities
+     *            du/ds, u = (x, y, L), which the derivative pass computes
+     *            anyway. The prediction is checked as successive substitution
+     *            checks its iterates: Rachford-Rice for L, both phases'
+     *            fugacities once, and |f_L / f_V - 1| below the flash
+     *            tolerance. A prediction that passes is the answer; otherwise
+     *            the flash goes on from it, one substitution step further.
+     *   reuse    An accepted prediction takes the remembered sensitivities as
+     *            its derivatives instead of the derivative pass: values exact
+     *            to the flash tolerance, derivatives first-order accurate.
+     *   memo     A flash whose inputs (p, T, z, incoming K and L, method,
+     *            tolerance, EOS) repeat bit for bit returns the remembered
+     *            answer, derivatives included.
+     *   tol=<r>  Accept a prediction whose residual is below r instead of the
+     *            flash tolerance: approximate when r is larger.
+     *   report   Print the tallies of each thread's tables when it exits.
+     *
+     * The flash API carries only K and L between calls, so the remembered
+     * answers live in per-thread, direct-mapped tables of each flash class,
+     * found by a hash of the incoming K and L (for the memo: of all inputs).
+     * A simulator carries them the same way: its thermodynamic hint hands the
+     * cell's last K and L back in. It could also hand in the hint's fluid
+     * state, whose x, y and L already carry du/ds in the primary variables.
+     */
+    struct PredictSettings
+    {
+        bool enabled = false;
+        bool predict = false;
+        bool reuse = false;
+        bool memo = false;
+        bool report = false;
+        Scalar tolerance = 0.; // 0: the flash tolerance
+        Scalar maxLnKStep = 1.; // larger predicted changes of a ln K are not trusted
+    };
+
+    static const PredictSettings& predictSettings_()
+    {
+        static const PredictSettings settings = [] {
+            PredictSettings result;
+            const char* value = std::getenv("OPM_FLASH_PREDICT");
+            if (value == nullptr) {
+                return result;
+            }
+            const std::string list(value);
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t end = std::min(list.find(',', start), list.size());
+                const std::string token = list.substr(start, end - start);
+                if (token == "predict" || token == "1") {
+                    result.predict = true;
+                }
+                else if (token == "reuse") {
+                    result.predict = true;
+                    result.reuse = true;
+                }
+                else if (token == "memo") {
+                    result.memo = true;
+                }
+                else if (token == "report") {
+                    result.report = true;
+                }
+                else if (token.rfind("tol=", 0) == 0) {
+                    result.tolerance = std::stod(token.substr(4));
+                }
+                else if (token.rfind("maxstep=", 0) == 0) {
+                    result.maxLnKStep = std::stod(token.substr(8));
+                }
+                start = end + 1;
+            }
+            result.enabled = result.predict || result.memo;
+            return result;
+        }();
+        return settings;
+    }
+
+    using ScalarComponents = std::array<Scalar, numComponents>;
+    //! The inputs of a flash besides the fluid system: both pressures, T, the
+    //! incoming L, z and the incoming K.
+    using FlashInput = std::array<Scalar, 2 * numComponents + 4>;
+
+    //! A two-phase answer, filed under its K = y / x and L: the incoming K
+    //! and L of a flash warm-started from it.
+    struct SplitRecord
+    {
+        bool valid = false;
+        Scalar fingerprint = 0.;
+        std::array<Scalar, numComponents + 1> key{};
+        Scalar p = 0.;
+        Scalar T = 0.;
+        ScalarComponents z{};
+        ScalarComponents x{};
+        ScalarComponents y{};
+        Scalar L = 0.;
+        Sensitivity sensitivity;
+    };
+
+    //! An answer filed under all inputs of its flash.
+    struct MemoRecord
+    {
+        bool valid = false;
+        Scalar fingerprint = 0.;
+        FlashInput input{};
+        PTFlashMethod method{};
+        Scalar tolerance = 0.;
+        EOSType eos{};
+        bool single_phase = false;
+        ScalarComponents x{};
+        ScalarComponents y{};
+        Scalar L = 0.;
+        Sensitivity sensitivity; // of a two-phase answer
+    };
+
+    static constexpr std::size_t recordSlots = std::size_t{1} << 14;
+
+    struct PredictMemory
+    {
+        std::vector<SplitRecord> splits;
+        std::vector<MemoRecord> memo;
+        // Tallies for the report.
+        long flashes = 0;
+        long warm = 0;
+        long found = 0;
+        long zero_steps = 0;
+        long accepted = 0;
+        long outside = 0;
+        long memo_hits = 0;
+        //! Checked predictions by decade of their residual: [0] below 1e-13,
+        //! [k] in [1e-14 + k), [15] from 10 up.
+        std::array<long, 16> residuals{};
+
+        PredictMemory()
+            : splits(predictSettings_().predict ? recordSlots : 0)
+            , memo(predictSettings_().memo ? recordSlots : 0)
+        {}
+
+        ~PredictMemory()
+        {
+            if (!predictSettings_().report || flashes == 0) {
+                return;
+            }
+            std::fprintf(stderr,
+                         "PREDICT components %d thermal %d: flashes %ld two-phase warm starts %ld "
+                         "remembered %ld zero steps %ld accepted %ld outside %ld memo hits %ld | "
+                         "residual decades from 1e-13:",
+                         numComponents, static_cast<int>(isThermal), flashes, warm, found,
+                         zero_steps, accepted, outside, memo_hits);
+            for (const long count : residuals) {
+                std::fprintf(stderr, " %ld", count);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    };
+
+    static PredictMemory& predictMemory_()
+    {
+        thread_local PredictMemory memory;
+        return memory;
+    }
+
+    //! A number that changes with the components and their interactions: a
+    //! record from another fluid system is not used.
+    static Scalar fluidSystemFingerprint_()
+    {
+        Scalar fingerprint = 0.;
+        if constexpr (requires {
+                          FluidSystem::criticalTemperature(0u);
+                          FluidSystem::criticalPressure(0u);
+                          FluidSystem::acentricFactor(0u);
+                          FluidSystem::interactionCoefficient(0u, 0u);
+                      }) {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fingerprint = 1.000001 * fingerprint + FluidSystem::criticalTemperature(compIdx)
+                    + 1e-5 * FluidSystem::criticalPressure(compIdx)
+                    + FluidSystem::acentricFactor(compIdx);
+                for (unsigned otherIdx = 0; otherIdx < compIdx; ++otherIdx) {
+                    fingerprint += (compIdx + 1.) * (otherIdx + 2.)
+                        * FluidSystem::interactionCoefficient(compIdx, otherIdx);
+                }
+            }
+        }
+        return fingerprint;
+    }
+
+    //! The table slot of a vector of values, by their bits.
+    template <std::size_t size>
+    static std::size_t recordSlot_(const std::array<Scalar, size>& values)
+    {
+        std::uint64_t hash = 0x9e3779b97f4a7c15ULL;
+        for (const Scalar value : values) {
+            hash ^= std::bit_cast<std::uint64_t>(value) + 0x9e3779b97f4a7c15ULL + (hash << 6)
+                + (hash >> 2);
+            // The finaliser of MurmurHash3.
+            hash ^= hash >> 33;
+            hash *= 0xff51afd7ed558ccdULL;
+            hash ^= hash >> 33;
+        }
+        return static_cast<std::size_t>(hash) & (recordSlots - 1);
+    }
+
+    template <std::size_t size>
+    static bool sameBits_(const std::array<Scalar, size>& a, const std::array<Scalar, size>& b)
+    {
+        return std::memcmp(a.data(), b.data(), size * sizeof(Scalar)) == 0;
+    }
+
+    //! The first-order prediction of K and L at the state of input from a
+    //! record: ln K_i moves by dy_i / y_i - dx_i / x_i with du = -S ds.
+    //! Nothing when a ln K would move by more than maxLnKStep.
+    static std::optional<std::pair<Dune::FieldVector<Scalar, numComponents>, Scalar>>
+    predictSplit_(const SplitRecord& record, const FlashInput& input, bool& zero_step)
+    {
+        std::array<Scalar, numComponents + 2> ds;
+        ds[0] = input[0] - record.p;
+        ds[1] = input[2] - record.T;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            ds[2 + compIdx] = input[4 + compIdx] - record.z[compIdx];
+        }
+        zero_step = std::all_of(ds.begin(), ds.end(), [](const Scalar d) { return d == 0.; });
+        Dune::FieldVector<Scalar, numComponents> K;
+        Scalar L = record.L;
+        for (unsigned varIdx = 0; varIdx < numComponents + 2; ++varIdx) {
+            L -= record.sensitivity[2 * numComponents][varIdx] * ds[varIdx];
+        }
+        const Scalar max_step = predictSettings_().maxLnKStep;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            Scalar dx = 0.;
+            Scalar dy = 0.;
+            for (unsigned varIdx = 0; varIdx < numComponents + 2; ++varIdx) {
+                dx -= record.sensitivity[compIdx][varIdx] * ds[varIdx];
+                dy -= record.sensitivity[numComponents + compIdx][varIdx] * ds[varIdx];
+            }
+            const Scalar dlnK = dy / record.y[compIdx] - dx / record.x[compIdx];
+            if (!std::isfinite(dlnK) || std::abs(dlnK) > max_step) {
+                return std::nullopt;
+            }
+            K[compIdx] = record.key[compIdx] * std::exp(dlnK);
+        }
+        return std::make_pair(K, L);
+    }
+
+    enum class PredictionOutcome { accepted, continued, outside };
+
+    /*!
+     * \brief Checks predicted equilibrium ratios as successive substitution
+     *        checks an iterate.
+     *
+     * L from Rachford-Rice, x and y from K and L, the fugacity coefficients of
+     * both phases, and the test |f_L / f_V - 1| < tolerance of
+     * successiveSubstitutionComposition_(). An accepted state also has
+     * physical, distinct phases. Otherwise K takes the substitution step from
+     * the fugacity ratios, as the flash would next.
+     */
+    template <class ScalarFluidState, class ScalarVector>
+    static PredictionOutcome checkPrediction_(ScalarFluidState& state,
+                                              ScalarVector& K,
+                                              Scalar& L,
+                                              const ScalarVector& z,
+                                              const Scalar tolerance,
+                                              const EOSType& eos_type,
+                                              PredictMemory& memory)
+    {
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(z[compIdx] > 0.)) {
+                K[compIdx] = 1.;
+            }
+        }
+        try {
+            OPM_FLASH_COUNT(rachfordRiceSolves);
+            L = RachfordRice::solve(K, z, L, 0);
+        }
+        catch (const NumericalProblem&) {
+            return PredictionOutcome::outside;
+        }
+        if (!(L > 0. && L < 1.)) {
+            return PredictionOutcome::outside;
+        }
+        OPM_FLASH_COUNT(ssiIterations);
+        computeLiquidVapor_(state, L, K, z);
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
+            param_cache.updatePhase(state, phaseIdx);
+            updateFugacityCoefficients_(state, param_cache, phaseIdx);
+        }
+        ScalarVector ratio;
+        ScalarVector residual;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(z[compIdx] > 0.)) {
+                ratio[compIdx] = 1.;
+                residual[compIdx] = 0.;
+                continue;
+            }
+            ratio[compIdx] = state.fugacity(oilPhaseIdx, compIdx) / state.fugacity(gasPhaseIdx, compIdx);
+            residual[compIdx] = ratio[compIdx] - 1.0;
+        }
+        const Scalar norm = residual.two_norm();
+        if (!std::isfinite(norm)) {
+            return PredictionOutcome::outside;
+        }
+        const int decade = norm > 0. ? static_cast<int>(std::floor(std::log10(norm))) + 14 : 0;
+        ++memory.residuals[std::clamp(decade, 0, 15)];
+        if (norm < tolerance && phaseCompositionsArePhysical_(state) && !phasesCoincide_(state)) {
+            state.setLvalue(L);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setKvalue(compIdx, K[compIdx]);
+            }
+            return PredictionOutcome::accepted;
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            K[compIdx] *= ratio[compIdx];
+        }
+        return PredictionOutcome::continued;
+    }
+
+    /*!
+     * \brief solve() with the remembered answers of OPM_FLASH_PREDICT: the
+     *        memo, then the checked prediction, then the flash; the answer is
+     *        remembered.
+     */
+    template <class FluidState, class ScalarFluidState>
+    static bool solveFromRecords_(FluidState& fluid_state,
+                                  ScalarFluidState& scalar_state,
+                                  const PTFlashMethod twoPhaseMethod,
+                                  const Scalar flash_tolerance,
+                                  const EOSType& eos_type,
+                                  const int verbosity)
+    {
+        const auto& settings = predictSettings_();
+        auto& memory = predictMemory_();
+        ++memory.flashes;
+        std::optional<Scalar> fingerprint_value;
+        const auto fingerprint = [&]() {
+            if (!fingerprint_value) {
+                fingerprint_value = fluidSystemFingerprint_();
+            }
+            return *fingerprint_value;
+        };
+
+        FlashInput input{};
+        input[0] = scalar_state.pressure(oilPhaseIdx);
+        input[1] = scalar_state.pressure(gasPhaseIdx);
+        input[2] = scalar_state.temperature(0);
+        input[3] = scalar_state.L();
+        Dune::FieldVector<Scalar, numComponents> z;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z[compIdx] = scalar_state.moleFraction(compIdx);
+            input[4 + compIdx] = z[compIdx];
+            input[4 + numComponents + compIdx] = scalar_state.K(compIdx);
+        }
+
+        const auto transfer = [&]() {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fluid_state.setMoleFraction(oilPhaseIdx, compIdx,
+                                            scalar_state.moleFraction(oilPhaseIdx, compIdx));
+                fluid_state.setMoleFraction(gasPhaseIdx, compIdx,
+                                            scalar_state.moleFraction(gasPhaseIdx, compIdx));
+            }
+        };
+        const auto returnRatios = [&]() {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto& x = fluid_state.moleFraction(oilPhaseIdx, compIdx);
+                if (Opm::getValue(x) > 0.) {
+                    fluid_state.setKvalue(compIdx, fluid_state.moleFraction(gasPhaseIdx, compIdx) / x);
+                }
+            }
+        };
+
+        // 1. The memo of bitwise-repeated inputs.
+        MemoRecord* memo_record = nullptr;
+        if (settings.memo) {
+            memo_record = &memory.memo[recordSlot_(input)];
+            const MemoRecord& record = *memo_record;
+            if (record.valid && record.method == twoPhaseMethod
+                && record.tolerance == flash_tolerance && record.eos == eos_type
+                && sameBits_(record.input, input) && record.fingerprint == fingerprint()) {
+                OPM_FLASH_COUNT(cacheHits);
+                ++memory.memo_hits;
+                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    scalar_state.setMoleFraction(oilPhaseIdx, compIdx, record.x[compIdx]);
+                    scalar_state.setMoleFraction(gasPhaseIdx, compIdx, record.y[compIdx]);
+                }
+                scalar_state.setLvalue(record.L);
+                transfer();
+                if (record.single_phase) {
+                    updateDerivativesSinglePhase_(scalar_state, fluid_state);
+                }
+                else {
+                    applySensitivities_<true>(scalar_state, fluid_state, record.sensitivity);
+                    returnRatios();
+                }
+                return record.single_phase;
+            }
+        }
+
+        // 2. The checked prediction of a two-phase warm start.
+        bool accepted = false;
+        std::optional<Sensitivity> reused_sensitivity;
+        const Scalar incoming_L = input[3];
+        if (settings.predict && incoming_L > 0. && incoming_L < 1.) {
+            ++memory.warm;
+            std::array<Scalar, numComponents + 1> key;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                key[compIdx] = input[4 + numComponents + compIdx];
+            }
+            key[numComponents] = incoming_L;
+            const SplitRecord& record = memory.splits[recordSlot_(key)];
+            if (record.valid && sameBits_(record.key, key) && record.fingerprint == fingerprint()) {
+                ++memory.found;
+                bool zero_step = false;
+                auto prediction = predictSplit_(record, input, zero_step);
+                memory.zero_steps += zero_step;
+                if (prediction) {
+                    auto& [K, L] = *prediction;
+                    ScalarFluidState trial = scalar_state;
+                    const Scalar tolerance
+                        = settings.tolerance > 0. ? settings.tolerance : flash_tolerance;
+                    const auto outcome
+                        = checkPrediction_(trial, K, L, z, tolerance, eos_type, memory);
+                    if (outcome == PredictionOutcome::accepted) {
+                        OPM_FLASH_COUNT(cacheHits);
+                        ++memory.accepted;
+                        accepted = true;
+                        scalar_state = trial;
+                        if (settings.reuse) {
+                            reused_sensitivity = record.sensitivity;
+                        }
+                    }
+                    else if (outcome == PredictionOutcome::continued) {
+                        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                            scalar_state.setKvalue(compIdx, K[compIdx]);
+                        }
+                        scalar_state.setLvalue(L);
+                    }
+                    else {
+                        ++memory.outside;
+                    }
+                }
+                else {
+                    ++memory.outside;
+                }
+            }
+        }
+
+        // 3. The flash.
+        bool is_single_phase = false;
+        std::optional<NewtonJacobian> newton_jacobian;
+        if (!accepted) {
+            auto result = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+            is_single_phase = result.single_phase;
+            newton_jacobian = std::move(result.newton_jacobian);
+        }
+        transfer();
+        Sensitivity sensitivity;
+        if (is_single_phase) {
+            updateDerivativesSinglePhase_(scalar_state, fluid_state);
+        }
+        else if (reused_sensitivity) {
+            sensitivity = *reused_sensitivity;
+            applySensitivities_<true>(scalar_state, fluid_state, sensitivity);
+        }
+        else {
+            updateDerivativesTwoPhase_<true>(scalar_state, fluid_state, eos_type, newton_jacobian,
+                                             &sensitivity);
+        }
+        if (!is_single_phase) {
+            returnRatios();
+        }
+
+        // 4. Remember the answer.
+        if (settings.predict && !is_single_phase) {
+            std::array<Scalar, numComponents + 1> key;
+            bool positive = true;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                key[compIdx] = Opm::getValue(fluid_state.K(compIdx));
+                positive = positive && scalar_state.moleFraction(oilPhaseIdx, compIdx) > 0.
+                    && scalar_state.moleFraction(gasPhaseIdx, compIdx) > 0.;
+            }
+            key[numComponents] = Opm::getValue(fluid_state.L());
+            if (positive) {
+                SplitRecord& record = memory.splits[recordSlot_(key)];
+                record.valid = true;
+                record.fingerprint = fingerprint();
+                record.key = key;
+                record.p = input[0];
+                record.T = input[2];
+                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    record.z[compIdx] = z[compIdx];
+                    record.x[compIdx] = scalar_state.moleFraction(oilPhaseIdx, compIdx);
+                    record.y[compIdx] = scalar_state.moleFraction(gasPhaseIdx, compIdx);
+                }
+                record.L = scalar_state.L();
+                record.sensitivity = sensitivity;
+            }
+        }
+        if (memo_record) {
+            MemoRecord& record = *memo_record;
+            record.valid = true;
+            record.fingerprint = fingerprint();
+            record.input = input;
+            record.method = twoPhaseMethod;
+            record.tolerance = flash_tolerance;
+            record.eos = eos_type;
+            record.single_phase = is_single_phase;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                record.x[compIdx] = scalar_state.moleFraction(oilPhaseIdx, compIdx);
+                record.y[compIdx] = scalar_state.moleFraction(gasPhaseIdx, compIdx);
+            }
+            record.L = scalar_state.L();
+            if (!is_single_phase) {
+                record.sensitivity = sensitivity;
+            }
+        }
+        return is_single_phase;
+    }
 
     //! flash_solve_scalar(), also returning the composition Jacobian when
     //! Newton finished the split.
@@ -1785,12 +2320,14 @@ protected:
      * gives those of \f$\mathbf u\f$. A Newton solve that converged at exactly
      * this state already assembled \f$\partial F / \partial \mathbf u\f$.
      */
-    template <typename FlashFluidStateScalar, typename FluidState>
+    template <bool withTemperature = isThermal, typename FlashFluidStateScalar, typename FluidState>
     static void updateDerivativesTwoPhase_(const FlashFluidStateScalar& fluid_state_scalar,
                                            FluidState& fluid_state,
                                            const EOSType& eos_type,
-                                           const std::optional<NewtonJacobian>& newton_jacobian)
+                                           const std::optional<NewtonJacobian>& newton_jacobian,
+                                           Sensitivity* sensitivity = nullptr)
     {
+        static_assert(withTemperature || !isThermal);
         using InputEval = typename FluidState::ValueType;
         using ComponentVector = Dune::FieldVector<InputEval, numComponents>;
         ComponentVector z;
@@ -1799,8 +2336,10 @@ protected:
         }
 
         constexpr std::size_t num_equations = numMisciblePhases * numMiscibleComponents + 1;
+        // With withTemperature the temperature is a state variable also for
+        // an isothermal caller, so that the sensitivities cover a change of T.
         constexpr std::size_t num_state_variables
-            = isThermal ? numComponents + 2 : numComponents + 1;
+            = withTemperature ? numComponents + 2 : numComponents + 1;
         using StateEval = Opm::DenseAd::Evaluation<double, num_state_variables>;
         using StateComponentVector = Dune::FieldVector<StateEval, numComponents>;
         using StateFluidState = Opm::CompositionalFluidState<StateEval, FluidSystem>;
@@ -1814,7 +2353,7 @@ protected:
         state_derivative_state.setPressure(FluidSystem::oilPhaseIdx, state_pressure);
         state_derivative_state.setPressure(FluidSystem::gasPhaseIdx, state_pressure);
 
-        if constexpr (isThermal) {
+        if constexpr (withTemperature) {
             // set the temperature with derivatives
             const StateEval state_temperature = StateEval(fluid_state_scalar.temperature(0), 1);
             state_derivative_state.setTemperature(state_temperature);
@@ -1823,9 +2362,9 @@ protected:
             state_derivative_state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
         }
 
-        // composition variable offset: 2 for thermal (pressure=0, temperature=1, z starts at 2)
-        //                               1 for non-thermal (pressure=0, z starts at 1)
-        constexpr unsigned composition_offset = isThermal ? 2 : 1;
+        // composition variable offset: 2 with temperature (pressure=0, temperature=1, z starts at 2)
+        //                               1 without (pressure=0, z starts at 1)
+        constexpr unsigned composition_offset = withTemperature ? 2 : 1;
         for (unsigned idx = 0; idx < numComponents; ++idx) {
             state_composition[idx] = StateEval(Opm::getValue(z[idx]), idx + composition_offset);
         }
@@ -1874,6 +2413,36 @@ protected:
         state_jacobian.template leftmultiply<UnknownJacobian>(unknown_jacobian);
         // state_jacobian now stores (dF/du)^-1 dF/ds; the minus sign is
         // applied while transferring each sensitivity below.
+        if constexpr (withTemperature) {
+            if (sensitivity) {
+                *sensitivity = state_jacobian;
+            }
+        }
+        applySensitivities_<withTemperature>(fluid_state_scalar, fluid_state, state_jacobian);
+    } //end updateDerivativesTwoPhase
+
+    /*!
+     * \brief The derivatives of a two-phase result in the caller's variables
+     *        from its sensitivities, by the chain rule through the caller's
+     *        derivatives of s = (p, [T,] z).
+     *
+     * \param state_jacobian (dF/du)^-1 dF/ds at the result, with a temperature
+     *        column when withTemperature; the temperature enters the chain rule
+     *        only for a thermal flash.
+     */
+    template <bool withTemperature, typename FlashFluidStateScalar, typename FluidState, class StateJacobian>
+    static void applySensitivities_(const FlashFluidStateScalar& fluid_state_scalar,
+                                    FluidState& fluid_state,
+                                    const StateJacobian& state_jacobian)
+    {
+        using InputEval = typename FluidState::ValueType;
+        using ComponentVector = Dune::FieldVector<InputEval, numComponents>;
+        ComponentVector z;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z[compIdx] = fluid_state.moleFraction(compIdx);
+        }
+        constexpr unsigned composition_offset = withTemperature ? 2 : 1;
+        const auto scalar_liquid_fraction = fluid_state_scalar.L();
 
         ComponentVector liquid_composition(numComponents);
         ComponentVector vapour_composition(numComponents);
@@ -1987,7 +2556,7 @@ protected:
                 FluidSystem::gasPhaseIdx, compIdx, vapour_composition[compIdx]);
         }
         fluid_state.setLvalue(liquid_fraction_with_derivatives);
-    } //end updateDerivativesTwoPhase
+    } //end applySensitivities_
 
     /*!
      * \brief A single-phase result: both phases take the mixture composition,
