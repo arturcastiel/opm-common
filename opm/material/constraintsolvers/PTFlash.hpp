@@ -420,7 +420,10 @@ protected:
      * K without a stability test, and is kept only if it converges to a
      * distinct split with 0 < L < 1; otherwise the state is restored.
      * Approximate: Rachford-Rice on the interpolated K in an all-two-phase
-     * cell, the label of an all-single-phase cell; no iteration.
+     * cell, the label of an all-single-phase cell; no iteration. With an
+     * acceptance tolerance, a two-phase answer is kept only if its largest
+     * |ln(f_L / f_V)| is below it, and is otherwise converged as in the
+     * exact mode.
      */
     template <typename FluidState>
     static std::optional<ScalarFlashResult> flashFromTable_(FluidState& fluid_state,
@@ -460,23 +463,29 @@ protected:
                 K_scalar[compIdx] = std::exp(ln_K[compIdx]);
             }
             OPM_FLASH_COUNT(cacheHits);
+            const FluidState input_state = fluid_state;
             if (!exact) {
                 // Mass balance holds exactly, equal fugacities to the
                 // interpolation error of ln K.
+                const Scalar acceptance = PTFlashTableSettings::get().acceptance;
                 try {
                     OPM_FLASH_COUNT(rachfordRiceSolves);
                     Scalar L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
-                    if (L_scalar > 0. && L_scalar < 1.) {
-                        computeLiquidVapor_(fluid_state, L_scalar, K_scalar, z_scalar);
+                    if (!(L_scalar > 0. && L_scalar < 1.)) {
+                        return std::nullopt;
+                    }
+                    computeLiquidVapor_(fluid_state, L_scalar, K_scalar, z_scalar);
+                    if (!(acceptance > 0.)
+                        || fugacityResidual_(fluid_state, z_scalar, eos_type) < acceptance) {
                         fluid_state.setLvalue(L_scalar);
                         return ScalarFlashResult{false, std::nullopt};
                     }
                 }
                 catch (const NumericalProblem&) {
+                    return std::nullopt;
                 }
-                return std::nullopt;
+                fluid_state = input_state;
             }
-            const FluidState input_state = fluid_state;
             try {
                 OPM_FLASH_COUNT(rachfordRiceSolves);
                 Scalar L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
@@ -504,6 +513,36 @@ protected:
             return ScalarFlashResult{true, std::nullopt};
         }
         return std::nullopt;
+    }
+
+    //! The largest |ln(f_L / f_V)| over the components present, at the phase
+    //! compositions of the state.
+    template <class FlashFluidState, class ComponentVector>
+    static Scalar fugacityResidual_(const FlashFluidState& fluid_state,
+                                    const ComponentVector& z,
+                                    const EOSType& eos_type)
+    {
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        std::array<std::array<Scalar, numComponents>, 2> ln_phi;
+        for (const int phaseIdx : {static_cast<int>(oilPhaseIdx), static_cast<int>(gasPhaseIdx)}) {
+            param_cache.updatePhase(fluid_state, phaseIdx);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                ln_phi[phaseIdx == static_cast<int>(oilPhaseIdx) ? 0 : 1][compIdx] = std::log(
+                    FluidSystem::fugacityCoefficient(fluid_state, param_cache, phaseIdx, compIdx));
+            }
+        }
+        Scalar residual = 0.0;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(z[compIdx] > 0.)) {
+                continue;
+            }
+            const Scalar x = fluid_state.moleFraction(oilPhaseIdx, compIdx);
+            const Scalar y = fluid_state.moleFraction(gasPhaseIdx, compIdx);
+            residual = std::max(residual,
+                                std::abs(std::log(x / y) + ln_phi[0][compIdx] - ln_phi[1][compIdx]));
+        }
+        return std::isfinite(residual) ? residual : std::numeric_limits<Scalar>::infinity();
     }
 
     //! A table vertex: the flash without the table from Wilson K at (p, T, z).
