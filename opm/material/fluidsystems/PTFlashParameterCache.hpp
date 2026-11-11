@@ -167,6 +167,19 @@ public:
         };
     }
 
+    //! \f$\partial \ln A_i / \partial T\f$ of a phase, see CubicEOSParams.
+    Scalar lnAiTemperatureDerivative(unsigned phaseIdx, unsigned compIdx) const
+    {
+        switch (phaseIdx)
+        {
+        case oilPhaseIdx: return oilPhaseParams_.lnAiTemperatureDerivative(compIdx);
+        case gasPhaseIdx: return gasPhaseParams_.lnAiTemperatureDerivative(compIdx);
+        default:
+            throw std::logic_error("The Ai parameter is only defined for "
+                                   "oil and gas phases");
+        };
+    }
+
     Scalar Bi(unsigned phaseIdx, unsigned compIdx) const
     {
         switch (phaseIdx)

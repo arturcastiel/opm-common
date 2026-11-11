@@ -137,9 +137,9 @@ public:
                                                           Coefficients& fugCoeffs,
                                                           Derivatives& lnPhiDerivatives)
     {
-        Coefficients* noPressureDerivatives = nullptr;
+        Coefficients* noStateDerivatives = nullptr;
         coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
-                                    noPressureDerivatives);
+                                    noStateDerivatives, noStateDerivatives);
     }
 
     /*!
@@ -171,8 +171,38 @@ public:
                                                           Derivatives& lnPhiDerivatives,
                                                           Coefficients& lnPhiPressureDerivatives)
     {
+        Coefficients* noTemperatureDerivatives = nullptr;
         coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
-                                    &lnPhiPressureDerivatives);
+                                    &lnPhiPressureDerivatives, noTemperatureDerivatives);
+    }
+
+    /*!
+     * \brief computeFugacityCoefficientsAndDerivatives() with the pressure
+     *        derivatives, and the derivatives of the logarithms in temperature
+     *        at fixed pressure and phase composition.
+     *
+     * With \f$a_i = \partial \ln A_i / \partial T\f$ of the parameter cache,
+     * \f$\partial A_{ij} / \partial T = A_{ij} (a_i + a_j) / 2\f$, so
+     * \f$A_T = \sum_i x_i a_i S_i\f$ and
+     * \f$\partial S_i / \partial T = (a_i S_i + \sum_j A_{ij} x_j a_j) / 2\f$
+     * with \f$S_i = \sum_j A_{ij} x_j\f$; \f$B\f$ and every \f$B_i\f$ are
+     * proportional to \f$1 / T\f$. \f$Z_T\f$ follows from the cubic, or is
+     * \f$-Z / T\f$ where the molar volume is at its floor. A coefficient at
+     * its limits has no derivative.
+     *
+     * \param lnPhiTemperatureDerivatives Receives \f$\partial \ln\phi_i / \partial T\f$ at i.
+     */
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void computeFugacityCoefficientsAndDerivatives(const FluidState& fs,
+                                                          const Params& params,
+                                                          unsigned phaseIdx,
+                                                          Coefficients& fugCoeffs,
+                                                          Derivatives& lnPhiDerivatives,
+                                                          Coefficients& lnPhiPressureDerivatives,
+                                                          Coefficients& lnPhiTemperatureDerivatives)
+    {
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    &lnPhiPressureDerivatives, &lnPhiTemperatureDerivatives);
     }
 
 private:
@@ -182,7 +212,8 @@ private:
                                             unsigned phaseIdx,
                                             Coefficients& fugCoeffs,
                                             Derivatives& lnPhiDerivatives,
-                                            Coefficients* lnPhiPressureDerivatives)
+                                            Coefficients* lnPhiPressureDerivatives,
+                                            Coefficients* lnPhiTemperatureDerivatives)
     {
         using LhsEval = typename FluidState::ValueType;
         static_assert(std::is_floating_point_v<LhsEval>,
@@ -261,6 +292,37 @@ private:
                     + params.Bi(phaseIdx, compIdx) * invB * Zp + betaP * gamma[compIdx];
             }
         }
+        if (lnPhiTemperatureDerivatives) {
+            const LhsEval T = fs.temperature(phaseIdx);
+            std::array<LhsEval, numComponents> a;
+            std::array<LhsEval, numComponents> xa; // x_j a_j
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                a[compIdx] = params.lnAiTemperatureDerivative(phaseIdx, compIdx);
+                xa[compIdx] = fs.moleFraction(phaseIdx, compIdx) * a[compIdx];
+            }
+            LhsEval AT = 0.0;
+            std::array<LhsEval, numComponents> ST;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                LhsEval weighted = 0.0;
+                for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+                    weighted += params.aCache(phaseIdx, compIdx, compJIdx) * xa[compJIdx];
+                }
+                ST[compIdx] = 0.5 * (a[compIdx] * S[compIdx] + weighted);
+                AT += xa[compIdx] * S[compIdx];
+            }
+            const LhsEval BT = -B / T;
+            const LhsEval ZT = volumeAtFloor ? -Z / T : -(FA * AT + FB * BT) / FZ;
+            const LhsEval LambdaT = (ZT + m2 * BT) / P2 - (ZT + m1 * BT) / P1;
+            const LhsEval common = -(ZT - BT) / ZB;
+            const LhsEval betaT
+                = ((AT * invB - A * BT * invB * invB) * Lambda + A * invB * LambdaT) / Delta;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const LhsEval gammaT = 2 * (ST[compIdx] * invA - S[compIdx] * AT * invA * invA);
+                (*lnPhiTemperatureDerivatives)[compIdx] = common
+                    + params.Bi(phaseIdx, compIdx) * invB * ZT + betaT * gamma[compIdx]
+                    + beta * gammaT;
+            }
+        }
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             if (!(fugCoeffs[compIdx] < maxFugacityCoefficient)
                 || !(fugCoeffs[compIdx] > minFugacityCoefficient)) {
@@ -269,6 +331,9 @@ private:
                 }
                 if (lnPhiPressureDerivatives) {
                     (*lnPhiPressureDerivatives)[compIdx] = 0.0;
+                }
+                if (lnPhiTemperatureDerivatives) {
+                    (*lnPhiTemperatureDerivatives)[compIdx] = 0.0;
                 }
             }
         }

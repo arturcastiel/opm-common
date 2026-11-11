@@ -1518,6 +1518,20 @@ protected:
               FluidSystem::fugacityCoefficientsAndDerivatives(
                   fluid_state, param_cache, 0u, coefficients, derivatives, coefficients);
           };
+    //! ... and the temperature derivatives.
+    static constexpr bool hasFugacityTemperatureDerivatives_
+        = requires(const CompositionalFluidState<Scalar, FluidSystem>& fluid_state,
+                   const typename FluidSystem::template ParameterCache<Scalar>& param_cache,
+                   std::array<Scalar, numComponents>& coefficients,
+                   std::array<std::array<Scalar, numComponents>, numComponents>& derivatives) {
+              FluidSystem::fugacityCoefficientsAndDerivatives(
+                  fluid_state, param_cache, 0u, coefficients, derivatives, coefficients,
+                  coefficients);
+          };
+    //! Whether the fluid system gives the derivatives in the state variables
+    //! of the flash: pressure [and temperature].
+    static constexpr bool hasFugacityStateDerivatives_
+        = isThermal ? hasFugacityTemperatureDerivatives_ : hasFugacityPressureDerivatives_;
 
     /*!
      * \brief Solves \f$(H + s\,\mathrm{diag}(d))\,\Delta = r\f$ for the
@@ -2302,11 +2316,12 @@ protected:
      *        (\delta_{ij} + w_i\, \partial \ln\phi_i / \partial w_j)\f$
      *        for the mole fractions \f$\mathbf w\f$ of phase \f$\alpha\f$.
      *
-     * With \p fugacity_state, for an isothermal flash with both phases at one
-     * pressure and a fluid system that gives the pressure derivatives of
-     * \f$\ln\phi\f$, also the state column of fugacityDerivatives_(),
-     * \f$G = \partial ((f^L - f^V) / p) / \partial p\f$ with
-     * \f$\partial f_i / \partial p = w_i \phi_i (1 + p\, \partial \ln\phi_i / \partial p)\f$.
+     * With \p fugacity_state, for both phases at one pressure and a fluid
+     * system that gives the pressure [and temperature] derivatives of
+     * \f$\ln\phi\f$, also the state columns of fugacityDerivatives_(),
+     * \f$G = \partial ((f^L - f^V) / p) / \partial (p, T)\f$ with
+     * \f$\partial f_i / \partial p = w_i \phi_i (1 + p\, \partial \ln\phi_i / \partial p)\f$
+     * and \f$\partial f_i / \partial T = w_i \phi_i\, p\, \partial \ln\phi_i / \partial T\f$.
      */
     template <typename FlashFluidStateScalar>
     static void analyticFugacityJacobians_(const FlashFluidStateScalar& fluid_state_scalar,
@@ -2339,11 +2354,19 @@ protected:
             Vector coefficients;
             Matrix derivatives;
             Vector pressure_derivatives;
-            if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+            [[maybe_unused]] Vector temperature_derivatives;
+            if constexpr (hasFugacityStateDerivatives_) {
                 if (fugacity_state) {
-                    FluidSystem::fugacityCoefficientsAndDerivatives(
-                        state, param_cache, phaseIdx, coefficients, derivatives,
-                        pressure_derivatives);
+                    if constexpr (isThermal) {
+                        FluidSystem::fugacityCoefficientsAndDerivatives(
+                            state, param_cache, phaseIdx, coefficients, derivatives,
+                            pressure_derivatives, temperature_derivatives);
+                    }
+                    else {
+                        FluidSystem::fugacityCoefficientsAndDerivatives(
+                            state, param_cache, phaseIdx, coefficients, derivatives,
+                            pressure_derivatives);
+                    }
                 }
                 else {
                     FluidSystem::fugacityCoefficientsAndDerivatives(
@@ -2365,13 +2388,20 @@ protected:
                 }
                 jacobian[i][i] += scaled;
             }
-            if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+            if constexpr (hasFugacityStateDerivatives_) {
                 if (fugacity_state) {
                     for (unsigned i = 0; i < numComponents; ++i) {
                         const Scalar w = state.moleFraction(phaseIdx, i);
                         const Scalar column = w * coefficients[i]
                             * (1.0 + pref * pressure_derivatives[i]) / pref;
                         (*fugacity_state)[i][0] = liquid ? column : (*fugacity_state)[i][0] - column;
+                        if constexpr (isThermal) {
+                            const Scalar temperature_column
+                                = w * coefficients[i] * temperature_derivatives[i];
+                            (*fugacity_state)[i][1] = liquid
+                                ? temperature_column
+                                : (*fugacity_state)[i][1] - temperature_column;
+                        }
                     }
                 }
             }
@@ -2382,7 +2412,7 @@ protected:
     template <typename FlashFluidStateScalar>
     static bool hasAnalyticStateColumn_(const FlashFluidStateScalar& fluid_state_scalar)
     {
-        if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+        if constexpr (hasFugacityStateDerivatives_) {
             return Opm::getValue(fluid_state_scalar.pressure(oilPhaseIdx))
                 == Opm::getValue(fluid_state_scalar.pressure(gasPhaseIdx));
         }
@@ -2610,7 +2640,7 @@ protected:
             // Newton assembled the fugacity rows of dF/du at this state; only
             // those of dF/ds remain.
             bool analytic_column = false;
-            if constexpr (hasFugacityPressureDerivatives_) {
+            if constexpr (hasFugacityStateDerivatives_) {
                 if (hasAnalyticStateColumn_(fluid_state_scalar)) {
                     ComponentMatrix unused_liquid;
                     ComponentMatrix unused_vapour;
