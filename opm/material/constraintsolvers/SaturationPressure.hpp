@@ -107,7 +107,7 @@ namespace Opm {
  * one pressure to the next, and brackets the sign change of \f$\ln S_Y\f$.
  * A failed scan does not establish that no root exists: near a critical point,
  * the two-phase interval can be narrower than the pressure sampling step. A
- * scan that has found no two-phase trial stops below 10^4 Pa (above 10^9 Pa
+ * scan that has found no two-phase trial stops below 10^2 Pa (above 10^9 Pa
  * for the lower dew point), so a boundary outside that window is not reported.
  * A damped Newton stationary solve completes fixed-pressure substitutions that
  * stall near criticality. During continuation, a failed trial point does not
@@ -295,7 +295,7 @@ private:
     // of a few pascal converge so slowly that each needs the full
     // substitution and a Newton completion: such mixtures cost a thousand
     // times a resolved one.
-    static constexpr Scalar minScanPressure_ = 1.0e4;
+    static constexpr Scalar minScanPressure_ = 1.0e2;
     static constexpr Scalar maxScanPressure_ = 1.0e9;
 
     // Rescale a composition to sum to one. The boundary residual is measured
