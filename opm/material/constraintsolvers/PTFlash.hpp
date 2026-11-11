@@ -462,15 +462,15 @@ protected:
             feed_state.setMoleFraction(oil, compIdx, z[compIdx]);
             feed_state.setMoleFraction(gas, compIdx, z[compIdx]);
         }
-        ParamCache oil_cache(eos_type);
-        ParamCache gas_cache(eos_type);
-        oil_cache.updatePhase(feed_state, oil);
-        gas_cache.updatePhase(feed_state, gas);
+        // One cache holds both phases, which share the pure-component parameters.
+        ParamCache feed_cache(eos_type);
+        feed_cache.updatePhase(feed_state, oil);
+        feed_cache.updatePhase(feed_state, gas);
 
         // A separate liquid root is far smaller than the vapour root; a single
         // root gives two equal volumes up to rounding.
-        const Scalar liquid_volume = Opm::getValue(oil_cache.molarVolume(oil));
-        const Scalar vapour_volume = Opm::getValue(gas_cache.molarVolume(gas));
+        const Scalar liquid_volume = Opm::getValue(feed_cache.molarVolume(oil));
+        const Scalar vapour_volume = Opm::getValue(feed_cache.molarVolume(gas));
         if (!(liquid_volume < (1.0 - 1e-6) * vapour_volume)) {
             return {oil, false, vapour_volume};
         }
@@ -488,7 +488,7 @@ protected:
             }
             return sum;
         };
-        const bool vapour_is_stable = sum_z_ln_phi(gas_cache, gas) < sum_z_ln_phi(oil_cache, oil);
+        const bool vapour_is_stable = sum_z_ln_phi(feed_cache, gas) < sum_z_ln_phi(feed_cache, oil);
         return {vapour_is_stable ? gas : oil, true, vapour_is_stable ? vapour_volume : liquid_volume};
     }
 
@@ -737,15 +737,16 @@ protected:
 
         // The reference phase is the feed on its stable root throughout: its
         // fugacity coefficients are evaluated once, not in every iteration.
+        // They are stored in the reference state, so the cache is free for
+        // the trial phase afterwards.
         {
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
             }
-            ParamCache reference_param_cache(eos_type);
-            reference_param_cache.updatePhase(reference_state, reference_phase_idx);
+            trial_param_cache.updatePhase(reference_state, reference_phase_idx);
             std::array<FlashEval, numComponents> reference_fugacity_coefficients;
             CubicEOS::computeFugacityCoefficients(reference_state,
-                                                  reference_param_cache,
+                                                  trial_param_cache,
                                                   reference_phase_idx,
                                                   reference_fugacity_coefficients);
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
