@@ -44,6 +44,32 @@
 namespace Opm
 {
 
+namespace detail {
+//! The pure-component parameters of the last updatePure() on this thread
+//! that computed them, for one scalar type and fluid system.
+template <class Scalar, class FluidSystem>
+struct CubicEOSPureMemo
+{
+    static constexpr unsigned numComponents = FluidSystem::numComponents;
+
+    bool valid = false;
+    unsigned generation = 0;
+    CompositionalConfig::EOSType eosType{};
+    Scalar temperature{};
+    Scalar pressure{};
+    std::array<Scalar, numComponents> Ai{};
+    std::array<Scalar, numComponents> Bi{};
+    std::array<std::array<Scalar, numComponents>, numComponents> aCache{};
+    std::array<Scalar, numComponents> translation{};
+
+    static CubicEOSPureMemo& get()
+    {
+        static thread_local CubicEOSPureMemo memo;
+        return memo;
+    }
+};
+} // namespace detail
+
 template <class Scalar, class FluidSystem, unsigned phaseIdx>
 class CubicEOSParams
 {
@@ -83,6 +109,27 @@ public:
             return;
         }
         pureUpToDate_ = false;
+
+        // The parameter caches of one flash, and of the phases of a cache,
+        // share the temperature and pressure: the last computation on this
+        // thread holds them if the fluid system has not changed since.
+        using Memo = detail::CubicEOSPureMemo<Scalar, FluidSystem>;
+        constexpr bool hasGeneration = requires { FluidSystem::parameterGeneration(); };
+        if constexpr (hasGeneration) {
+            const Memo& memo = Memo::get();
+            if (memo.valid && memo.generation == FluidSystem::parameterGeneration()
+                && memo.eosType == EosType_ && memo.temperature == temperature
+                && memo.pressure == pressure) {
+                Ai_ = memo.Ai;
+                Bi_ = memo.Bi;
+                aCache_ = memo.aCache;
+                translation_ = memo.translation;
+                pureTemperature_ = temperature;
+                purePressure_ = pressure;
+                pureUpToDate_ = true;
+                return;
+            }
+        }
 
         // calculate Ai and Bi
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -130,6 +177,19 @@ public:
         pureTemperature_ = temperature;
         purePressure_ = pressure;
         pureUpToDate_ = true;
+
+        if constexpr (hasGeneration) {
+            Memo& memo = Memo::get();
+            memo.valid = true;
+            memo.generation = FluidSystem::parameterGeneration();
+            memo.eosType = EosType_;
+            memo.temperature = temperature;
+            memo.pressure = pressure;
+            memo.Ai = Ai_;
+            memo.Bi = Bi_;
+            memo.aCache = aCache_;
+            memo.translation = translation_;
+        }
     }
 
     /*!

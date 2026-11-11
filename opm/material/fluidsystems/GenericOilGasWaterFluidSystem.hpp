@@ -143,6 +143,7 @@ namespace Opm {
             // Check if the current size is less than the maximum allowed components.
             if (component_param_.size() < numComponents) {
                 component_param_.push_back(param);
+                ++parameter_generation_;
             } else {
                 // Adding another component would exceed the limit.
                 throw std::runtime_error {
@@ -176,6 +177,17 @@ namespace Opm {
                 };
             }
             interaction_coefficients_ = std::move(bic);
+            ++parameter_generation_;
+        }
+
+        /*!
+         * \brief A number that changes whenever a component parameter or an
+         *        interaction coefficient changes, so that values derived from
+         *        them can be kept between calls (see CubicEOSParams::updatePure()).
+         */
+        static unsigned parameterGeneration()
+        {
+            return parameter_generation_;
         }
 
         /*!
@@ -243,6 +255,7 @@ namespace Opm {
 
             const auto& lbc = comp_config.lbcCoefficients();
             std::ranges::copy(lbc, lbc_coefficients_.begin());
+            ++parameter_generation_;
 
             // Init. water pvt from deck
             waterPvt_->initFromState(eclState, schedule);
@@ -258,6 +271,7 @@ namespace Opm {
             component_param_.reserve(numComponents);
             interaction_coefficients_.clear();
             lbc_coefficients_ = ViscosityModel::defaultLBCCoefficients();
+            ++parameter_generation_;
         }
 
         /*!
@@ -727,6 +741,7 @@ namespace Opm {
         static std::vector<Scalar> interaction_coefficients_;
         static std::array<Scalar, 5> lbc_coefficients_;
         static std::shared_ptr<WaterPvt> waterPvt_;
+        static inline unsigned parameter_generation_ = 0;
 
     public:
         static std::string printComponentParams() {
