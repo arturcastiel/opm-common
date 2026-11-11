@@ -328,6 +328,9 @@ protected:
      *   tol=<r>  Accept a prediction whose residual is below r instead of the
      *            flash tolerance: approximate when r is larger.
      *   report   Print the tallies of each thread's tables when it exits.
+     *   slots=<b> 2^b slots per table (default 14).
+     *   count    Only the tallies (with report): incoming L outside [0, 1]
+     *            (no previous answer), exactly 0 or 1, or inside (0, 1).
      *
      * The flash API carries only K and L between calls, so the remembered
      * answers live in per-thread, direct-mapped tables of each flash class,
@@ -343,8 +346,10 @@ protected:
         bool reuse = false;
         bool memo = false;
         bool report = false;
+        bool count = false;
         Scalar tolerance = 0.; // 0: the flash tolerance
         Scalar maxLnKStep = 1.; // larger predicted changes of a ln K are not trusted
+        int slotBits = 14;
     };
 
     static const PredictSettings& predictSettings_()
@@ -373,15 +378,21 @@ protected:
                 else if (token == "report") {
                     result.report = true;
                 }
+                else if (token == "count") {
+                    result.count = true;
+                }
                 else if (token.rfind("tol=", 0) == 0) {
                     result.tolerance = std::stod(token.substr(4));
                 }
                 else if (token.rfind("maxstep=", 0) == 0) {
                     result.maxLnKStep = std::stod(token.substr(8));
                 }
+                else if (token.rfind("slots=", 0) == 0) {
+                    result.slotBits = std::clamp(std::stoi(token.substr(6)), 4, 24);
+                }
                 start = end + 1;
             }
-            result.enabled = result.predict || result.memo;
+            result.enabled = result.predict || result.memo || result.count;
             return result;
         }();
         return settings;
@@ -424,7 +435,10 @@ protected:
         Sensitivity sensitivity; // of a two-phase answer
     };
 
-    static constexpr std::size_t recordSlots = std::size_t{1} << 14;
+    static std::size_t recordSlots_()
+    {
+        return std::size_t{1} << predictSettings_().slotBits;
+    }
 
     struct PredictMemory
     {
@@ -438,13 +452,16 @@ protected:
         long accepted = 0;
         long outside = 0;
         long memo_hits = 0;
+        long no_answer_in = 0;
+        long single_phase_in = 0;
+        long split_in = 0;
         //! Checked predictions by decade of their residual: [0] below 1e-13,
         //! [k] in [1e-14 + k), [15] from 10 up.
         std::array<long, 16> residuals{};
 
         PredictMemory()
-            : splits(predictSettings_().predict ? recordSlots : 0)
-            , memo(predictSettings_().memo ? recordSlots : 0)
+            : splits(predictSettings_().predict ? recordSlots_() : 0)
+            , memo(predictSettings_().memo ? recordSlots_() : 0)
         {}
 
         ~PredictMemory()
@@ -453,11 +470,13 @@ protected:
                 return;
             }
             std::fprintf(stderr,
-                         "PREDICT components %d thermal %d: flashes %ld two-phase warm starts %ld "
+                         "PREDICT components %d thermal %d: flashes %ld incoming L outside [0,1] %ld "
+                         "L = 0 or 1 %ld L in (0,1) %ld | two-phase warm starts %ld "
                          "remembered %ld zero steps %ld accepted %ld outside %ld memo hits %ld | "
                          "residual decades from 1e-13:",
-                         numComponents, static_cast<int>(isThermal), flashes, warm, found,
-                         zero_steps, accepted, outside, memo_hits);
+                         numComponents, static_cast<int>(isThermal), flashes, no_answer_in,
+                         single_phase_in, split_in, warm, found, zero_steps, accepted, outside,
+                         memo_hits);
             for (const long count : residuals) {
                 std::fprintf(stderr, " %ld", count);
             }
@@ -508,7 +527,7 @@ protected:
             hash *= 0xff51afd7ed558ccdULL;
             hash ^= hash >> 33;
         }
-        return static_cast<std::size_t>(hash) & (recordSlots - 1);
+        return static_cast<std::size_t>(hash) & (recordSlots_() - 1);
     }
 
     template <std::size_t size>
@@ -678,6 +697,16 @@ protected:
                 }
             }
         };
+
+        if (input[3] > 0. && input[3] < 1.) {
+            ++memory.split_in;
+        }
+        else if (input[3] == 0. || input[3] == 1.) {
+            ++memory.single_phase_in;
+        }
+        else {
+            ++memory.no_answer_in;
+        }
 
         // 1. The memo of bitwise-repeated inputs.
         MemoRecord* memo_record = nullptr;
