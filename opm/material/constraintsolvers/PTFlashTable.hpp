@@ -57,8 +57,8 @@
  * over the whole cell, and Rachford-Rice at the state's own composition
  * places the boundary inside it.
  *
- * The table is thread-local and is cleared when the fluid system parameters,
- * the equation of state, the method or the tolerance change.
+ * The table is thread-local and is cleared when the fluid system parameters
+ * or the equation of state change.
  */
 #ifndef OPM_PTFLASH_TABLE_HPP
 #define OPM_PTFLASH_TABLE_HPP
@@ -291,8 +291,16 @@ public:
         return building_;
     }
 
-    //! A cheap hash of everything a vertex flash depends on but the state.
-    static std::uint64_t fingerprint(int eos, int method, Scalar tolerance)
+    /*!
+     * \brief A cheap hash of the fluid a vertex flash depends on: the
+     *        equation of state and the component parameters.
+     *
+     * Not the method or the tolerance of the call: the table gives starts
+     * and phase states, and every answer is converged by the caller's
+     * method. A simulator that flashes its cells and its wells with
+     * different methods keeps one table.
+     */
+    static std::uint64_t fingerprint(int eos)
     {
         std::uint64_t h = 0x9e3779b97f4a7c15ull;
         const auto mix = [&h](Scalar v) {
@@ -302,8 +310,6 @@ public:
             h = mix64(h ^ bits);
         };
         mix(eos);
-        mix(method);
-        mix(tolerance);
         for (int i = 0; i < numComponents; ++i) {
             mix(FluidSystem::criticalTemperature(i));
             mix(FluidSystem::criticalPressure(i));

@@ -235,11 +235,10 @@ public:
             return std::nullopt;
         }
         auto& table = FlashTable::get();
-        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type),
-                                              static_cast<int>(twoPhaseMethod), flash_tolerance),
+        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type)),
                       z);
         const auto vertex_flash = [&](Scalar p, Scalar T, const auto& zv) {
-            return vertexFlash_(p, T, zv, twoPhaseMethod, flash_tolerance, eos_type);
+            return vertexFlash_(p, T, zv, PTFlashMethod::SsiNewton, flash_tolerance, eos_type);
         };
         return table.temperature(pressure, temperature, z, hSpec, tMin, tMax, enthalpyKey,
                                  vertex_flash, enthalpy);
@@ -658,8 +657,7 @@ protected:
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             z_scalar[compIdx] = fluid_state.moleFraction(compIdx);
         }
-        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type),
-                                              static_cast<int>(twoPhaseMethod), flash_tolerance),
+        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type)),
                       z_scalar);
         typename FlashTable::Location location;
         if (!table.locate(fluid_state.pressure(oilPhaseIdx), fluid_state.temperature(0), z_scalar,
@@ -667,7 +665,7 @@ protected:
             return std::nullopt;
         }
         const auto vertex_flash = [&](Scalar p, Scalar T, const auto& z) {
-            return vertexFlash_(p, T, z, twoPhaseMethod, flash_tolerance, eos_type);
+            return vertexFlash_(p, T, z, PTFlashMethod::SsiNewton, flash_tolerance, eos_type);
         };
         const auto negative_flash = [&](Scalar p, Scalar T, const auto& z, const auto& seed_ln_K,
                                         Scalar& L, auto& vertex_ln_K) {
@@ -934,7 +932,8 @@ protected:
         return std::isfinite(residual) ? residual : std::numeric_limits<Scalar>::infinity();
     }
 
-    //! A table vertex: the flash without the table from Wilson K at (p, T, z).
+    //! A table vertex: the flash without the table from Wilson K at (p, T, z),
+    //! by substitution and Newton whatever the method of the call.
     template <class Composition>
     static typename FlashTable::Vertex vertexFlash_(Scalar p, Scalar T, const Composition& z,
                                                     PTFlashMethod twoPhaseMethod,
