@@ -243,7 +243,28 @@ struct PHFlash {
             return r;
         };
 
-        const auto bracket = findBracket(evaluate, tLo, tHi, cfg, verbosity);
+        // A flashing search with the built-in provider starts from the
+        // incoming temperature, which a simulator changes little between
+        // iterations and time steps, and from the incoming equilibrium
+        // ratios of a two-phase state (K only, rule 1 of WarmStart). Where
+        // no bracket is found next to it, the whole interval is searched.
+        std::optional<Bracket> bracket;
+        const Scalar incoming = getValue(fluidState.temperature(0));
+        if (builtInProvider && !searchWithoutFlash && incoming > tLo && incoming < tHi) {
+            warmStart.storeIncoming(fluidState, incoming);
+            auto idealGasCp = [&](const Scalar T) {
+                Scalar cp = 0.0;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    cp += getValue(fluidState.moleFraction(compIdx))
+                          * cfg.cpTable[compIdx].heatCapacity(T);
+                }
+                return cp;
+            };
+            bracket = localBracket(evaluate, incoming, tLo, tHi, idealGasCp, cfg);
+        }
+        if (!bracket) {
+            bracket = findBracket(evaluate, tLo, tHi, cfg, verbosity);
+        }
         if (!bracket) {
             return false;
         }
@@ -346,6 +367,20 @@ private:
             }
         }
 
+        //! Cache the equilibrium ratios a two-phase incoming state carries
+        //! (L in (0, 1), every K positive and finite) for a flash at T.
+        template <class FluidState>
+        void storeIncoming(const FluidState& fluidState, const Scalar T)
+        {
+            const Scalar L = getValue(fluidState.L());
+            valid = L > 0.0 && L < 1.0;
+            for (int compIdx = 0; valid && compIdx < numComponents; ++compIdx) {
+                K[compIdx] = getValue(fluidState.K(compIdx));
+                valid = K[compIdx] > 0.0 && std::isfinite(K[compIdx]);
+            }
+            temperature = T;
+        }
+
         void drop()
         {
             valid = false;
@@ -418,6 +453,75 @@ private:
         catch (const std::runtime_error&) {
         }
         catch (const Dune::FMatrixError&) {
+        }
+        return std::nullopt;
+    }
+
+    //! Limit on the evaluations of one localBracket() call.
+    static constexpr int maxLocalSteps = 8;
+
+    /*!
+     * \brief A bracket of the root of r(T) next to the start temperature t0.
+     *
+     * The search steps from t0 toward the root (H increases with T, so down
+     * where r > 0). The first step is twice the Newton step with the
+     * ideal-gas heat capacity of the feed, which the departure enthalpy and
+     * the latent heat of a two-phase state only make larger than the true
+     * slope, so that it usually overshoots the root by a little; each further
+     * step is four times the previous one, up to the end of the interval.
+     *
+     * \param idealGasCp sum_i z_i cp_i(T) [J/(mol K)]
+     * \return the bracket, or nothing where a trial cannot be evaluated or
+     *         the end of the interval is reached without a sign change; the
+     *         caller then searches the whole interval
+     */
+    template <class Evaluate, class Cp>
+    static std::optional<Bracket> localBracket(const Evaluate& evaluate,
+                                               const Scalar t0,
+                                               const Scalar tLo,
+                                               const Scalar tHi,
+                                               const Cp& idealGasCp,
+                                               const Config& cfg)
+    {
+        const auto r0 = evaluate(t0);
+        if (!r0) {
+            return std::nullopt;
+        }
+        Trial s{t0, *r0};
+        if (s.residual == 0.0) {
+            return Bracket{s, s};
+        }
+        const Scalar direction = s.residual > 0.0 ? -1.0 : 1.0;
+        const Scalar end = direction > 0.0 ? tHi : tLo;
+        const Scalar cp = idealGasCp(t0);
+        Scalar step = cp > 0.0 && std::isfinite(cp) ? Scalar(2.0) * std::abs(s.residual) / cp
+                                                    : Scalar(1.0);
+        step = std::max(step, Scalar(10.0) * cfg.temperatureTolerance);
+        for (int i = 0; i < maxLocalSteps; ++i) {
+            const bool last = !(direction * (end - s.temperature) > step);
+            const Scalar t = last ? end : s.temperature + direction * step;
+            const auto rt = evaluate(t);
+            if (!rt) {
+                return std::nullopt;
+            }
+            const Trial trial{t, *rt};
+            if (trial.residual == 0.0 || (trial.residual < 0.0) != (s.residual < 0.0)) {
+                return s.temperature < t ? Bracket{s, trial} : Bracket{trial, s};
+            }
+            if (last) {
+                // A root on the end itself can show a residual of either
+                // sign: accept the end if the secant through the last two
+                // trials places the root within the tolerance beyond it.
+                if (trial.residual != s.residual
+                    && std::abs(trial.residual * (trial.temperature - s.temperature)
+                                / (trial.residual - s.residual)) <= cfg.temperatureTolerance)
+                {
+                    return Bracket{trial, trial};
+                }
+                return std::nullopt;
+            }
+            s = trial;
+            step *= Scalar(4.0);
         }
         return std::nullopt;
     }
