@@ -494,10 +494,41 @@ namespace Opm {
 
             const auto fugCoeff =
                 CubicEOS::computeFugacityCoefficient(fluidState, paramCache, phaseIdx, compIdx);
-            const auto translation =
-                exp(-volumeShift(compIdx) * paramCache.Bi(phaseIdx, compIdx));
+            // exp(-s_c B_c), computed with B_c by the parameter cache.
+            const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
 
             return decay<LhsEval>(fugCoeff * translation);
+        }
+
+        /*!
+         * \brief The fugacity coefficients of all components in a phase,
+         *        fugacityCoefficient() of each component with the terms the
+         *        components share evaluated once.
+         *
+         * \param fugCoeffs Receives the coefficient of component i at index i.
+         */
+        template <class FluidState, class Coefficients, class ParamCacheEval>
+        static void fugacityCoefficients(const FluidState& fluidState,
+                                         const ParameterCache<ParamCacheEval>& paramCache,
+                                         unsigned phaseIdx,
+                                         Coefficients& fugCoeffs)
+        {
+            using LhsEval = typename FluidState::ValueType;
+            if (waterEnabled && phaseIdx == static_cast<unsigned int>(waterPhaseIdx)) {
+                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    fugCoeffs[compIdx] = LhsEval(0.0);
+                }
+                return;
+            }
+
+            assert(isConsistent());
+            assert(phaseIdx < numPhases);
+
+            CubicEOS::computeFugacityCoefficients(fluidState, paramCache, phaseIdx, fugCoeffs);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
+                fugCoeffs[compIdx] = decay<LhsEval>(fugCoeffs[compIdx] * translation);
+            }
         }
 
         // TODO: the following interfaces are needed by function checkFluidSystem()

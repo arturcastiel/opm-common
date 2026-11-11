@@ -179,6 +179,22 @@ public:
         };
     }
 
+    /*!
+     * \brief The volume translation factor \f$\exp(-s_i B_i)\f$ of a
+     *        component's fugacity coefficient in a phase.
+     */
+    Scalar volumeTranslationFactor(unsigned phaseIdx, unsigned compIdx) const
+    {
+        switch (phaseIdx)
+        {
+        case oilPhaseIdx: return oilPhaseParams_.volumeTranslationFactor(compIdx);
+        case gasPhaseIdx: return gasPhaseParams_.volumeTranslationFactor(compIdx);
+        default:
+            throw std::logic_error("The volume translation factor is only defined for "
+                                   "oil and gas phases");
+        };
+    }
+
     Scalar m1(unsigned phaseIdx) const
     {
         switch (phaseIdx)
@@ -332,10 +348,19 @@ protected:
         Scalar T = decay<Scalar>(fluidState.temperature(phaseIdx));
         Scalar p = decay<Scalar>(fluidState.pressure(phaseIdx));
 
+        // The other phase may hold them already.
         switch (phaseIdx)
         {
-        case oilPhaseIdx: oilPhaseParams_.updatePure(T, p); break;
-        case gasPhaseIdx: gasPhaseParams_.updatePure(T, p); break;
+        case oilPhaseIdx:
+            if (!oilPhaseParams_.takePure(gasPhaseParams_, T, p)) {
+                oilPhaseParams_.updatePure(T, p);
+            }
+            break;
+        case gasPhaseIdx:
+            if (!gasPhaseParams_.takePure(oilPhaseParams_, T, p)) {
+                gasPhaseParams_.updatePure(T, p);
+            }
+            break;
         }
     }
 
@@ -414,6 +439,10 @@ protected:
             const Scalar RT_p = Constants<Scalar>::R * T / p;
 
             for (unsigned compIdx = 0; compIdx < FluidSystem::numComponents; ++compIdx) {
+                // A component without a shift adds nothing.
+                if (FluidSystem::volumeShift(compIdx) == 0) {
+                    continue;
+                }
                 const Scalar b = decay<Scalar>(Bi(phaseIdx, compIdx)) * RT_p;
                 shift += decay<Scalar>(fluidState.moleFraction(phaseIdx, compIdx))
                        * FluidSystem::volumeShift(compIdx) * b;

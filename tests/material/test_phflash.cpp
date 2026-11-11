@@ -744,3 +744,75 @@ BOOST_AUTO_TEST_CASE(EnthalpyStepReturnsFalse)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(IncomingState)
+
+namespace {
+
+// The temperature recovered with the eos_departure model from an incoming
+// state at start [K]; a start outside the interval runs the search over the
+// whole interval.
+double recoverFromF1(const double start, const double hSpec)
+{
+    auto fs = makeInitialState<FluidSystemF1, EvaluationF1>(f1Pressure, start, f1Z);
+    const bool ok = PhFlashF1::solve(fs, hSpec, makeConfigF1(EnthalpyModel::eos_departure),
+                                     PTFlashMethod::SsiNewton, ptTolerance, EOSType::PR);
+    BOOST_REQUIRE_MESSAGE(ok, "PHFlash found no solution from " << start << " K");
+    return Opm::getValue(fs.temperature(0));
+}
+
+constexpr double incomingTolerance = 1e-5; // [K]
+
+} // anonymous namespace
+
+BOOST_AUTO_TEST_CASE(NewtonFromIncomingMatchesIntervalSearch)
+{
+    // From incoming temperatures 1 K and 20 K off on either side, the Newton
+    // search finds the root the search over the whole interval finds.
+    const auto cfg = makeConfigF1(EnthalpyModel::eos_departure);
+    for (const double Tstar : {280., 300., 340., 380., 450.}) {
+        const double hSpec = enthalpyF1(f1Pressure, Tstar, EnthalpyModel::eos_departure);
+        const double reference = recoverFromF1(cfg.tempMax + 100., hSpec);
+        BOOST_CHECK_SMALL(reference - Tstar, incomingTolerance);
+        for (const double offset : {-20., -1., 1., 20.}) {
+            const double T = recoverFromF1(Tstar + offset, hSpec);
+            BOOST_CHECK_MESSAGE(std::abs(T - reference) < incomingTolerance,
+                                "from " << Tstar + offset << " K: " << T << " K, the interval "
+                                << "search " << reference << " K");
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(TwoPhaseIncomingState)
+{
+    // An incoming two-phase split 2 K off seeds the search; the state is left
+    // flashed at the root with the split of the isothermal flash there.
+    const auto cfg = makeConfigF1(EnthalpyModel::eos_departure);
+    constexpr double Tstar = 320.;
+    FlashCase<numComponentsF1> probe{"incoming split", f1Pressure, Tstar, f1Z};
+    const auto outcome = runFlash<FluidSystemF1, EvaluationF1>(probe);
+    BOOST_REQUIRE(!outcome.summary.single_phase);
+    const double hSpec = EnthalpyF1::mixtureEnthalpy(outcome.state, cfg.cpTable, EOSType::PR,
+                                                     cfg.model);
+
+    auto fs = makeInitialState<FluidSystemF1, EvaluationF1>(f1Pressure, Tstar + 2., f1Z);
+    for (int compIdx = 0; compIdx < numComponentsF1; ++compIdx) {
+        fs.setKvalue(compIdx, outcome.summary.y[compIdx] / outcome.summary.x[compIdx]);
+    }
+    fs.setLvalue(outcome.summary.L);
+    BOOST_REQUIRE(PhFlashF1::solve(fs, hSpec, cfg, PTFlashMethod::SsiNewton, ptTolerance,
+                                   EOSType::PR));
+    BOOST_CHECK_SMALL(Opm::getValue(fs.temperature(0)) - Tstar, incomingTolerance);
+    BOOST_CHECK_SMALL(Opm::getValue(fs.L()) - outcome.summary.L, 1e-6);
+}
+
+BOOST_AUTO_TEST_CASE(RootOnIntervalEnd)
+{
+    // The root is the cold end of the interval itself, where the residual
+    // can show either sign: it is found from 1 K above.
+    const auto cfg = makeConfigF1(EnthalpyModel::eos_departure);
+    const double hSpec = enthalpyF1(f1Pressure, cfg.tempMin, EnthalpyModel::eos_departure);
+    BOOST_CHECK_SMALL(recoverFromF1(cfg.tempMin + 1., hSpec) - cfg.tempMin, incomingTolerance);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
