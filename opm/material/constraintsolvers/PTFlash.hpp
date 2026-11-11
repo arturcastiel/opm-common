@@ -108,6 +108,11 @@ class PTFlash
     static constexpr int substitutionStepsBeforeNewton = 5;
     static constexpr int maxHybridSubstitutionSteps = 20;
     static constexpr Scalar maxPredictedSubstitutionSteps = 8;
+    // Plain substitution steps of a stability trial between two
+    // extrapolations, and the largest change of a ln K that one extrapolation
+    // may make, see checkStability_().
+    static constexpr int stabilityAccelerationInterval = 5;
+    static constexpr Scalar maxStabilityExtrapolation = 1.0;
 
 public:
     /*!
@@ -720,6 +725,28 @@ protected:
      * composition is \f$-\ln S\f$, so a trial that ends with \f$S > 1\f$
      * establishes that the mixture is unstable.
      *
+     * Both trials iterate \f$\ln W_i \leftarrow d_i - \ln\varphi_i(\mathbf W / S)\f$
+     * with \f$d_i = \ln z_i + \ln\varphi_i(\mathbf z)\f$, a descent method for
+     * the modified tangent-plane distance
+     *
+     * \f[ tm(\mathbf W) = 1 + \sum_i W_i \big(\ln W_i + \ln\varphi_i - d_i - 1\big)
+     *                   = 1 - S \mp \sum_i W_i \ln R_i \f]
+     *
+     * (upper sign vapour), whose stationary points are those of the trial
+     * (Michelsen, Fluid Phase Equilib. 9 (1982) 1-19). Near a critical point
+     * or the stability limit the steps in \f$\ln K\f$ shrink by a factor close
+     * to one and plain substitution takes hundreds of steps. Every
+     * stabilityAccelerationInterval plain steps the remaining steps are
+     * therefore summed from the last three, as in extrapolateSubstitution_(),
+     * and the extrapolated ratios are kept only if they lower \f$tm\f$ below
+     * its value at the last evaluated ratios; otherwise the iteration
+     * continues from the plain step. An extrapolation is shortened to change
+     * no \f$\ln K_i\f$ by more than maxStabilityExtrapolation: where a fugacity
+     * coefficient is clamped the identity above no longer holds, and a far
+     * extrapolation could then lower \f$tm\f$ without approaching a
+     * stationary point. The stationary points, the convergence
+     * and trivial-solution tests are those of plain substitution.
+     *
      * \param fluid_state The mixture at the pressure and temperature of the flash.
      * \param[out] isTrivial Whether the trial collapsed onto the mixture.
      * \param[in,out] K Starting ratios in, the trial's converged ratios out.
@@ -792,6 +819,14 @@ protected:
                     reference_phase_idx, compIdx, reference_fugacity_coefficients[compIdx]);
             }
         }
+        // The last three plain steps in ln K, newest first, and the plain
+        // point to return to when an extrapolation does not lower tm.
+        using FieldType = typename ComponentVector::field_type;
+        std::array<ComponentVector, 3> steps{};
+        int plain_steps = 0;
+        bool extrapolated = false;
+        ComponentVector plain_K = K;
+        FieldType tm_before = 0.;
 
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
@@ -836,6 +871,27 @@ protected:
                     : trial_fugacity / reference_fugacity * trial_sum;
             }
 
+            // The plain steps in ln K and the modified tangent-plane distance.
+            ComponentVector step(0.);
+            FieldType tm = 1. - trial_sum;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                if (!(Opm::getValue(z[compIdx]) > 0.)) {
+                    continue;
+                }
+                step[compIdx] = log(substitution_factor[compIdx]);
+                const FieldType mole_number = trial_sum * trial_composition[compIdx];
+                tm += is_vapour_trial ? -mole_number * step[compIdx] : mole_number * step[compIdx];
+            }
+            if (extrapolated) {
+                extrapolated = false;
+                if (!(tm < tm_before) || !std::isfinite(Opm::getValue(tm))) {
+                    // Continue from the plain step instead.
+                    K = plain_K;
+                    plain_steps = 0;
+                    continue;
+                }
+            }
+
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 K[compIdx] *= substitution_factor[compIdx];
             }
@@ -860,8 +916,23 @@ protected:
             if (isTrivial || substitution_residual < substitutionTolerance) {
                 return;
             }
-            //todo: make sure that no mole fraction is smaller than 1e-8 ?
-            //todo: take care of water!
+
+            steps = {step, steps[0], steps[1]};
+            ++plain_steps;
+            ComponentVector extrapolation;
+            if (plain_steps >= stabilityAccelerationInterval
+                && extrapolateSubstitution_(steps, extrapolation)) {
+                plain_K = K;
+                tm_before = tm;
+                const FieldType largest = extrapolation.infinity_norm();
+                const FieldType shortening = largest > maxStabilityExtrapolation
+                    ? maxStabilityExtrapolation / largest : FieldType{1.};
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    K[compIdx] *= exp(shortening * extrapolation[compIdx]);
+                }
+                extrapolated = true;
+                plain_steps = 0;
+            }
         }
         OPM_THROW_NOLOG(NumericalProblem, " Stability test did not converge");
     }//end checkStability
