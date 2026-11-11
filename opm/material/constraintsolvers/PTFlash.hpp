@@ -255,6 +255,9 @@ protected:
             z_scalar[compIdx] = fluid_state.moleFraction(compIdx);
         }
 
+        // The stable cubic root of the feed, from the last stability test.
+        std::optional<FeedRoot> feed_root;
+
         // Here, a cold start means there is no usable previous two-phase split
         // (L is outside (0, 1)); a warm start reuses previous K and L values.
         const bool is_cold_start = L_scalar <= 0 || L_scalar >= 1;
@@ -262,7 +265,7 @@ protected:
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
-            phaseStabilityTest_(
+            feed_root = phaseStabilityTest_(
                 is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
         }
         if (verbosity >= 1) {
@@ -336,7 +339,7 @@ protected:
                 for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
                     K_scalar[compIdx] = fluid_state.wilsonK_(compIdx);
                 }
-                phaseStabilityTest_(
+                feed_root = phaseStabilityTest_(
                     is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
                 if (!is_single_phase) {
                     OPM_FLASH_COUNT(splitRetries);
@@ -369,8 +372,12 @@ protected:
                 // by the root with the lower Gibbs energy. A single root larger
                 // than the pseudo-critical volume of the feed is a vapour; a
                 // smaller one is labelled by Li's correlation.
-                const auto [stable_phase_idx, has_two_roots, molar_volume]
-                    = feedStableRoot_(fluid_state, z_scalar, eos_type);
+                // A stable mixture comes from a stability test, which has
+                // already found the stable root of the feed.
+                if (!feed_root) {
+                    feed_root = feedStableRoot_(fluid_state, z_scalar, eos_type);
+                }
+                const auto [stable_phase_idx, has_two_roots, molar_volume] = *feed_root;
                 if (has_two_roots) {
                     L_scalar = stable_phase_idx == static_cast<int>(oilPhaseIdx) ? 1.0 : 0.0;
                     if (verbosity >= 1) {
@@ -417,6 +424,10 @@ protected:
      * fugacity coefficients on it are clamped to their maximum, so it is never
      * the stable one. With a single root both labels give the same root.
      *
+     * \param[out] stable_root_fugacity If given, the fugacities
+     *        \f$f_i(\mathbf z)\f$ of the feed on its stable root, the
+     *        reference of the stability trials.
+     *
      * \return the phase index of the stable root, whether the cubic has a
      *         separate liquid and vapour root, and the molar volume of the
      *         stable root
@@ -424,7 +435,8 @@ protected:
     template <class FlashFluidState, class ComponentVector>
     static FeedRoot feedStableRoot_(const FlashFluidState& fluid_state,
                                     const ComponentVector& z,
-                                    const EOSType& eos_type)
+                                    const EOSType& eos_type,
+                                    ComponentVector* stable_root_fugacity = nullptr)
     {
         using FlashEval = typename FlashFluidState::ValueType;
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
@@ -442,11 +454,24 @@ protected:
         oil_cache.updatePhase(feed_state, oil);
         gas_cache.updatePhase(feed_state, gas);
 
+        const auto store_fugacity = [&](const ParamCache& cache, const int phase_idx) {
+            if (stable_root_fugacity == nullptr) {
+                return;
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                feed_state.setFugacityCoefficient(
+                    phase_idx, compIdx,
+                    CubicEOS::computeFugacityCoefficient(feed_state, cache, phase_idx, compIdx));
+                (*stable_root_fugacity)[compIdx] = feed_state.fugacity(phase_idx, compIdx);
+            }
+        };
+
         // A separate liquid root is far smaller than the vapour root; a single
         // root gives two equal volumes up to rounding.
         const Scalar liquid_volume = Opm::getValue(oil_cache.molarVolume(oil));
         const Scalar vapour_volume = Opm::getValue(gas_cache.molarVolume(gas));
         if (!(liquid_volume < (1.0 - 1e-6) * vapour_volume)) {
+            store_fugacity(oil_cache, oil);
             return {oil, false, vapour_volume};
         }
 
@@ -463,6 +488,7 @@ protected:
             return sum;
         };
         const bool vapour_is_stable = sum_z_ln_phi(gas_cache, gas) < sum_z_ln_phi(oil_cache, oil);
+        store_fugacity(vapour_is_stable ? gas_cache : oil_cache, vapour_is_stable ? gas : oil);
         return {vapour_is_stable ? gas : oil, true, vapour_is_stable ? vapour_volume : liquid_volume};
     }
 
@@ -553,9 +579,11 @@ protected:
      * \param z The mixture composition.
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
+     *
+     * \return The stable cubic root of the feed, see feedStableRoot_().
      */
     template <class FlashFluidState, class ComponentVector>
-    static void phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
+    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
     {
         OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
@@ -564,8 +592,10 @@ protected:
         ComponentVector vapour_trial_k = K;
         ComponentVector liquid_trial_k = K;
 
-        // Both trials are measured against the feed on its stable root.
-        const int reference_phase_idx = feedStableRoot_(fluid_state, z, eos_type).phase_idx;
+        // Both trials are measured against the feed on its stable root, whose
+        // fugacities do not change while the trials grow.
+        ComponentVector reference_fugacity;
+        const FeedRoot feed_root = feedStableRoot_(fluid_state, z, eos_type, &reference_fugacity);
 
         // Grow a vapour-like trial phase.
         if (verbosity == 3 || verbosity == 4) {
@@ -578,7 +608,7 @@ protected:
                         vapour_trial_sum,
                         z,
                         /*is_vapour_trial=*/true,
-                        reference_phase_idx,
+                        reference_fugacity,
                         eos_type,
                         verbosity);
         const bool vapour_trial_finds_no_instability
@@ -595,7 +625,7 @@ protected:
                         liquid_trial_sum,
                         z,
                         /*is_vapour_trial=*/false,
-                        reference_phase_idx,
+                        reference_fugacity,
                         eos_type,
                         verbosity);
         const bool liquid_trial_finds_no_instability
@@ -621,6 +651,7 @@ protected:
                 }
             }
         }
+        return feed_root;
     }
 
     template <class ComponentVector>
@@ -663,8 +694,8 @@ protected:
      * \param[out] trial_sum The mole number sum \f$S\f$ of the trial phase.
      * \param z The mixture composition.
      * \param is_vapour_trial Whether to grow a vapour-like or liquid-like trial.
-     * \param reference_phase_idx The phase index of the feed's stable root,
-     *        which supplies the reference fugacities.
+     * \param reference_fugacity The fugacities \f$f_i(\mathbf z)\f$ of the
+     *        feed on its stable root, see feedStableRoot_().
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
      */
@@ -676,7 +707,7 @@ protected:
                                 typename FlashFluidState::ValueType& trial_sum,
                                 const ComponentVector& z,
                                 bool is_vapour_trial,
-                                const int reference_phase_idx,
+                                const ComponentVector& reference_fugacity,
                                 const EOSType& eos_type,
                                 int verbosity)
     {
@@ -684,11 +715,9 @@ protected:
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
 
-        // The trial composition is evaluated on its candidate phase root. The
-        // feed composition supplies the reference fugacities on its stable
-        // root, the state whose tangent plane the trial is measured against.
+        // The trial composition is evaluated on its candidate phase root and
+        // measured against the tangent plane of the feed on its stable root.
         FlashFluidState trial_state = fluid_state;
-        FlashFluidState reference_state = fluid_state;
         const int trial_phase_idx
             = is_vapour_trial ? static_cast<int>(gasPhaseIdx) : static_cast<int>(oilPhaseIdx);
 
@@ -722,27 +751,15 @@ protected:
                 trial_state.setMoleFraction(trial_phase_idx, compIdx, trial_composition[compIdx]);
             }
 
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
-            }
-
             ParamCache trial_param_cache(eos_type);
             trial_param_cache.updatePhase(trial_state, trial_phase_idx);
 
-            ParamCache reference_param_cache(eos_type);
-            reference_param_cache.updatePhase(reference_state, reference_phase_idx);
-
-            // Fugacity coefficients of the trial phase and reference phase.
+            // Fugacity coefficients of the trial phase.
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 const auto trial_fugacity_coefficient = CubicEOS::computeFugacityCoefficient(
                     trial_state, trial_param_cache, trial_phase_idx, compIdx);
-                const auto reference_fugacity_coefficient = CubicEOS::computeFugacityCoefficient(
-                    reference_state, reference_param_cache, reference_phase_idx, compIdx);
-
                 trial_state.setFugacityCoefficient(
                     trial_phase_idx, compIdx, trial_fugacity_coefficient);
-                reference_state.setFugacityCoefficient(
-                    reference_phase_idx, compIdx, reference_fugacity_coefficient);
             }
 
             // The substitution factors R_i of the brief.
@@ -753,11 +770,9 @@ protected:
                     continue;
                 }
                 const auto trial_fugacity = trial_state.fugacity(trial_phase_idx, compIdx);
-                const auto reference_fugacity
-                    = reference_state.fugacity(reference_phase_idx, compIdx);
                 substitution_factor[compIdx] = is_vapour_trial
-                    ? reference_fugacity / trial_fugacity / trial_sum
-                    : trial_fugacity / reference_fugacity * trial_sum;
+                    ? reference_fugacity[compIdx] / trial_fugacity / trial_sum
+                    : trial_fugacity / reference_fugacity[compIdx] * trial_sum;
             }
 
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
