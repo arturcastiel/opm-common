@@ -69,7 +69,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -101,6 +103,11 @@ struct PTFlashTableSettings
     //! [0, 1] when every ln K is off by this much is single-phase without a
     //! stability test (not in the exact mode).
     double margin = 0.05;
+    //! The P-H flash starts its temperature search where the enthalpy of
+    //! the table's vertices matches: Never, Cold (a state without a phase
+    //! state from an earlier flash, L outside [0, 1]) or Always.
+    enum class EnthalpyStart { Never, Cold, Always };
+    EnthalpyStart enthalpyStart = EnthalpyStart::Never;
     //! Approximate mode: the largest |ln(f_L / f_V)| a two-phase answer may
     //! have; above it the split is converged from there. Zero: no test.
     double acceptance = 0.0;
@@ -113,7 +120,7 @@ struct PTFlashTableSettings
     //! OPM_FLASH_OBL = off | exact | approx, OPM_FLASH_OBL_N = intervals,
     //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_ACCEPT =
     //! acceptance, OPM_FLASH_OBL_STATS = 1, OPM_FLASH_OBL_NEGATIVE = 1,
-    //! OPM_FLASH_OBL_MARGIN = margin.
+    //! OPM_FLASH_OBL_MARGIN = margin, OPM_FLASH_OBL_PH = cold | always.
     static PTFlashTableSettings& get()
     {
         static PTFlashTableSettings settings = fromEnvironment();
@@ -158,6 +165,15 @@ struct PTFlashTableSettings
         }
         if (const char* margin = std::getenv("OPM_FLASH_OBL_MARGIN")) {
             settings.margin = std::atof(margin);
+        }
+        if (const char* start = std::getenv("OPM_FLASH_OBL_PH")) {
+            const std::string value(start);
+            if (value == "cold") {
+                settings.enthalpyStart = EnthalpyStart::Cold;
+            }
+            else if (value == "always") {
+                settings.enthalpyStart = EnthalpyStart::Always;
+            }
         }
         return settings;
     }
@@ -288,6 +304,8 @@ public:
         report();
         vertices_.clear();
         cells_.clear();
+        enthalpies_.clear();
+        enthalpyQueries_ = enthalpyStarts_ = 0;
         queries_ = hits_ = vertexFlashes_ = negativeFlashes_ = 0;
         outcomes_.fill(0);
         fingerprint_ = fingerprint;
@@ -575,6 +593,90 @@ public:
         return phase;
     }
 
+    /*!
+     * \brief A start for the temperature search of a P-H flash: where the
+     *        enthalpy of the vertices equals \p hSpec.
+     *
+     * At each temperature level of the lattice the enthalpy is interpolated
+     * multilinearly over the other axes (ln p and z) at the state, and
+     * between two levels linearly in T. The search begins at the levels
+     * around \p T0 and moves one level towards \p hSpec at a time, so only
+     * the vertices near the answer are flashed. A vertex enthalpy comes from
+     * \p enthalpy(p, T, z, vertex) and is kept for the rest of the run;
+     * \p enthalpyKey identifies the enthalpy model, a change empties them.
+     *
+     * \return nothing outside [tMin, tMax], where a vertex has no enthalpy,
+     *         or where the enthalpy does not increase between two levels
+     */
+    template <class Composition, class VertexFlash, class Enthalpy>
+    std::optional<Scalar> temperature(Scalar p, Scalar T0, const Composition& z, Scalar hSpec,
+                                      Scalar tMin, Scalar tMax, std::uint64_t enthalpyKey,
+                                      const VertexFlash& flash, const Enthalpy& enthalpy)
+    {
+        if (enthalpyKey != enthalpyKey_) {
+            enthalpies_.clear();
+            enthalpyKey_ = enthalpyKey;
+        }
+        Location location;
+        if (!locate(p, T0, z, location)) {
+            return std::nullopt;
+        }
+        ++enthalpyQueries_;
+        // The enthalpy at level j of the 1/T axis, over the other axes.
+        const auto level = [&](int j) -> std::optional<Scalar> {
+            Scalar h = 0.0;
+            for (int corner = 0; corner < numCorners / 2; ++corner) {
+                std::array<int, numAxes> index = location.index;
+                index[1] = j;
+                Scalar weight = 1.0;
+                for (int a = 0, bit = 0; a < numAxes; ++a) {
+                    if (a == 1) {
+                        continue;
+                    }
+                    const int upper = (corner >> bit++) & 1;
+                    index[a] += upper;
+                    weight *= upper ? location.fraction[a] : 1.0 - location.fraction[a];
+                }
+                if (weight == 0.0) {
+                    continue;
+                }
+                const Scalar hv = vertexEnthalpy(index, flash, enthalpy);
+                if (!std::isfinite(hv)) {
+                    return std::nullopt;
+                }
+                h += weight * hv;
+            }
+            return h;
+        };
+        const auto levelTemperature = [this](int j) { return 1.0 / (origin_[1] + j * step_[1]); };
+        // Level j is the warmer end of the interval, j + 1 the colder.
+        int j = location.index[1];
+        for (int move = 0; move < 2 * intervals_; ++move) {
+            const Scalar tWarm = levelTemperature(j);
+            const Scalar tCold = levelTemperature(j + 1);
+            if (!(tWarm > tMin && tCold < tMax)) {
+                return std::nullopt;
+            }
+            const auto hWarm = level(j);
+            const auto hCold = level(j + 1);
+            if (!hWarm || !hCold || !(*hWarm > *hCold)) {
+                return std::nullopt;
+            }
+            if (hSpec > *hWarm) {
+                --j;
+            }
+            else if (hSpec < *hCold) {
+                ++j;
+            }
+            else {
+                ++enthalpyStarts_;
+                const Scalar T = tCold + (hSpec - *hCold) / (*hWarm - *hCold) * (tWarm - tCold);
+                return std::clamp(T, tMin, tMax);
+            }
+        }
+        return std::nullopt;
+    }
+
     //! Counts what a query led to.
     void note(Outcome outcome)
     {
@@ -590,6 +692,12 @@ public:
     std::size_t vertices() const
     {
         return vertices_.size();
+    }
+
+    //! Starts for the P-H flash given, and asked for.
+    long enthalpyStarts() const
+    {
+        return enthalpyStarts_;
     }
 
     std::size_t cells() const
@@ -633,6 +741,10 @@ public:
                 std::cerr << ' ' << names[o] << ' ' << outcomes_[o];
             }
             std::cerr << std::endl;
+        }
+        if (enthalpyQueries_ > 0) {
+            std::cerr << "OBL-ENTHALPY queries " << enthalpyQueries_ << " starts " << enthalpyStarts_
+                      << " vertex-enthalpies " << enthalpies_.size() << std::endl;
         }
     }
 
@@ -725,6 +837,31 @@ private:
         return vertices_.emplace(key, v).first->second;
     }
 
+    //! The enthalpy of a vertex, NaN where it has none.
+    template <class VertexFlash, class Enthalpy>
+    Scalar vertexEnthalpy(const std::array<int, numAxes>& index, const VertexFlash& flash,
+                          const Enthalpy& enthalpy)
+    {
+        const std::uint64_t key = pack(index);
+        const auto found = enthalpies_.find(key);
+        if (found != enthalpies_.end()) {
+            return found->second;
+        }
+        building_ = true;
+        const Vertex& v = vertex(index, flash);
+        building_ = false;
+        Scalar h = std::numeric_limits<Scalar>::quiet_NaN();
+        Scalar p = 0.0;
+        Scalar T = 0.0;
+        std::array<Scalar, numComponents> z{};
+        if (v.phase != Phase::Failed && point(index, p, T, z)) {
+            if (const auto value = enthalpy(p, T, z, v)) {
+                h = *value;
+            }
+        }
+        return enthalpies_.emplace(key, h).first->second;
+    }
+
     /*!
      * \brief The phase state of the vertices of a cell or simplex, with the
      *        negative flashes a boundary needs.
@@ -792,6 +929,10 @@ private:
     long hits_ = 0;
     long vertexFlashes_ = 0;
     long negativeFlashes_ = 0;
+    long enthalpyQueries_ = 0;
+    long enthalpyStarts_ = 0;
+    std::uint64_t enthalpyKey_ = 0;
+    std::unordered_map<std::uint64_t, Scalar, KeyHash> enthalpies_;
     std::array<long, static_cast<int>(Outcome::Count)> outcomes_{};
     std::unordered_map<std::uint64_t, Vertex, KeyHash> vertices_;
     std::unordered_map<std::uint64_t, Cell, KeyHash> cells_;

@@ -84,8 +84,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -272,7 +274,14 @@ struct PHFlash {
         // not converge, or the flash of the state at its solution does not
         // confirm it, the whole interval is searched.
         const Scalar incoming = getValue(fluidState.temperature(0));
-        if (builtInProvider && !searchWithoutFlash && incoming > tLo && incoming < tHi) {
+        Scalar start = incoming;
+        if (builtInProvider && !searchWithoutFlash) {
+            if (const auto tableStart = startFromTable(fluidState, hSpec, cfg, tLo, tHi,
+                                                       twoPhaseMethod, ptTolerance, eosType)) {
+                start = *tableStart;
+            }
+        }
+        if (builtInProvider && !searchWithoutFlash && start > tLo && start < tHi) {
             warmStart.storeIncoming(fluidState, incoming);
             auto idealGasCp = [&](const Scalar T) {
                 Scalar cp = 0.0;
@@ -300,7 +309,7 @@ struct PHFlash {
                 }
                 return SlopedTrial{Trial{T, *r}, slopeAlongFlash(searchState, cfg, eosType)};
             };
-            if (const auto solution = newton(evaluateWithSlope, incoming, tLo, tHi, idealGasCp, cfg)) {
+            if (const auto solution = newton(evaluateWithSlope, start, tLo, tHi, idealGasCp, cfg)) {
                 // The flash of the state confirms the solution; one that is
                 // off by more than the temperature tolerance, but within
                 // confirmSteps of it, takes one more Newton step on the
@@ -341,6 +350,95 @@ struct PHFlash {
     }
 
 private:
+    /*!
+     * \brief The start of the temperature search from the flash table of
+     *        PTFlashTable.hpp, when PTFlashTableSettings::enthalpyStart asks
+     *        for it: the temperature where the enthalpy of the table's
+     *        vertices, from their phase state and ln K, matches hSpec.
+     */
+    template <class FluidState>
+    static std::optional<Scalar> startFromTable(const FluidState& fluidState,
+                                                const Scalar hSpec,
+                                                const Config& cfg,
+                                                const Scalar tLo,
+                                                const Scalar tHi,
+                                                const PTFlashMethod twoPhaseMethod,
+                                                const Scalar ptTolerance,
+                                                const EOSType& eosType)
+    {
+        using Settings = PTFlashTableSettings;
+        using Table = PTFlashTable<Scalar, FluidSystem>;
+        const auto when = Settings::get().enthalpyStart;
+        const Scalar incomingL = getValue(fluidState.L());
+        if (when == Settings::EnthalpyStart::Never
+            || (when == Settings::EnthalpyStart::Cold && incomingL >= 0.0 && incomingL <= 1.0)) {
+            return std::nullopt;
+        }
+        std::array<Scalar, numComponents> z;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z[compIdx] = getValue(fluidState.moleFraction(compIdx));
+        }
+        // The enthalpy model: the heat capacities and the model.
+        std::uint64_t key = 0x9e3779b97f4a7c15ull + static_cast<std::uint64_t>(cfg.model);
+        for (const auto& cp : cfg.cpTable) {
+            for (const Scalar c : {cp.c0, cp.c1, cp.c2, cp.c3}) {
+                key = key * 0x100000001b3ull ^ std::bit_cast<std::uint64_t>(static_cast<double>(c));
+            }
+        }
+        const auto enthalpy = [&](Scalar p, Scalar T, const auto& zv,
+                                  const typename Table::Vertex& vertex) -> std::optional<Scalar> {
+            ScalarState state;
+            state.setTemperature(T);
+            Scalar L = vertex.phase == Table::Phase::Liquid ? 1.0 : 0.0;
+            std::array<Scalar, numComponents> x, y;
+            if (vertex.phase == Table::Phase::TwoPhase) {
+                L = vertex.L;
+                Scalar sumX = 0.0;
+                Scalar sumY = 0.0;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar K = std::exp(vertex.lnK[compIdx]);
+                    x[compIdx] = zv[compIdx] / (L + (1.0 - L) * K);
+                    y[compIdx] = K * x[compIdx];
+                    sumX += x[compIdx];
+                    sumY += y[compIdx];
+                }
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    x[compIdx] /= sumX;
+                    y[compIdx] /= sumY;
+                }
+            }
+            else {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    x[compIdx] = y[compIdx] = zv[compIdx];
+                }
+            }
+            for (const unsigned phaseIdx : {static_cast<unsigned>(FluidSystem::oilPhaseIdx),
+                                            static_cast<unsigned>(FluidSystem::gasPhaseIdx)}) {
+                state.setPressure(phaseIdx, p);
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setMoleFraction(FluidSystem::oilPhaseIdx, compIdx, x[compIdx]);
+                state.setMoleFraction(FluidSystem::gasPhaseIdx, compIdx, y[compIdx]);
+            }
+            state.setLvalue(L);
+            try {
+                const Scalar h = EnthalpyCalc::mixtureEnthalpy(state, cfg.cpTable, eosType, cfg.model);
+                if (std::isfinite(h)) {
+                    return h;
+                }
+            }
+            catch (const std::runtime_error&) {
+            }
+            catch (const Dune::FMatrixError&) {
+            }
+            return std::nullopt;
+        };
+        return PTFlash<Scalar, FluidSystem, true>::tableTemperature(
+            getValue(fluidState.pressure(FluidSystem::oilPhaseIdx)),
+            getValue(fluidState.temperature(0)), z, hSpec, tLo, tHi, key, enthalpy,
+            twoPhaseMethod, ptTolerance, eosType);
+    }
+
     //! A temperature [K] and its residual r = H(T) - hSpec [J/mol].
     struct Trial
     {
