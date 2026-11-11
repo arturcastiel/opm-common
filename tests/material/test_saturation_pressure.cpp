@@ -493,6 +493,27 @@ BOOST_AUTO_TEST_CASE(PureComponentSaturationPressure)
     BOOST_CHECK_CLOSE(pDew, pBubble, 1.0e-3);
 }
 
+BOOST_AUTO_TEST_CASE(ScanStopsOutsideItsPressureWindow)
+{
+    // Pure decane at the freezing point of water has a vapour pressure of a
+    // few tens of pascal, below the window of the scan: it is not reported,
+    // and the output is left untouched. At the test temperature, where it
+    // is in the kilopascal range, it is (PureComponentSaturationPressure).
+    const CompVec liquid{0.0, 0.0, 1.0};
+    Scalar press = -1.0;
+    CompVec vapor{};
+    BOOST_CHECK(!SatP::bubblePressure(liquid, 273.15, eosType, press, vapor));
+    BOOST_CHECK_LT(press, 0.0);
+
+    // Carbon dioxide with traces of methane and decane far above its critical
+    // temperature has no dew point. All three searches of dewPressure() give
+    // up at the ends of the window instead of scanning on to pressures of a
+    // fraction of a pascal.
+    const CompVec gas{1.0 - 2.0e-8, 1.0e-8, 1.0e-8};
+    BOOST_CHECK(!SatP::dewPressure(gas, 423.15, eosType, press, vapor));
+    BOOST_CHECK_LT(press, 0.0);
+}
+
 BOOST_AUTO_TEST_CASE(TrivialSolutionIsNotReportedAsADewPoint)
 {
     // For these methane-rich mixtures, successive substitution can converge to
