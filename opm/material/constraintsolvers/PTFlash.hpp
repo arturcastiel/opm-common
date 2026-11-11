@@ -1216,15 +1216,21 @@ protected:
             }
 
             // The plain steps in ln K and the modified tangent-plane distance.
+            // Only the extrapolation uses them: the last three plain steps
+            // and tm before it, and tm of the step after it. The first plain
+            // steps after an extrapolation skip their logarithms.
             ComponentVector step(0.);
             FieldType tm = 1. - trial_sum;
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                if (!(Opm::getValue(z[compIdx]) > 0.)) {
-                    continue;
+            if (extrapolated || plain_steps + 3 >= stabilityAccelerationInterval) {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    if (!(Opm::getValue(z[compIdx]) > 0.)) {
+                        continue;
+                    }
+                    step[compIdx] = log(substitution_factor[compIdx]);
+                    const FieldType mole_number = trial_sum * trial_composition[compIdx];
+                    tm += is_vapour_trial ? -mole_number * step[compIdx]
+                                          : mole_number * step[compIdx];
                 }
-                step[compIdx] = log(substitution_factor[compIdx]);
-                const FieldType mole_number = trial_sum * trial_composition[compIdx];
-                tm += is_vapour_trial ? -mole_number * step[compIdx] : mole_number * step[compIdx];
             }
             if (extrapolated) {
                 extrapolated = false;
