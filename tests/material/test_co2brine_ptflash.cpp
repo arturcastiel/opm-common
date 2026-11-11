@@ -376,3 +376,21 @@ BOOST_AUTO_TEST_CASE(RachfordRiceNonConvergenceKeepsExceptionType)
     const Dune::FieldVector<double, 3> z{0.2, 0.5, 0.3};
     BOOST_CHECK_THROW(Opm::RachfordRice::solve(K, z, 0), Opm::NumericalProblem);
 }
+
+// A negative-flash root outside [0, 1] is found where it lies, from any start
+// inside the window, and K on one side of one has no root.
+BOOST_AUTO_TEST_CASE(RachfordRiceNegativeFlashWindow)
+{
+    // h(V) = 0.2 / (1 + 2 V) - 0.45 / (1 - 0.5 V) vanishes at V = -0.25.
+    const Dune::FieldVector<double, 2> K{3.0, 0.5};
+    const Dune::FieldVector<double, 2> z{0.1, 0.9};
+    BOOST_CHECK_SMALL(Opm::RachfordRice::solve(K, z, 0) - 1.25, 1e-12);
+    for (const double initialL : {1.3, 1.2, 0.5, -1.0}) {
+        BOOST_CHECK_SMALL(Opm::RachfordRice::solve(K, z, initialL, 0) - 1.25, 1e-12);
+    }
+
+    const Dune::FieldVector<double, 2> below{0.9, 0.5};
+    BOOST_CHECK_THROW(Opm::RachfordRice::solve(below, z, 0), Opm::NumericalProblem);
+    const Dune::FieldVector<double, 2> above{1.1, 4.0};
+    BOOST_CHECK_THROW(Opm::RachfordRice::solve(above, z, 0.5, 0), Opm::NumericalProblem);
+}

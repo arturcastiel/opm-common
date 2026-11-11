@@ -276,7 +276,7 @@ protected:
                 newton_jacobian.reset();
                 try {
                     OPM_FLASH_COUNT(rachfordRiceSolves);
-                    L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
+                    L_scalar = RachfordRice::solve(K_scalar, z_scalar, L_scalar, verbosity);
                     newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
                                                 fluid_state, flash_tolerance, eos_type, verbosity);
                     return true;
@@ -1887,7 +1887,7 @@ protected:
                 }
 
                 // Solve Rachford-Rice to get L from updated K
-                L = RachfordRice::solve(K, z, 0);
+                L = RachfordRice::solve(K, z, L, 0);
 
                 steps = {step, steps[0], steps[1]};
                 ++plain_steps;
@@ -1901,7 +1901,7 @@ protected:
                         K[compIdx] *= exp(extrapolation[compIdx]);
                     }
                     try {
-                        L = RachfordRice::solve(K, z, 0);
+                        L = RachfordRice::solve(K, z, L, 0);
                         extrapolated = true;
                     }
                     catch (const NumericalProblem&) {
