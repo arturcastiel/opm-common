@@ -376,13 +376,14 @@ protected:
                                           const EOSType& eos_type,
                                           const int verbosity)
     {
+        const auto& settings = PTFlashTableSettings::get();
         // A boundary cell of the table can find the state single-phase
         // without a stability test; the state is then labelled as below.
         bool single_phase_from_table = false;
         if constexpr (std::is_same_v<typename FluidState::ValueType, Scalar>) {
             // Plain Newton has no globalisation for a start that is not the
             // stability test's, so it keeps the flash without the table.
-            if (PTFlashTableSettings::get().mode != PTFlashTableMode::Off
+            if (settings.mode != PTFlashTableMode::Off
                 && twoPhaseMethod != PTFlashMethod::Newton && !FlashTable::get().building()) {
                 if (auto result = flashFromTable_(fluid_state, twoPhaseMethod, flash_tolerance,
                                                   eos_type, verbosity, single_phase_from_table)) {
@@ -406,14 +407,16 @@ protected:
         // Here, a cold start means there is no usable previous two-phase split
         // (L is outside (0, 1)); a warm start reuses previous K and L values.
         const bool is_cold_start = L_scalar <= 0 || L_scalar >= 1;
-        // A single-phase state close to a reference state whose stability
-        // test was decisive stays single-phase without a test. The reference
-        // is found by the incoming ratios.
-        auto& stability_reference = stabilityMemory_().references[referenceSlot_(K_scalar)];
+        // With the stability bypass, a single-phase state close to a
+        // reference state whose stability test was decisive stays
+        // single-phase without a test. The reference is found by the
+        // incoming ratios.
+        StabilityReference* stability_reference = settings.stabilityBypass
+            ? &stabilityMemory_().references[referenceSlot_(K_scalar)] : nullptr;
         const auto incoming_K = K_scalar;
         const bool stability_bypassed = single_phase_from_table
-            || (is_cold_start
-                && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state,
+            || (is_cold_start && stability_reference
+                && stabilityBypass_(*stability_reference, K_scalar, L_scalar, fluid_state,
                                     z_scalar, eos_type));
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
@@ -577,16 +580,16 @@ protected:
                         L_scalar = li_single_phase_label_(fluid_state, z_scalar, verbosity);
                     }
                 }
-                if (both_trials_trivial) {
-                    is_new_reference = rememberReference_(stability_reference, incoming_K,
+                if (both_trials_trivial && stability_reference) {
+                    is_new_reference = rememberReference_(*stability_reference, incoming_K,
                                                           fluid_state, z_scalar,
                                                           stable_phase_idx);
                 }
             }
         }
         // Any other outcome leaves no reference for the incoming ratios.
-        if (!stability_bypassed && !is_new_reference) {
-            stability_reference = StabilityReference{};
+        if (stability_reference && !stability_bypassed && !is_new_reference) {
+            *stability_reference = StabilityReference{};
         }
         fluid_state.setLvalue(L_scalar);
         return {is_single_phase, newton_jacobian};
@@ -601,6 +604,7 @@ protected:
      * Exact: in an all-two-phase cell the split starts from the interpolated
      * K without a stability test, and is kept only if it converges to a
      * distinct split with 0 < L < 1; otherwise the state is restored.
+     * Skip: as Exact, and the label of an all-single-phase cell.
      * Approximate: Rachford-Rice on the interpolated K in an all-two-phase
      * cell, the label of an all-single-phase cell; no iteration. With an
      * acceptance tolerance, a two-phase answer is kept only if its largest
@@ -625,7 +629,10 @@ protected:
     {
         using ScalarVector = Dune::FieldVector<Scalar, numComponents>;
         using TablePhase = typename FlashTable::Phase;
-        const bool exact = PTFlashTableSettings::get().mode == PTFlashTableMode::Exact;
+        const PTFlashTableMode mode = PTFlashTableSettings::get().mode;
+        const bool exact = mode == PTFlashTableMode::Exact;
+        // Only the approximate mode answers from the interpolated split.
+        const bool interpolated = mode == PTFlashTableMode::Approximate;
         auto& table = FlashTable::get();
         ScalarVector z_scalar;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -662,7 +669,7 @@ protected:
             }
             OPM_FLASH_COUNT(cacheHits);
             const FluidState input_state = fluid_state;
-            if (!exact) {
+            if (interpolated) {
                 // Mass balance holds exactly, equal fugacities to the
                 // interpolation error of ln K.
                 const Scalar acceptance = PTFlashTableSettings::get().acceptance;

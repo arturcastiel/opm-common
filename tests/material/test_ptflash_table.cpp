@@ -267,8 +267,8 @@ BOOST_AUTO_TEST_CASE(NegativeFlashVerticesKeepTheAnswers)
     Settings::get().negativeFlash = true;
     Table::get().reset();
     const auto expected = flashAll(Opm::PTFlashTableMode::Off);
-    flashAll(Opm::PTFlashTableMode::Approximate);
-    const auto boundary = flashAll(Opm::PTFlashTableMode::Approximate);
+    flashAll(Opm::PTFlashTableMode::Skip);
+    const auto boundary = flashAll(Opm::PTFlashTableMode::Skip);
     checkSame(expected, boundary);
     using Outcome = Table::Outcome;
     BOOST_TEST_MESSAGE("boundary splits " << Table::get().count(Outcome::BoundarySplit)
@@ -280,7 +280,6 @@ BOOST_AUTO_TEST_CASE(NegativeFlashVerticesKeepTheAnswers)
     flashAll(Opm::PTFlashTableMode::Exact);
     checkSame(expected, flashAll(Opm::PTFlashTableMode::Exact));
     BOOST_CHECK_EQUAL(Table::get().count(Outcome::BoundarySingle), 0);
-    Settings::get().negativeFlash = false;
     Settings::get().acceptance = 0.0;
     Settings::get().interpolation = Settings::Interpolation::Automatic;
 }
@@ -331,7 +330,7 @@ BOOST_AUTO_TEST_CASE(EnthalpyOfTheVerticesStartsThePHSearch)
         }
         evaluations = Opm::FlashStatistics::get().phEvaluations;
         Settings::get().mode = Opm::PTFlashTableMode::Off;
-        Settings::get().enthalpyStart = Settings::EnthalpyStart::Never;
+        Settings::get().enthalpyStart = Settings::EnthalpyStart::Cold;
         return answers;
     };
     Settings::get().acceptance = 1e-6;
@@ -355,4 +354,15 @@ BOOST_AUTO_TEST_CASE(EnthalpyOfTheVerticesStartsThePHSearch)
                        << " from the table");
     BOOST_CHECK_LT(fromTable, fromMiddle);
     Settings::get().acceptance = 0.0;
+}
+
+BOOST_AUTO_TEST_CASE(OptionsAreOffByDefault)
+{
+    // Without the environment every option is off, so the flash is the
+    // flash without them; the table's sub-options are on for when it is.
+    const auto defaults = Settings{};
+    BOOST_CHECK(defaults.mode == Opm::PTFlashTableMode::Off);
+    BOOST_CHECK(!defaults.stabilityBypass);
+    BOOST_CHECK(defaults.negativeFlash);
+    BOOST_CHECK(defaults.enthalpyStart == Settings::EnthalpyStart::Cold);
 }
