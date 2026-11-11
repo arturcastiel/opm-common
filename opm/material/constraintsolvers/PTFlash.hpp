@@ -357,13 +357,16 @@ protected:
                                           const EOSType& eos_type,
                                           const int verbosity)
     {
+        // A boundary cell of the table can find the state single-phase
+        // without a stability test; the state is then labelled as below.
+        bool single_phase_from_table = false;
         if constexpr (std::is_same_v<typename FluidState::ValueType, Scalar>) {
             // Plain Newton has no globalisation for a start that is not the
             // stability test's, so it keeps the flash without the table.
             if (PTFlashTableSettings::get().mode != PTFlashTableMode::Off
                 && twoPhaseMethod != PTFlashMethod::Newton && !FlashTable::get().building()) {
                 if (auto result = flashFromTable_(fluid_state, twoPhaseMethod, flash_tolerance,
-                                                  eos_type, verbosity)) {
+                                                  eos_type, verbosity, single_phase_from_table)) {
                     return *result;
                 }
             }
@@ -391,9 +394,10 @@ protected:
         // is found by the incoming ratios.
         auto& stability_reference = stabilityMemory_().references[referenceSlot_(K_scalar)];
         const auto incoming_K = K_scalar;
-        const bool stability_bypassed = is_cold_start
-            && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state, z_scalar,
-                                eos_type);
+        const bool stability_bypassed = single_phase_from_table
+            || (is_cold_start
+                && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state,
+                                    z_scalar, eos_type));
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
         const bool split_from_flash_first = is_cold_start && !stability_bypassed
@@ -587,13 +591,22 @@ protected:
      * acceptance tolerance, a two-phase answer is kept only if its largest
      * |ln(f_L / f_V)| is below it, and is otherwise converged as in the
      * exact mode.
+     *
+     * A boundary cell (negative-flash vertices) gives L from Rachford-Rice
+     * on the interpolated K at the state's composition. Inside (0, 1), the
+     * split starts there without a stability test, and is kept only if it
+     * converges to a distinct interior split whose Gibbs energy is below the
+     * feed's, which proves the feed unstable (see splitBelowFeed_()). Beyond
+     * the margin of PTFlashTableSettings, outside the exact mode,
+     * \p single_phase sets the state single-phase without a stability test.
      */
     template <typename FluidState>
     static std::optional<ScalarFlashResult> flashFromTable_(FluidState& fluid_state,
                                                             PTFlashMethod twoPhaseMethod,
                                                             const Scalar flash_tolerance,
                                                             const EOSType& eos_type,
-                                                            const int verbosity)
+                                                            const int verbosity,
+                                                            bool& single_phase)
     {
         using ScalarVector = Dune::FieldVector<Scalar, numComponents>;
         using TablePhase = typename FlashTable::Phase;
@@ -614,11 +627,18 @@ protected:
         const auto vertex_flash = [&](Scalar p, Scalar T, const auto& z) {
             return vertexFlash_(p, T, z, twoPhaseMethod, flash_tolerance, eos_type);
         };
+        const auto negative_flash = [&](Scalar p, Scalar T, const auto& z, const auto& seed_ln_K,
+                                        Scalar& L, auto& vertex_ln_K) {
+            return vertexNegativeFlash_(p, T, z, seed_ln_K, flash_tolerance, eos_type, L,
+                                        vertex_ln_K);
+        };
         const auto useful = [exact](TablePhase phase) {
             return phase == TablePhase::TwoPhase || !exact;
         };
         std::array<Scalar, numComponents> ln_K;
-        const TablePhase phase = table.evaluate(location, vertex_flash, useful, ln_K);
+        const TablePhase phase
+            = table.evaluate(location, vertex_flash, negative_flash, useful, ln_K);
+        using Outcome = typename FlashTable::Outcome;
 
         if (phase == TablePhase::TwoPhase) {
             ScalarVector K_scalar;
@@ -656,6 +676,7 @@ protected:
                                                  fluid_state, flash_tolerance, eos_type, verbosity);
                 if (L_scalar > 0. && L_scalar < 1. && !phasesCoincide_(fluid_state)) {
                     fluid_state.setLvalue(L_scalar);
+                    table.note(Outcome::TwoPhaseStart);
                     return ScalarFlashResult{false, newton_jacobian};
                 }
             }
@@ -664,10 +685,12 @@ protected:
             catch (const Dune::FMatrixError&) {
             }
             OPM_FLASH_COUNT(splitRetries);
+            table.note(Outcome::TwoPhaseRetry);
             fluid_state = input_state;
         }
         else if (!exact && (phase == TablePhase::Liquid || phase == TablePhase::Vapour)) {
             OPM_FLASH_COUNT(cacheHits);
+            table.note(Outcome::SinglePhase);
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                 fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z_scalar[compIdx]);
                 fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z_scalar[compIdx]);
@@ -675,7 +698,168 @@ protected:
             fluid_state.setLvalue(phase == TablePhase::Liquid ? 1.0 : 0.0);
             return ScalarFlashResult{true, std::nullopt};
         }
+        else if (phase == TablePhase::Boundary) {
+            ScalarVector K_scalar;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                K_scalar[compIdx] = std::exp(ln_K[compIdx]);
+            }
+            Scalar L_scalar = 0.;
+            try {
+                OPM_FLASH_COUNT(rachfordRiceSolves);
+                L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
+            }
+            catch (const NumericalProblem&) {
+                table.note(Outcome::Flash);
+                return std::nullopt;
+            }
+            if (L_scalar > 0. && L_scalar < 1.) {
+                OPM_FLASH_COUNT(cacheHits);
+                const FluidState input_state = fluid_state;
+                try {
+                    auto newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
+                                                     fluid_state, flash_tolerance, eos_type,
+                                                     verbosity);
+                    if (L_scalar > 0. && L_scalar < 1. && !phasesCoincide_(fluid_state)
+                        && splitBelowFeed_(fluid_state, z_scalar, L_scalar, eos_type)) {
+                        fluid_state.setLvalue(L_scalar);
+                        table.note(Outcome::BoundarySplit);
+                        return ScalarFlashResult{false, newton_jacobian};
+                    }
+                }
+                catch (const NumericalProblem&) {
+                }
+                catch (const Dune::FMatrixError&) {
+                }
+                OPM_FLASH_COUNT(splitRetries);
+                table.note(Outcome::BoundaryRetry);
+                fluid_state = input_state;
+                return std::nullopt;
+            }
+            // The change of L when every ln K is off by the margin: the
+            // interpolation error the single-phase verdict has to survive.
+            // Near a critical point, where K is close to one, it is large.
+            Scalar dh_dV = 0.;
+            Scalar dh_dlnK = 0.;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar dK = K_scalar[compIdx] - 1.;
+                const Scalar denominator = 1. + (1. - L_scalar) * dK;
+                dh_dV += z_scalar[compIdx] * dK * dK / (denominator * denominator);
+                dh_dlnK += z_scalar[compIdx] * K_scalar[compIdx] / (denominator * denominator);
+            }
+            const Scalar spread = PTFlashTableSettings::get().margin * dh_dlnK / dh_dV;
+            if (!exact && std::isfinite(spread)
+                && (L_scalar + spread < 0. || L_scalar - spread > 1.)) {
+                OPM_FLASH_COUNT(cacheHits);
+                table.note(Outcome::BoundarySingle);
+                single_phase = true;
+                return std::nullopt;
+            }
+            table.note(Outcome::BoundaryBand);
+            return std::nullopt;
+        }
+        table.note(Outcome::Flash);
         return std::nullopt;
+    }
+
+    /*!
+     * \brief Whether a split has a lower Gibbs energy than its feed,
+     *
+     * \f[ L\,\mathrm{tpd}(\mathbf x) + (1 - L)\,\mathrm{tpd}(\mathbf y) <
+     *     -\epsilon, \f]
+     *
+     * with the tangent-plane distances of flashFirst_(). Then the feed is
+     * unstable, which is what the stability test would establish.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool splitBelowFeed_(const FlashFluidState& fluid_state,
+                                const ComponentVector& z,
+                                const Scalar L,
+                                const EOSType& eos_type)
+    {
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        const auto plane = feedTangentPlane_(fluid_state, z, eos_type);
+        if (!plane) {
+            return false;
+        }
+        FlashFluidState split_state = fluid_state;
+        ParamCache param_cache(eos_type);
+        std::array<Scalar, 2> distance{0., 0.};
+        for (const int phaseIdx : {static_cast<int>(oilPhaseIdx), static_cast<int>(gasPhaseIdx)}) {
+            param_cache.updatePhase(split_state, phaseIdx);
+            updateFugacityCoefficients_(split_state, param_cache, phaseIdx);
+            Scalar& d = distance[phaseIdx == static_cast<int>(oilPhaseIdx) ? 0 : 1];
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar w = split_state.moleFraction(phaseIdx, compIdx);
+                if (z[compIdx] > 0. && w > 0.) {
+                    d += w * (std::log(w * split_state.fugacityCoefficient(phaseIdx, compIdx))
+                              - (*plane)[compIdx]);
+                }
+            }
+        }
+        const Scalar gibbs = L * distance[0] + (1. - L) * distance[1];
+        return std::isfinite(gibbs) && gibbs < -stabilityTolerance;
+    }
+
+    /*!
+     * \brief The negative flash of a single-phase table vertex: the split
+     *        with L outside [0, 1] that continues the tie-lines of the
+     *        two-phase region, started from ln K of a two-phase vertex next
+     *        to it (substitution, then Newton).
+     *
+     * \return whether it converged to distinct phases with L outside [0, 1];
+     *         only then are \p L and \p ln_K set
+     */
+    template <class Composition>
+    static bool vertexNegativeFlash_(Scalar p, Scalar T, const Composition& z,
+                                     const std::array<Scalar, numComponents>& seed_ln_K,
+                                     const Scalar flash_tolerance,
+                                     const EOSType& eos_type,
+                                     Scalar& L,
+                                     std::array<Scalar, numComponents>& ln_K)
+    {
+        using ScalarVector = Dune::FieldVector<Scalar, numComponents>;
+        CompositionalFluidState<Scalar, FluidSystem> state;
+        state.setPressure(oilPhaseIdx, p);
+        state.setPressure(gasPhaseIdx, p);
+        state.setTemperature(T);
+        ScalarVector z_scalar;
+        ScalarVector K_scalar;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z_scalar[compIdx] = z[compIdx];
+            state.setMoleFraction(compIdx, z[compIdx]);
+            K_scalar[compIdx] = std::exp(seed_ln_K[compIdx]);
+        }
+        try {
+            OPM_FLASH_COUNT(rachfordRiceSolves);
+            Scalar L_scalar = RachfordRice::solve(K_scalar, z_scalar, 0);
+            if (!successiveSubstitutionComposition_(K_scalar, L_scalar, state, z_scalar,
+                                                    /*run_newton_afterwards=*/true,
+                                                    flash_tolerance, eos_type, 0)) {
+                newtonComposition_(K_scalar, L_scalar, state, z_scalar, flash_tolerance, eos_type,
+                                   0);
+            }
+            if (!std::isfinite(L_scalar) || (L_scalar >= 0. && L_scalar <= 1.)
+                || !phaseCompositionsArePhysical_(state) || phasesCoincide_(state)) {
+                return false;
+            }
+            std::array<Scalar, numComponents> split_ln_K;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar x = state.moleFraction(oilPhaseIdx, compIdx);
+                const Scalar y = state.moleFraction(gasPhaseIdx, compIdx);
+                if (!(x > 0.) || !(y > 0.)) {
+                    return false;
+                }
+                split_ln_K[compIdx] = std::log(y / x);
+            }
+            L = L_scalar;
+            ln_K = split_ln_K;
+            return true;
+        }
+        catch (const NumericalProblem&) {
+        }
+        catch (const Dune::FMatrixError&) {
+        }
+        return false;
     }
 
     //! The largest |ln(f_L / f_V)| over the components present, at the phase
