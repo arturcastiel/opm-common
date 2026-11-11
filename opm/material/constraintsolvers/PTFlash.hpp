@@ -113,6 +113,18 @@ class PTFlash
     // may make, see checkStability_().
     static constexpr int stabilityAccelerationInterval = 5;
     static constexpr Scalar maxStabilityExtrapolation = 1.0;
+    // Substitution steps of a stability trial before second-order steps take
+    // over, and the largest change of a ln W that one such step may make,
+    // see stabilityNewtonStep_().
+    static constexpr int stabilityNewtonStart = 3;
+    static constexpr Scalar maxStabilityNewtonStep = 1.0;
+    // The convergence test leaves the mole number sum S of a trial uncertain
+    // by about the root of substitutionTolerance. A converged trial with S
+    // that close to one takes up to maxResolvingSteps more second-order steps,
+    // until its residual is below resolvedStabilityTolerance.
+    static constexpr Scalar unresolvedStabilityBand = 1e-4;
+    static constexpr Scalar resolvedStabilityTolerance = 1e-20;
+    static constexpr int maxResolvingSteps = 4;
     // Substitution steps a cold start takes on the split before the
     // stability test, see flashFirst_(): without a phase below the tangent
     // plane of the feed, and in all.
@@ -1073,6 +1085,9 @@ protected:
         bool extrapolated = false;
         ComponentVector plain_K = K;
         FieldType tm_before = 0.;
+        int resolving_steps = 0;
+        bool newton_step = false;
+        bool newton_rejected = false;
 
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
@@ -1131,13 +1146,16 @@ protected:
             if (extrapolated) {
                 extrapolated = false;
                 if (!(tm < tm_before) || !std::isfinite(Opm::getValue(tm))) {
-                    // Continue from the plain step instead.
+                    // Continue from the plain step instead, and by
+                    // substitution after a rejected second-order step.
                     K = plain_K;
                     plain_steps = 0;
+                    newton_rejected = newton_rejected || newton_step;
                     continue;
                 }
             }
 
+            const ComponentVector evaluated_K = K;
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 K[compIdx] *= substitution_factor[compIdx];
             }
@@ -1149,22 +1167,80 @@ protected:
                 const auto substitution_error = Opm::getValue(substitution_factor[compIdx]) - 1.0;
                 substitution_residual += substitution_error * substitution_error;
             }
-            const Scalar trivial_residual = trivialSolutionMeasure_(K);
-
-            // Print iteration info
-            if (verbosity >= 3) {
-                OpmLog::debug(fmt::format(
-                    "{:>10}{:>16}{:>16}", iteration, trivial_residual, substitution_residual));
+            // A converged trial may have converged onto the mixture itself.
+            // Where its mole number sum is within the resolution of the
+            // convergence test of one, the second-order steps continue until
+            // the sum decides.
+            const bool resolves_decision = substitution_residual < resolvedStabilityTolerance
+                || std::abs(Opm::getValue(trial_sum) - 1.) > unresolvedStabilityBand
+                || iteration + 1 < stabilityNewtonStart || newton_rejected
+                || resolving_steps >= maxResolvingSteps;
+            if (substitution_residual < substitutionTolerance && !resolves_decision) {
+                ++resolving_steps;
             }
-
-            // Check convergence
-            isTrivial = (trivial_residual < trivialSolutionTolerance);
-            if (isTrivial || substitution_residual < substitutionTolerance) {
+            else if (substitution_residual < substitutionTolerance) {
+                isTrivial = trivialSolutionMeasure_(K) < trivialSolutionTolerance;
+                if (verbosity >= 3) {
+                    OpmLog::debug(fmt::format("{:>10}{:>16}", iteration, substitution_residual));
+                }
                 return;
             }
 
             steps = {step, steps[0], steps[1]};
             ++plain_steps;
+
+            // A second-order step from the evaluated point, once substitution
+            // has had a few steps to settle, kept on the same terms as an
+            // extrapolation.
+            newton_step = false;
+            if (!newton_rejected && iteration + 1 >= stabilityNewtonStart) {
+                bool is_clamped = false;
+                std::array<Scalar, numComponents> composition, gradient;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar phi = Opm::getValue(trial_fugacity_coefficients[compIdx]);
+                    is_clamped = is_clamped
+                        || !(phi > minFugacityCoefficient && phi < maxFugacityCoefficient);
+                    const bool is_present = Opm::getValue(z[compIdx]) > 0.;
+                    composition[compIdx]
+                        = is_present ? Opm::getValue(trial_composition[compIdx]) : 0.;
+                    // g_i = ln W_i + ln phi_i - d_i, the negative plain step
+                    // of a vapour trial and the plain step of a liquid one.
+                    gradient[compIdx] = is_vapour_trial ? -Opm::getValue(step[compIdx])
+                                                        : Opm::getValue(step[compIdx]);
+                }
+                std::array<Scalar, numComponents> growth;
+                if (!is_clamped
+                    && stabilityNewtonStep_(trial_param_cache, trial_phase_idx,
+                                            Opm::getValue(trial_state.pressure(trial_phase_idx)),
+                                            Opm::getValue(trial_state.temperature(trial_phase_idx)),
+                                            composition, gradient, growth)) {
+                    plain_K = K;
+                    tm_before = tm;
+                    for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                        K[compIdx] = is_vapour_trial ? evaluated_K[compIdx] * growth[compIdx]
+                                                     : evaluated_K[compIdx] / growth[compIdx];
+                    }
+                    newton_step = true;
+                }
+            }
+
+            // The trial has collapsed onto the mixture when the point it
+            // evaluates next is the trivial solution.
+            const Scalar trivial_residual = trivialSolutionMeasure_(K);
+            if (verbosity >= 3) {
+                OpmLog::debug(fmt::format(
+                    "{:>10}{:>16}{:>16}", iteration, trivial_residual, substitution_residual));
+            }
+            isTrivial = trivial_residual < trivialSolutionTolerance;
+            if (isTrivial) {
+                return;
+            }
+            if (newton_step) {
+                extrapolated = true;
+                plain_steps = 0;
+                continue;
+            }
+
             ComponentVector extrapolation;
             if (plain_steps >= stabilityAccelerationInterval
                 && extrapolateSubstitution_(steps, extrapolation)) {
@@ -1182,6 +1258,226 @@ protected:
         }
         OPM_THROW_NOLOG(NumericalProblem, " Stability test did not converge");
     }//end checkStability
+
+    /*!
+     * \brief The composition derivatives of the fugacity coefficients of a
+     *        phase, \f$n\,\partial \ln\varphi_i / \partial n_j\f$ at constant
+     *        temperature and pressure, with \f$n\f$ the total mole number.
+     *
+     * For the general two-parameter cubic of CubicEOS,
+     *
+     * \f[ \ln\varphi_i = \frac{B_i}{B}(Z - 1) - \ln(Z - B)
+     *   + \beta \left(\frac{2 a_i}{A} - \frac{B_i}{B}\right), \quad
+     *   \beta = \frac{A}{(m_1 - m_2) B} \ln\frac{Z + m_2 B}{Z + m_1 B}, \quad
+     *   a_i = \sum_k x_k A_{ik}, \f]
+     *
+     * is differentiated with the mole fractions as independent variables,
+     * \f$\partial A / \partial x_j = 2 a_j\f$, \f$\partial B / \partial x_j = B_j\f$
+     * and \f$\partial Z / \partial x_j = -(F_A\,2 a_j + F_B B_j) / F_Z\f$ from the
+     * cubic \f$F(Z; A, B) = 0\f$. Since \f$\ln\varphi_i\f$ is homogeneous of degree
+     * zero in the mole numbers,
+     * \f$n\,\partial \ln\varphi_i / \partial n_j = D_{ij} - \sum_k x_k D_{ik}\f$
+     * with \f$D_{ij} = \partial \ln\varphi_i / \partial x_j\f$.
+     *
+     * \param cache The parameter cache, updated for the phase.
+     * \param phase_idx The phase.
+     * \param x The normalised phase composition.
+     * \param[out] derivatives The matrix, row i for \f$\ln\varphi_i\f$.
+     * \return false where the cubic is degenerate at the cached root
+     */
+    template <class ParamCache>
+    static bool fugacityCompositionDerivatives_(
+        const ParamCache& cache,
+        const unsigned phase_idx,
+        const Scalar pressure,
+        const Scalar temperature,
+        const std::array<Scalar, numComponents>& x,
+        Dune::FieldMatrix<Scalar, numComponents, numComponents>& derivatives)
+    {
+        constexpr int n = numComponents;
+        const Scalar A = Opm::getValue(cache.A(phase_idx));
+        const Scalar B = Opm::getValue(cache.B(phase_idx));
+        const Scalar m1 = Opm::getValue(cache.m1(phase_idx));
+        const Scalar m2 = Opm::getValue(cache.m2(phase_idx));
+        const Scalar Z = pressure * Opm::getValue(cache.molarVolume(phase_idx))
+            / (Constants<Scalar>::R * temperature);
+        if (!(A > 0. && B > 0. && Z > B)) {
+            return false;
+        }
+
+        // The cubic of CubicEOS::computeMolarVolume() and its partial derivatives.
+        const Scalar c2 = (m1 + m2 - 1.) * B - 1.;
+        const Scalar c1 = A + m1 * m2 * B * B - (m1 + m2) * B * (B + 1.);
+        const Scalar F_Z = (3. * Z + 2. * c2) * Z + c1;
+        const Scalar F_A = Z - B;
+        const Scalar F_B = (m1 + m2 - 1.) * Z * Z
+            + (2. * m1 * m2 * B - (m1 + m2) * (2. * B + 1.)) * Z
+            - A - m1 * m2 * (3. * B * B + 2. * B);
+        if (!(std::abs(F_Z) > 1e-12 * (1. + std::abs(c1)))) {
+            return false;
+        }
+
+        // Per component j: dZ/dx_j, and with it the x_j-derivatives of the
+        // terms of ln phi_i that do not depend on i.
+        const Scalar inv_A = 1. / A;
+        const Scalar inv_B = 1. / B;
+        const Scalar Zp2 = Z + m2 * B;
+        const Scalar Zp1 = Z + m1 * B;
+        const Scalar inv_Zp2 = 1. / Zp2;
+        const Scalar inv_Zp1 = 1. / Zp1;
+        const Scalar inv_ZmB = 1. / (Z - B);
+        const Scalar inv_F_Z = 1. / F_Z;
+        const Scalar coefficient = A * inv_B / (m1 - m2);
+        const Scalar beta = coefficient * std::log(Zp2 * inv_Zp1);
+        std::array<std::array<Scalar, n>, n> A_ij;
+        std::array<Scalar, n> a, Bi, gamma, u, v, dbeta;
+        Scalar mean_u = 0., mean_v = 0., mean_dbeta = 0.;
+        for (int j = 0; j < n; ++j) {
+            a[j] = 0.;
+            for (int k = 0; k < n; ++k) {
+                A_ij[j][k] = Opm::getValue(cache.aCache(phase_idx, j, k));
+                a[j] += A_ij[j][k] * x[k];
+            }
+            Bi[j] = Opm::getValue(cache.Bi(phase_idx, j));
+            gamma[j] = 2. * a[j] * inv_A - Bi[j] * inv_B;
+            const Scalar dZ = -(F_A * 2. * a[j] + F_B * Bi[j]) * inv_F_Z;
+            u[j] = (dZ - (Z - 1.) * Bi[j] * inv_B) * inv_B;
+            v[j] = (Bi[j] - dZ) * inv_ZmB;
+            dbeta[j] = beta * gamma[j]
+                + coefficient * ((dZ + m2 * Bi[j]) * inv_Zp2 - (dZ + m1 * Bi[j]) * inv_Zp1);
+            mean_u += x[j] * u[j];
+            mean_v += x[j] * v[j];
+            mean_dbeta += x[j] * dbeta[j];
+        }
+        // D_ij = d ln phi_i / d x_j
+        //      = B_i u_j + v_j + gamma_i dbeta_j
+        //        + beta (2 A_ij / A - 4 a_i a_j / A^2 + B_i B_j / B^2),
+        // and with sum_j x_j A_ij = a_i, sum_j x_j a_j = A, sum_j x_j B_j = B
+        // its x-weighted row sum is B_i mean_u + mean_v + gamma_i (mean_dbeta - beta).
+        // The difference is symmetric, so one triangle is evaluated.
+        const Scalar c_A = 2. * beta * inv_A;
+        const Scalar c_aa = 4. * beta * inv_A * inv_A;
+        const Scalar c_BB = beta * inv_B * inv_B;
+        for (int j = 0; j < n; ++j) {
+            u[j] -= mean_u;
+            v[j] -= mean_v;
+            dbeta[j] += beta - mean_dbeta;
+        }
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j <= i; ++j) {
+                const Scalar value = Bi[i] * u[j] + v[j] + gamma[i] * dbeta[j]
+                    + c_A * A_ij[i][j]
+                    - c_aa * a[i] * a[j] + c_BB * Bi[i] * Bi[j];
+                derivatives[i][j] = value;
+                derivatives[j][i] = value;
+            }
+        }
+        return true;
+    }
+
+    /*!
+     * \brief A second-order step of a stability trial.
+     *
+     * In the variables \f$\alpha_i = 2\sqrt{W_i}\f$ the modified tangent-plane
+     * distance \f$tm\f$ of checkStability_() has the gradient
+     * \f$\sqrt{W_i}\,g_i\f$, \f$g_i = \ln W_i + \ln\varphi_i - d_i\f$, and, up to
+     * a term \f$\delta_{ij} g_i / 2\f$ that vanishes at a stationary point, the
+     * Hessian
+     *
+     * \f[ H_{ij} = \delta_{ij} + \sqrt{W_i W_j}\,
+     *              \frac{\partial \ln\varphi_i}{\partial n_j}
+     *            = \delta_{ij} + \sqrt{w_i w_j}\, S
+     *              \frac{\partial \ln\varphi_i}{\partial n_j}, \f]
+     *
+     * the identity for an ideal mixture, where the step is a substitution
+     * step (Michelsen, Fluid Phase Equilib. 9 (1982) 1-19; Michelsen and
+     * Mollerup, Thermodynamic Models, 2nd ed. (2007), ch. 10). The step
+     * solves \f$H\,\Delta\alpha = -\sqrt{W}\,g\f$ and is shortened to change no
+     * \f$\ln W_i\f$ by more than maxStabilityNewtonStep.
+     *
+     * \param cache The parameter cache, updated for the trial phase.
+     * \param phase_idx The trial phase.
+     * \param w The normalised trial composition, zero for an absent component.
+     * \param g The gradient \f$g_i\f$, zero for an absent component.
+     * \param[out] growth The factors \f$W_i^{new} / W_i\f$.
+     * \return false where \f$H\f$ is not positive definite or the cubic is
+     *         degenerate; the trial then continues by substitution
+     */
+    template <class ParamCache>
+    static bool stabilityNewtonStep_(const ParamCache& cache,
+                                     const unsigned phase_idx,
+                                     const Scalar pressure,
+                                     const Scalar temperature,
+                                     const std::array<Scalar, numComponents>& w,
+                                     const std::array<Scalar, numComponents>& g,
+                                     std::array<Scalar, numComponents>& growth)
+    {
+        constexpr int n = numComponents;
+        Dune::FieldMatrix<Scalar, n, n> H;
+        if (!fugacityCompositionDerivatives_(cache, phase_idx, pressure, temperature, w, H)) {
+            return false;
+        }
+        std::array<Scalar, n> root_w, rhs;
+        for (int i = 0; i < n; ++i) {
+            root_w[i] = std::sqrt(w[i]);
+            rhs[i] = -root_w[i] * g[i];
+        }
+
+        // H = L D L^T of the lower triangle of H, then the solve.
+        std::array<Scalar, n> inv_diagonal;
+        for (int j = 0; j < n; ++j) {
+            Scalar diagonal = 1. + w[j] * H[j][j];
+            for (int k = 0; k < j; ++k) {
+                diagonal -= H[j][k] * H[j][k] * inv_diagonal[k];
+            }
+            if (!(diagonal > 1e-12)) {
+                return false;
+            }
+            inv_diagonal[j] = 1. / diagonal;
+            for (int i = j + 1; i < n; ++i) {
+                // H[i][j] holds L_ij D_j while the column is built.
+                Scalar entry = root_w[i] * root_w[j] * H[i][j];
+                for (int k = 0; k < j; ++k) {
+                    entry -= H[i][k] * H[j][k] * inv_diagonal[k];
+                }
+                H[i][j] = entry;
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < i; ++k) {
+                rhs[i] -= H[i][k] * inv_diagonal[k] * rhs[k];
+            }
+        }
+        for (int i = n - 1; i >= 0; --i) {
+            rhs[i] *= inv_diagonal[i];
+            for (int k = i + 1; k < n; ++k) {
+                rhs[i] -= H[k][i] * inv_diagonal[i] * rhs[k];
+            }
+        }
+
+        // sqrt(W_i^new / W_i) = 1 + t_i with t_i = Delta alpha_i / alpha_i,
+        // shortened so that |ln W_i^new - ln W_i| <= maxStabilityNewtonStep.
+        static const Scalar max_root_growth = std::exp(0.5 * maxStabilityNewtonStep);
+        static const Scalar min_root_growth = std::exp(-0.5 * maxStabilityNewtonStep);
+        Scalar shortening = 1.;
+        for (int i = 0; i < n; ++i) {
+            growth[i] = w[i] > 0. ? 0.5 * rhs[i] / root_w[i] : 0.;
+            if (!std::isfinite(growth[i])) {
+                return false;
+            }
+            if (growth[i] > max_root_growth - 1.) {
+                shortening = std::min(shortening, (max_root_growth - 1.) / growth[i]);
+            }
+            else if (growth[i] < min_root_growth - 1.) {
+                shortening = std::min(shortening, (min_root_growth - 1.) / growth[i]);
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            const Scalar root_growth = 1. + shortening * growth[i];
+            growth[i] = root_growth * root_growth;
+        }
+        return true;
+    }
 
     /*!
      * \brief The phase compositions from the equilibrium ratios and the
