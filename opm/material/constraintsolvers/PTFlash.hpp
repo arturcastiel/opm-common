@@ -152,6 +152,17 @@ public:
 
         updateDerivatives_(scalar_state, fluid_state, eos_type, is_single_phase, newton_jacobian);
 
+        // The equilibrium ratios of a two-phase answer are y / x: a warm
+        // start of the next flash from this state starts from them.
+        if (!is_single_phase) {
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto& x = fluid_state.moleFraction(oilPhaseIdx, compIdx);
+                if (Opm::getValue(x) > 0.) {
+                    fluid_state.setKvalue(compIdx, fluid_state.moleFraction(gasPhaseIdx, compIdx) / x);
+                }
+            }
+        }
+
         return is_single_phase;
     } //end solve
 
