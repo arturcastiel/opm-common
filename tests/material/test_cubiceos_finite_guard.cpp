@@ -310,6 +310,18 @@ BOOST_AUTO_TEST_CASE(CubicRootsOfADoubleRootAreFinite)
                     BOOST_CHECK(std::isfinite(rootEvals[rootIdx].derivative(varIdx)));
                 }
             }
+
+            // The single extreme root the equation of state asks for is the
+            // same, finite root.
+            for (const bool largest : {false, true}) {
+                std::array<Scalar, 3> extreme{};
+                const unsigned numExtreme = Opm::cubicExtremeRoot(
+                    extreme.data(), Scalar{1}, cubic.b, cubic.c, cubic.d, largest);
+                BOOST_REQUIRE_EQUAL(numExtreme, numRoots);
+                const Scalar Z = largest ? extreme[numExtreme - 1] : extreme[0];
+                BOOST_REQUIRE(std::isfinite(Z));
+                BOOST_CHECK_EQUAL(Z, largest ? roots[numRoots - 1] : roots[0]);
+            }
         }
     }
 }

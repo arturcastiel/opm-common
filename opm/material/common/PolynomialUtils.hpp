@@ -489,52 +489,56 @@ unsigned cubicExtremeRoot(SolContainer* sol,
     // The depressed cubic and its discriminant, as in cubicRoots().
     Scalar p = (3.0 * a * c - b * b) / (3.0 * a * a);
     Scalar q = (2.0 * b * b * b - 9.0 * a * b * c + 27.0 * d * a * a) / (27.0 * a * a * a);
+    // Where two roots (nearly) coincide, the argument of acos or acosh can lie just outside the
+    // function's domain; such a cubic is solved as one with a zero discriminant, as in cubicRoots().
     Scalar discr = 4.0 * p * p * p + 27.0 * q * q;
     if (discr < 0.0) {
-        return cubicExtremeOfThreeRoots_(sol, a, b, p, q, largest);
+        const Scalar cos_3theta = ((3.0 * q) / (2.0 * p)) * sqrt(-3.0 / p);
+        if (abs(cos_3theta) < 1.0) {
+            return cubicExtremeOfThreeRoots_(sol, a, b, p, q, largest);
+        }
     }
     else if (discr > 0.0) {
 
         // Find one real root of a depressed cubic using hyperbolic method. Different solutions depending on
         // sign of p
-        Scalar t = 0;
         if (p < 0) {
             // Help calculation
-            Scalar theta = (1.0 / 3.0) * acosh( ((-3.0 * abs(q)) / (2.0 * p)) * sqrt(-3.0 / p) );
+            const Scalar cosh_3theta = ((-3.0 * abs(q)) / (2.0 * p)) * sqrt(-3.0 / p);
+            if (cosh_3theta > 1.0) {
+                Scalar theta = (1.0 / 3.0) * acosh(cosh_3theta);
 
-            // Root
-            t = ( (-2.0 * abs(q)) / q ) * sqrt(-p / 3.0) * cosh(theta);
+                // Root, transformed to the output solution
+                const Scalar t = ( (-2.0 * abs(q)) / q ) * sqrt(-p / 3.0) * cosh(theta);
+                sol[0] = t - b / (3.0 * a);
+                return 1;
+            }
         }
         else if (p > 0) {
             // Help calculation
             Scalar theta = (1.0 / 3.0) * asinh( ((3.0 * q) / (2.0 * p)) * sqrt(3.0 / p) );
-            // Root
-            t = -2.0 * sqrt(p / 3.0) * sinh(theta);
-
+            // Root, transformed to the output solution
+            const Scalar t = -2.0 * sqrt(p / 3.0) * sinh(theta);
+            sol[0] = t - b / (3.0 * a);
+            return 1;
         }
         else {
             throw std::runtime_error(" p = 0 in cubic root solver!");
         }
-
-        // Transform t to output solution
-        sol[0] = t - b / (3.0 * a);
-        return 1;
-
     }
+
+    // The discriminant, 4*p^3 + 27*q^2 = 0, thus we have simple (real) roots
+    // If p = 0 then also q = 0, and t = 0 is a triple root
+    if (p == 0) {
+        sol[0] = sol[1] = sol[2] = 0.0 - b / (3.0 * a);
+    }
+    // If p != 0, the we have a simple root and a double root
     else {
-        // The discriminant, 4*p^3 + 27*q^2 = 0, thus we have simple (real) roots
-        // If p = 0 then also q = 0, and t = 0 is a triple root
-        if (p == 0) {
-            sol[0] = sol[1] = sol[2] = 0.0 - b / (3.0 * a);
-        }
-        // If p != 0, the we have a simple root and a double root
-        else {
-            sol[0] = (3.0 * q / p) - b / (3.0 * a);
-            sol[1] = sol[2] = (-3.0 * q) / (2.0 * p) - b / (3.0 * a);
-            std::sort(sol, sol + 3);
-        }
-        return 3;
+        sol[0] = (3.0 * q / p) - b / (3.0 * a);
+        sol[1] = sol[2] = (-3.0 * q) / (2.0 * p) - b / (3.0 * a);
+        std::sort(sol, sol + 3);
     }
+    return 3;
 }
 
 } // end Opm
