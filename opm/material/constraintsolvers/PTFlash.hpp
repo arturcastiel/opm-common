@@ -290,9 +290,16 @@ public:
                       const EOSType& eos_type,
                       int verbosity = 0)
     {
-        // The caller may pass the same memory in and out.
-        const Memory incoming = previous ? *previous : Memory{};
-        next = Memory{};
+        // The caller may pass the same memory in and out; otherwise no copy.
+        static constexpr Memory no_memory{};
+        std::optional<Memory> incoming_copy;
+        if (previous == &next) {
+            incoming_copy = *previous;
+        }
+        const Memory& incoming = incoming_copy ? *incoming_copy : (previous ? *previous : no_memory);
+        // Every field of a part is set when its flag is.
+        next.has_split = false;
+        next.has_stability = false;
         auto scalar_state = scalarState_(fluid_state);
         auto& tally = memoryTally_();
         ++tally.flashes;
@@ -879,7 +886,11 @@ protected:
      * numbers \f$2\sqrt{n_i}\f$ on its stable root (Michelsen 1982;
      * MultiComponentFlash.jl, michelsen_critical_point_measure!). It is one
      * for an ideal mixture and vanishes at a critical point or on the
-     * spinodal.
+     * spinodal. Where the fluid system gives the analytic derivatives of
+     * \f$\ln\varphi\f$ in the mole fractions, \f$\partial \ln\varphi_i /
+     * \partial n_j = \partial \ln\varphi_i / \partial x_j - \sum_k z_k
+     * \partial \ln\varphi_i / \partial x_k\f$ at \f$n = z\f$; otherwise
+     * automatic differentiation in the mole numbers.
      */
     static Scalar criticalDistance_(const Scalar pressure,
                                     const Scalar temperature,
@@ -887,6 +898,42 @@ protected:
                                     const EOSType& eos_type,
                                     const int phase_idx)
     {
+        if constexpr (hasFugacityDerivatives_) {
+            CompositionalFluidState<Scalar, FluidSystem> state;
+            state.setPressure(oilPhaseIdx, pressure);
+            state.setPressure(gasPhaseIdx, pressure);
+            state.setTemperature(temperature);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setMoleFraction(phase_idx, compIdx, z[compIdx]);
+            }
+            typename FluidSystem::template ParameterCache<Scalar> param_cache(eos_type);
+            param_cache.updatePhase(state, phase_idx);
+            std::array<Scalar, numComponents> coefficients;
+            std::array<std::array<Scalar, numComponents>, numComponents> derivatives;
+            FluidSystem::fugacityCoefficientsAndDerivatives(
+                state, param_cache, static_cast<unsigned>(phase_idx), coefficients, derivatives);
+            Dune::FieldMatrix<Scalar, numComponents, numComponents> curvature(0.);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                Scalar weighted = 0.;
+                for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                    weighted += z[otherIdx] * derivatives[compIdx][otherIdx];
+                }
+                for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                    curvature[compIdx][otherIdx] = std::sqrt(z[compIdx] * z[otherIdx])
+                        * (derivatives[compIdx][otherIdx] - weighted);
+                }
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                for (int otherIdx = 0; otherIdx < compIdx; ++otherIdx) {
+                    const Scalar mean
+                        = 0.5 * (curvature[compIdx][otherIdx] + curvature[otherIdx][compIdx]);
+                    curvature[compIdx][otherIdx] = mean;
+                    curvature[otherIdx][compIdx] = mean;
+                }
+                curvature[compIdx][compIdx] += 1.;
+            }
+            return smallestEigenvalue_(curvature);
+        }
         using DistanceEval = DenseAd::Evaluation<Scalar, numComponents>;
         using ParamCache = typename FluidSystem::template ParameterCache<DistanceEval>;
         CompositionalFluidState<DistanceEval, FluidSystem> state;
