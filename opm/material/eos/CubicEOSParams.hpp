@@ -36,6 +36,7 @@
 #include <opm/material/eos/RKParams.hpp>
 #include <opm/material/eos/SRKParams.hpp>
 
+#include <array>
 #include <cmath>
 
 #include <fmt/format.h>
@@ -60,12 +61,28 @@ public:
     void setEOSType(const EOSType eos_type)
     {
         EosType_= eos_type;
+        pureUpToDate_ = false;
     }
 
+    /*!
+     * \brief The pure-component parameters \f$A_i\f$, \f$B_i\f$, the mixing
+     *        matrix \f$A_{ij}\f$ and the volume translation factors at a
+     *        temperature and pressure.
+     *
+     * They depend on temperature and pressure only. A repeated call at the
+     * temperature and pressure of the last completed one keeps them, so the
+     * composition updates of a flash, which all share its temperature and
+     * pressure, compute them once.
+     */
     void updatePure(Scalar temperature, Scalar pressure)
     {
         Valgrind::CheckDefined(temperature);
         Valgrind::CheckDefined(pressure);
+
+        if (pureUpToDate_ && temperature == pureTemperature_ && pressure == purePressure_) {
+            return;
+        }
+        pureUpToDate_ = false;
 
         // calculate Ai and Bi
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -103,6 +120,16 @@ public:
         // Update Aij
         updateACache_();
 
+        // The SSHIFT factor of the fugacity coefficients, exp(-s_i B_i).
+        if constexpr (requires { FluidSystem::volumeShift(0u); }) {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                translation_[compIdx] = exp(-FluidSystem::volumeShift(compIdx) * Bi(compIdx));
+            }
+        }
+
+        pureTemperature_ = temperature;
+        purePressure_ = pressure;
+        pureUpToDate_ = true;
     }
 
     template <class FluidState>
@@ -110,20 +137,22 @@ public:
     {
         using FlashEval = typename FluidState::ValueType;
 
+        // The mole fractions limited to [0, 1], once per component.
+        std::array<FlashEval, numComponents> x;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const FlashEval moleFrac = fs.moleFraction(phaseIdx, compIdx);
+            x[compIdx] = max(0.0, min(1.0, moleFrac));
+            Valgrind::CheckDefined(x[compIdx]);
+        }
+
         FlashEval newA = 0;
         FlashEval newB = 0;
         for (unsigned compIIdx = 0; compIIdx < numComponents; ++compIIdx) {
-            const FlashEval moleFracI = fs.moleFraction(phaseIdx, compIIdx);
-            FlashEval xi = max(0.0, min(1.0, moleFracI));
-            Valgrind::CheckDefined(xi);
+            const FlashEval& xi = x[compIIdx];
 
             for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
-                const FlashEval moleFracJ = fs.moleFraction(phaseIdx, compJIdx );
-                FlashEval xj = max(0.0, min(1.0, moleFracJ));
-                Valgrind::CheckDefined(xj);
-
                 // Calculate A
-                newA +=  xi * xj * aCache_[compIIdx][compJIdx];
+                newA +=  xi * x[compJIdx] * aCache_[compIIdx][compJIdx];
             }
 
             // Calculate B
@@ -161,11 +190,23 @@ public:
     void setAi(Scalar value, unsigned compIdx)
     {
         Ai_[compIdx] = value;
+        pureUpToDate_ = false;
     }
 
     void setBi(Scalar value, unsigned compIdx)
     {
         Bi_[compIdx] = value;
+        pureUpToDate_ = false;
+    }
+
+    /*!
+     * \brief The volume translation factor \f$\exp(-s_i B_i)\f$ of a
+     *        component's fugacity coefficient, for fluid systems with a
+     *        volume shift \f$s_i\f$ (SSHIFT).
+     */
+    Scalar volumeTranslationFactor(unsigned compIdx) const
+    {
+        return translation_[compIdx];
     }
 
     Scalar Ai(unsigned compIdx) const
@@ -234,8 +275,14 @@ protected:
     Scalar A_;
     Scalar B_;
     std::array<std::array<Scalar, numComponents>, numComponents> aCache_;
+    std::array<Scalar, numComponents> translation_;
 
     EOSType EosType_;
+
+    // The temperature and pressure of the last completed updatePure().
+    Scalar pureTemperature_;
+    Scalar purePressure_;
+    bool pureUpToDate_ = false;
 
 private:
     void updateACache_()

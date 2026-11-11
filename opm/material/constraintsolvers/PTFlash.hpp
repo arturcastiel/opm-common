@@ -705,6 +705,11 @@ protected:
             OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", "Iteration", "K-Norm", "R-Norm"));
         }
 
+        // The parameter caches live across the iterations: temperature and
+        // pressure are fixed, so they compute the pure-component parameters once.
+        ParamCache trial_param_cache(eos_type);
+        ParamCache reference_param_cache(eos_type);
+
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
         constexpr int max_iterations = 20000;
@@ -726,10 +731,7 @@ protected:
                 reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
             }
 
-            ParamCache trial_param_cache(eos_type);
             trial_param_cache.updatePhase(trial_state, trial_phase_idx);
-
-            ParamCache reference_param_cache(eos_type);
             reference_param_cache.updatePhase(reference_state, reference_phase_idx);
 
             // Fugacity coefficients of the trial phase and reference phase.
@@ -1771,14 +1773,16 @@ protected:
         ComponentVector plain_K = K;
         FieldType plain_L = L;
         FieldType gibbs_before = 0.;
+        // One parameter cache for all steps: temperature and pressure are
+        // fixed, so it computes the pure-component parameters once.
+        using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        ParamCache paramCache(eos_type);
         for (int iteration = 0; iteration < max_iterations; ++iteration) {
             OPM_FLASH_COUNT(ssiIterations);
             // Compute (normalized) liquid and vapor mole fractions
             computeLiquidVapor_(fluid_state, L, K, z);
 
             // Calculate fugacity coefficient
-            using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
-            ParamCache paramCache(eos_type);
             for (int phaseIdx=0; phaseIdx<numMisciblePhases; ++phaseIdx){
                 paramCache.updatePhase(fluid_state, phaseIdx);
                 for (int compIdx=0; compIdx<numComponents; ++compIdx){

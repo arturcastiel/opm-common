@@ -179,6 +179,22 @@ public:
         };
     }
 
+    /*!
+     * \brief The volume translation factor \f$\exp(-s_i B_i)\f$ of a
+     *        component's fugacity coefficient in a phase.
+     */
+    Scalar volumeTranslationFactor(unsigned phaseIdx, unsigned compIdx) const
+    {
+        switch (phaseIdx)
+        {
+        case oilPhaseIdx: return oilPhaseParams_.volumeTranslationFactor(compIdx);
+        case gasPhaseIdx: return gasPhaseParams_.volumeTranslationFactor(compIdx);
+        default:
+            throw std::logic_error("The volume translation factor is only defined for "
+                                   "oil and gas phases");
+        };
+    }
+
     Scalar m1(unsigned phaseIdx) const
     {
         switch (phaseIdx)
