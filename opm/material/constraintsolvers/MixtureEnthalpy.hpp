@@ -73,6 +73,7 @@
 #include <opm/material/Constants.hpp>
 #include <opm/material/densead/Evaluation.hpp>
 #include <opm/material/densead/Math.hpp>
+#include <opm/material/eos/CubicEOS.hpp>
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
@@ -321,11 +322,82 @@ private:
               const EOSType& eosType)
     {
         using Eval1 = DenseAd::Evaluation<Scalar, 1>;
-        using ParamCache = typename FluidSystem::template ParameterCache<Eval1>;
+        if constexpr (analyticTemperatureDerivative_) {
+            auto state = valueCopy_(fluidState, phaseIdx, rootIdx);
+            typename FluidSystem::template ParameterCache<Scalar> paramCache(eosType);
+            return sumLnPhiAnalytic_(state, paramCache, rootIdx);
+        }
+        else {
+            using ParamCache = typename FluidSystem::template ParameterCache<Eval1>;
+            const auto seeded = temperatureSeededCopy_(fluidState, phaseIdx, rootIdx);
+            ParamCache paramCache(eosType);
+            return sumLnPhi_(seeded, paramCache, rootIdx);
+        }
+    }
 
-        const auto seeded = temperatureSeededCopy_(fluidState, phaseIdx, rootIdx);
-        ParamCache paramCache(eosType);
-        return sumLnPhi_(seeded, paramCache, rootIdx);
+    //! Whether the parameter cache gives the temperature derivatives of the
+    //! pure-component parameters, for sumLnPhiAnalytic_().
+    static constexpr bool analyticTemperatureDerivative_
+        = requires(const typename FluidSystem::template ParameterCache<Scalar>& paramCache) {
+              paramCache.lnAiTemperatureDerivative(0u, 0u);
+          };
+
+    //! A value-only copy of the composition of phase phaseIdx as phase rootIdx.
+    template <class FluidState>
+    static CompositionalFluidState<Scalar, FluidSystem>
+    valueCopy_(const FluidState& fluidState, const unsigned phaseIdx, const unsigned rootIdx)
+    {
+        CompositionalFluidState<Scalar, FluidSystem> state;
+        state.setTemperature(Opm::getValue(fluidState.temperature(phaseIdx)));
+        const Scalar p = Opm::getValue(fluidState.pressure(phaseIdx));
+        state.setPressure(FluidSystem::oilPhaseIdx, p);
+        state.setPressure(FluidSystem::gasPhaseIdx, p);
+        valueComposition_(state, fluidState, phaseIdx, rootIdx);
+        return state;
+    }
+
+    template <class FluidState>
+    static void valueComposition_(CompositionalFluidState<Scalar, FluidSystem>& state,
+                                  const FluidState& fluidState,
+                                  const unsigned phaseIdx,
+                                  const unsigned rootIdx)
+    {
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            state.setMoleFraction(rootIdx, compIdx,
+                                  Opm::getValue(fluidState.moleFraction(phaseIdx, compIdx)));
+        }
+    }
+
+    /*!
+     * \brief sumLnPhi_() on values: the same value, and the temperature
+     *        derivative from CubicEOS::sumLnPhiTemperatureDerivative(); the
+     *        volume translation \f$p c / (R T)\f$ adds \f$p c / (R T^2)\f$, as
+     *        \f$c = \sum_i w_i s_i b_i\f$ does not depend on temperature.
+     */
+    template <class ParamCache>
+    static DenseAd::Evaluation<Scalar, 1>
+    sumLnPhiAnalytic_(const CompositionalFluidState<Scalar, FluidSystem>& state,
+                      ParamCache& paramCache,
+                      const unsigned rootIdx)
+    {
+        paramCache.updatePhase(state, rootIdx);
+
+        const Scalar T = state.temperature(rootIdx);
+        const Scalar p = state.pressure(rootIdx);
+        const Scalar A = paramCache.A(rootIdx);
+        const Scalar B = paramCache.B(rootIdx);
+        const Scalar m1 = paramCache.m1(rootIdx);
+        const Scalar m2 = paramCache.m2(rootIdx);
+        const Scalar Z = p * paramCache.molarVolume(rootIdx) / (Constants<Scalar>::R * T);
+
+        Scalar sumLnPhi = Z - 1.0 - log(Z - B)
+                        + A / ((m1 - m2) * B) * log((Z + m2 * B) / (Z + m1 * B));
+        const Scalar shift = p * paramCache.phaseVolumeShift(rootIdx) / (Constants<Scalar>::R * T);
+        sumLnPhi -= shift;
+        DenseAd::Evaluation<Scalar, 1> result(sumLnPhi);
+        result.setDerivative(0, CubicEOS<Scalar, FluidSystem>::sumLnPhiTemperatureDerivative(
+                                    state, paramCache, rootIdx) + shift / T);
+        return result;
     }
 
     /*!
@@ -373,6 +445,15 @@ private:
         using ParamCache = typename FluidSystem::template ParameterCache<Eval1>;
         constexpr unsigned oil = FluidSystem::oilPhaseIdx;
         constexpr unsigned gas = FluidSystem::gasPhaseIdx;
+
+        if constexpr (analyticTemperatureDerivative_) {
+            auto state = valueCopy_(fluidState, liquidIdx, oil);
+            valueComposition_(state, fluidState, vapourIdx, gas);
+            typename FluidSystem::template ParameterCache<Scalar> paramCache(eosType);
+            const Eval1 onLiquidRoot = sumLnPhiAnalytic_(state, paramCache, oil);
+            const Eval1 onVapourRoot = sumLnPhiAnalytic_(state, paramCache, gas);
+            return {onLiquidRoot, onVapourRoot};
+        }
 
         auto seeded = temperatureSeededCopy_(fluidState, liquidIdx, oil);
         seedComposition_(seeded, fluidState, vapourIdx, gas);

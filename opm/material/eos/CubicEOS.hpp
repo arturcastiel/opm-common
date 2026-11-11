@@ -205,6 +205,64 @@ public:
                                     &lnPhiPressureDerivatives, &lnPhiTemperatureDerivatives);
     }
 
+    /*!
+     * \brief The temperature derivative at fixed pressure and composition of
+     *        \f$\sum_i x_i \ln\phi_i = Z - 1 - \ln(Z - B)
+     *        + \frac{A}{(m_1 - m_2) B} \ln\frac{Z + m_2 B}{Z + m_1 B}\f$,
+     *        the sum without the limits of the coefficients and without a
+     *        volume translation, on the phase's cached molar volume.
+     *
+     * \f$A_T\f$, \f$B_T\f$ and \f$Z_T\f$ as in
+     * computeFugacityCoefficientsAndDerivatives() with the temperature
+     * derivatives.
+     */
+    template <class FluidState, class Params>
+    static typename FluidState::ValueType
+    sumLnPhiTemperatureDerivative(const FluidState& fs, const Params& params, unsigned phaseIdx)
+    {
+        using LhsEval = typename FluidState::ValueType;
+        static_assert(std::is_floating_point_v<LhsEval>,
+                      "The derivative is that of a value-only evaluation");
+        const LhsEval T = fs.temperature(phaseIdx);
+        const LhsEval p = fs.pressure(phaseIdx);
+        const LhsEval A = params.A(phaseIdx);
+        const LhsEval B = params.B(phaseIdx);
+        const LhsEval m1 = params.m1(phaseIdx);
+        const LhsEval m2 = params.m2(phaseIdx);
+        const LhsEval Z = p * params.molarVolume(phaseIdx) / (R * T);
+
+        std::array<LhsEval, numComponents> xa; // x_j a_j
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            xa[compIdx] = fs.moleFraction(phaseIdx, compIdx)
+                * params.lnAiTemperatureDerivative(phaseIdx, compIdx);
+        }
+        LhsEval AT = 0.0;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            LhsEval S = 0.0;
+            for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+                S += params.aCache(phaseIdx, compIdx, compJIdx) * fs.moleFraction(phaseIdx, compJIdx);
+            }
+            AT += xa[compIdx] * S;
+        }
+        const LhsEval BT = -B / T;
+        const LhsEval c2 = (m1 + m2 - 1) * B - 1;
+        const LhsEval c1 = A + m1 * m2 * B * B - (m1 + m2) * B * (B + 1);
+        const LhsEval FZ = (3 * Z + 2 * c2) * Z + c1;
+        const LhsEval FA = Z - B;
+        const LhsEval FB = (m1 + m2 - 1) * Z * Z + (2 * m1 * m2 * B - (m1 + m2) * (2 * B + 1)) * Z
+            - (A + m1 * m2 * (3 * B + 2) * B);
+        const bool volumeAtFloor = !(params.molarVolume(phaseIdx) > minMolarVolume);
+        const LhsEval ZT = volumeAtFloor ? -Z / T : -(FA * AT + FB * BT) / FZ;
+
+        const LhsEval P1 = Z + m1 * B;
+        const LhsEval P2 = Z + m2 * B;
+        const LhsEval Lambda = log(P2 / P1);
+        const LhsEval LambdaT = (ZT + m2 * BT) / P2 - (ZT + m1 * BT) / P1;
+        const LhsEval invB = 1 / B;
+        return ZT - (ZT - BT) / (Z - B)
+            + ((AT * invB - A * BT * invB * invB) * Lambda + A * invB * LambdaT) / (m1 - m2);
+    }
+
 private:
     template <class FluidState, class Params, class Coefficients, class Derivatives>
     static void coefficientsAndDerivatives_(const FluidState& fs,

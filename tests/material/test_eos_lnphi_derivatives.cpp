@@ -38,7 +38,9 @@
  *          bit for bit;
  *        - the temperature derivatives are those automatic differentiation in
  *          temperature gives, to 1e-10, for every equation of state; the
- *          pressure derivatives given with them are bit for bit the same.
+ *          pressure derivatives given with them are bit for bit the same;
+ *        - so is the temperature derivative of the closed form of
+ *          sum_i x_i ln(phi_i) that the residual enthalpy uses.
  */
 #include "config.h"
 
@@ -49,6 +51,7 @@
 #include <opm/material/components/C10.hpp>
 #include <opm/material/components/SimpleCO2.hpp>
 #include <opm/material/densead/Evaluation.hpp>
+#include <opm/material/eos/CubicEOS.hpp>
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
 #include <opm/material/fluidsystems/GenericOilGasWaterFluidSystem.hpp>
 
@@ -307,6 +310,54 @@ BOOST_AUTO_TEST_CASE(TemperatureDerivativesAreThoseOfAutomaticDifferentiation)
     }
     BOOST_TEST_MESSAGE("largest relative difference to automatic differentiation in temperature: "
                        << largestDifference);
+}
+
+BOOST_AUTO_TEST_CASE(SumLnPhiTemperatureDerivativeIsThatOfAutomaticDifferentiation)
+{
+    using TemperatureEval = Opm::DenseAd::Evaluation<Scalar, 1>;
+    using CubicEOS = Opm::CubicEOS<Scalar, FluidSystem>;
+    Scalar largestDifference = 0.0;
+    for (const auto eos : eosTypes) {
+        for (const auto& state : states) {
+            for (const unsigned phaseIdx : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                BOOST_TEST_CONTEXT("EoS " << static_cast<int>(eos) << ", p = " << state.pressure
+                                   << ", T = " << state.temperature << ", phase " << phaseIdx) {
+                    auto fs = fluidState<Scalar>(state);
+                    FluidSystem::ParameterCache<Scalar> cache(eos);
+                    cache.updatePhase(fs, phaseIdx);
+                    const Scalar analytic = state.temperature
+                        * CubicEOS::sumLnPhiTemperatureDerivative(fs, cache, phaseIdx);
+
+                    Opm::CompositionalFluidState<TemperatureEval, FluidSystem> adFs;
+                    for (const auto phase : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                        adFs.setPressure(phase, TemperatureEval(state.pressure));
+                        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                            adFs.setMoleFraction(phase, compIdx,
+                                                 TemperatureEval(state.composition[compIdx]));
+                        }
+                    }
+                    const auto T = TemperatureEval::createVariable(state.temperature, 0);
+                    adFs.setTemperature(T);
+                    FluidSystem::ParameterCache<TemperatureEval> adCache(eos);
+                    adCache.updatePhase(adFs, phaseIdx);
+                    const auto A = adCache.A(phaseIdx);
+                    const auto B = adCache.B(phaseIdx);
+                    const auto m1 = adCache.m1(phaseIdx);
+                    const auto m2 = adCache.m2(phaseIdx);
+                    const auto Z = state.pressure * adCache.molarVolume(phaseIdx)
+                        / (Opm::Constants<Scalar>::R * T);
+                    const auto sumLnPhi = Z - 1.0 - log(Z - B)
+                        + A / ((m1 - m2) * B) * log((Z + m2 * B) / (Z + m1 * B));
+                    const Scalar ad = state.temperature * sumLnPhi.derivative(0);
+                    const Scalar difference = std::abs(analytic - ad) / std::max(1.0, std::abs(ad));
+                    largestDifference = std::max(largestDifference, difference);
+                    BOOST_CHECK_SMALL(difference, 1e-10);
+                }
+            }
+        }
+    }
+    BOOST_TEST_MESSAGE("largest relative difference of T d(sum x ln phi)/dT to automatic "
+                       "differentiation: " << largestDifference);
 }
 
 BOOST_AUTO_TEST_CASE(MoleNumberDerivativesAreSymmetric)
