@@ -338,8 +338,11 @@ protected:
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
-            phaseStabilityTest_(
-                is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
+            // A single-phase answer of the previous call labels its phase.
+            const int known_phase_idx = L_scalar == 0. ? static_cast<int>(gasPhaseIdx)
+                : L_scalar == 1. ? static_cast<int>(oilPhaseIdx) : -1;
+            phaseStabilityTest_(is_single_phase, K_scalar, fluid_state, z_scalar, eos_type,
+                                verbosity, known_phase_idx);
         }
         if (verbosity >= 1) {
             OpmLog::debug(fmt::format("Inputs after stability test are K = [{}], L = [{}], z = [{}], P = {}, and T = {}",
@@ -849,59 +852,84 @@ protected:
      * it is not, the trial compositions give the starting equilibrium ratios
      * \f$K_i = y_i / x_i\f$ for the two-phase flash.
      *
+     * A mixture that was a single phase in the previous call (\p known_phase_idx)
+     * splits, if at all, by growing the other phase: that trial runs first,
+     * and when it already shows the mixture unstable the second trial, which
+     * cannot make it stable, is skipped. The ratios then come from the one
+     * trial and the feed, as where both trials coincide.
+     *
      * \param[out] isStable Whether the mixture stays in one phase.
      * \param[in,out] K Starting ratios in, refined ratios out for a two-phase mixture.
      * \param[in,out] fluid_state The mixture; a stable one gets \f$z\f$ as both phase compositions.
      * \param z The mixture composition.
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
+     * \param known_phase_idx The phase of a single-phase previous answer, or -1.
      */
     template <class FlashFluidState, class ComponentVector>
-    static void phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
+    static void phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity, const int known_phase_idx = -1)
     {
         OPM_FLASH_COUNT(stabilityTests);
-        bool liquid_trial_is_trivial, vapour_trial_is_trivial;
+        bool liquid_trial_is_trivial = true, vapour_trial_is_trivial = true;
         ComponentVector liquid_trial_composition, vapour_trial_composition;
-        typename FlashFluidState::ValueType liquid_trial_sum, vapour_trial_sum;
+        typename FlashFluidState::ValueType liquid_trial_sum = 0., vapour_trial_sum = 0.;
         ComponentVector vapour_trial_k = K;
         ComponentVector liquid_trial_k = K;
 
         // Both trials are measured against the feed on its stable root.
         const int reference_phase_idx = feedStableRoot_(fluid_state, z, eos_type).phase_idx;
 
-        // Grow a vapour-like trial phase.
-        if (verbosity == 3 || verbosity == 4) {
-            OpmLog::debug("Stability test for vapor phase:");
+        bool vapour_trial_ran = false, liquid_trial_ran = false;
+        bool vapour_trial_finds_no_instability = true, liquid_trial_finds_no_instability = true;
+        const auto grow_vapour_trial = [&]() {
+            if (verbosity == 3 || verbosity == 4) {
+                OpmLog::debug("Stability test for vapor phase:");
+            }
+            checkStability_(fluid_state,
+                            vapour_trial_is_trivial,
+                            vapour_trial_k,
+                            vapour_trial_composition,
+                            vapour_trial_sum,
+                            z,
+                            /*is_vapour_trial=*/true,
+                            reference_phase_idx,
+                            eos_type,
+                            verbosity);
+            vapour_trial_ran = true;
+            vapour_trial_finds_no_instability
+                = (vapour_trial_sum < (1.0 + stabilityTolerance)) || vapour_trial_is_trivial;
+        };
+        const auto grow_liquid_trial = [&]() {
+            if (verbosity == 3 || verbosity == 4) {
+                OpmLog::debug("Stability test for liquid phase:");
+            }
+            checkStability_(fluid_state,
+                            liquid_trial_is_trivial,
+                            liquid_trial_k,
+                            liquid_trial_composition,
+                            liquid_trial_sum,
+                            z,
+                            /*is_vapour_trial=*/false,
+                            reference_phase_idx,
+                            eos_type,
+                            verbosity);
+            liquid_trial_ran = true;
+            liquid_trial_finds_no_instability
+                = (liquid_trial_sum < (1.0 + stabilityTolerance)) || liquid_trial_is_trivial;
+        };
+        const bool may_skip = known_phase_idx >= 0;
+        if (known_phase_idx == static_cast<int>(gasPhaseIdx)) {
+            grow_liquid_trial();
+            if (!may_skip || liquid_trial_finds_no_instability) {
+                grow_vapour_trial();
+            }
         }
-        checkStability_(fluid_state,
-                        vapour_trial_is_trivial,
-                        vapour_trial_k,
-                        vapour_trial_composition,
-                        vapour_trial_sum,
-                        z,
-                        /*is_vapour_trial=*/true,
-                        reference_phase_idx,
-                        eos_type,
-                        verbosity);
-        const bool vapour_trial_finds_no_instability
-            = (vapour_trial_sum < (1.0 + stabilityTolerance)) || vapour_trial_is_trivial;
-
-        // Grow a liquid-like trial phase.
-        if (verbosity == 3 || verbosity == 4) {
-            OpmLog::debug("Stability test for liquid phase:");
+        else {
+            grow_vapour_trial();
+            if (!may_skip || vapour_trial_finds_no_instability) {
+                grow_liquid_trial();
+            }
         }
-        checkStability_(fluid_state,
-                        liquid_trial_is_trivial,
-                        liquid_trial_k,
-                        liquid_trial_composition,
-                        liquid_trial_sum,
-                        z,
-                        /*is_vapour_trial=*/false,
-                        reference_phase_idx,
-                        eos_type,
-                        verbosity);
-        const bool liquid_trial_finds_no_instability
-            = (liquid_trial_sum < (1.0 + stabilityTolerance)) || liquid_trial_is_trivial;
 
         // Neither trial phase found a negative tangent-plane distance.
         isStable = liquid_trial_finds_no_instability && vapour_trial_finds_no_instability;
@@ -915,21 +943,27 @@ protected:
         // The two stationary trial compositions seed the equilibrium ratios.
         else {
             ComponentVector starting_k = K;
-            for (int compIdx = 0; compIdx<numComponents; ++compIdx) {
-                if (Opm::getValue(z[compIdx]) > 0.) {
-                    K[compIdx]
-                        = vapour_trial_composition[compIdx] / liquid_trial_composition[compIdx];
-                } else {
-                    K[compIdx] = 1.;
+            if (vapour_trial_ran && liquid_trial_ran) {
+                for (int compIdx = 0; compIdx<numComponents; ++compIdx) {
+                    if (Opm::getValue(z[compIdx]) > 0.) {
+                        K[compIdx]
+                            = vapour_trial_composition[compIdx] / liquid_trial_composition[compIdx];
+                    } else {
+                        K[compIdx] = 1.;
+                    }
                 }
             }
             // Both trials can reach the same stationary point, as where the
             // feed splits into two liquids, and their ratios of one would
-            // collapse the split. The feed is then the other phase. The trial
-            // is the vapour if it is richer than the feed in the components
-            // with the larger starting ratios, else the liquid.
-            if (trivialSolutionMeasure_(K) < trivialSolutionTolerance) {
-                const auto& trial_composition = vapour_trial_sum > liquid_trial_sum
+            // collapse the split; or only one trial ran. The feed is then
+            // the other phase. The trial is the vapour if it is richer than
+            // the feed in the components with the larger starting ratios,
+            // else the liquid.
+            if (!(vapour_trial_ran && liquid_trial_ran)
+                || trivialSolutionMeasure_(K) < trivialSolutionTolerance) {
+                const bool vapour_trial_decides = vapour_trial_ran
+                    && (!liquid_trial_ran || vapour_trial_sum > liquid_trial_sum);
+                const auto& trial_composition = vapour_trial_decides
                     ? vapour_trial_composition : liquid_trial_composition;
                 Scalar lightness = 0.;
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -944,6 +978,9 @@ protected:
                         K[compIdx] = lightness > 0.
                             ? trial_composition[compIdx] / z[compIdx]
                             : z[compIdx] / trial_composition[compIdx];
+                    }
+                    else {
+                        K[compIdx] = 1.;
                     }
                 }
             }
