@@ -181,6 +181,45 @@ BOOST_AUTO_TEST_CASE(DerivativesAreThoseOfAutomaticDifferentiation)
                        << largestDifference);
 }
 
+BOOST_AUTO_TEST_CASE(MolarVolumeOfEvaluationsHasTheValueOfScalars)
+{
+    // The root of the cubic with derivatives takes its value from the root on
+    // values and its derivatives from the cubic; the derivatives must be those
+    // of central differences of the root on values. (The closed form on
+    // evaluations and on values differ in the last bit for one root in ten.)
+    for (const auto eos : eosTypes) {
+        for (const auto& state : states) {
+            for (const unsigned phaseIdx : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                BOOST_TEST_CONTEXT("EoS " << static_cast<int>(eos) << ", p = " << state.pressure
+                                   << ", T = " << state.temperature << ", phase " << phaseIdx) {
+                    const auto volume = [eos, phaseIdx](const State& s) {
+                        auto fs = fluidState<Scalar>(s);
+                        FluidSystem::ParameterCache<Scalar> cache(eos);
+                        cache.updatePhase(fs, phaseIdx);
+                        return cache.molarVolume(phaseIdx);
+                    };
+                    auto adFs = fluidState<Eval>(state);
+                    FluidSystem::ParameterCache<Eval> adCache(eos);
+                    adCache.updatePhase(adFs, phaseIdx);
+                    const Eval adVolume = adCache.molarVolume(phaseIdx);
+                    BOOST_CHECK_CLOSE_FRACTION(adVolume.value(), volume(state), 1e-14);
+                    for (int j = 0; j < numComponents; ++j) {
+                        constexpr Scalar h = 1e-7;
+                        State up = state;
+                        State down = state;
+                        up.composition[j] += h;
+                        down.composition[j] -= h;
+                        const Scalar difference = (volume(up) - volume(down)) / (2 * h);
+                        BOOST_CHECK_SMALL((adVolume.derivative(j) - difference)
+                                          / std::max(std::abs(difference), 1e-6 * adVolume.value()),
+                                          1e-5);
+                    }
+                }
+            }
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(MoleNumberDerivativesAreSymmetric)
 {
     for (const auto eos : eosTypes) {
