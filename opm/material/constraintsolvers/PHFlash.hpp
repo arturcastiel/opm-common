@@ -497,6 +497,10 @@ private:
         {
             const Scalar L = getValue(fluidState.L());
             valid = L > 0.0 && L < 1.0;
+            if (L == 0.0 || L == 1.0) {
+                singleLabel = L;
+                singleTemperature = T;
+            }
             if (!valid) {
                 return;
             }
@@ -534,6 +538,10 @@ private:
             temperature = T;
             liquidFraction = L;
             splitReusable = false;
+            if (L == 0.0 || L == 1.0) {
+                singleLabel = L;
+                singleTemperature = T;
+            }
         }
 
         void drop()
@@ -541,7 +549,18 @@ private:
             valid = false;
         }
 
+        //! The phase label (L = 0 or 1) of a single-phase trial within maxStep of T, or -1.
+        //! A cold start labelled single-phase goes straight to the stability test, without
+        //! the trial split a cold start with L = -1 first attempts; the test decides as before.
+        Scalar coldLabel(const Scalar T) const
+        {
+            return (singleLabel >= 0.0 && std::abs(T - singleTemperature) <= maxStep) ? singleLabel
+                                                                                     : Scalar(-1.0);
+        }
+
     private:
+        Scalar singleLabel = -1.0;
+        Scalar singleTemperature = 0.0;
         Scalar maxStep;
         bool valid = false;
         std::array<Scalar, numComponents> K{};
@@ -599,7 +618,7 @@ private:
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                     fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
                 }
-                fluidState.setLvalue(ValueType(-1.0));
+                fluidState.setLvalue(ValueType(warmStart.coldLabel(T)));
                 flash(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
             }
             warmStart.store(fluidState, T);
