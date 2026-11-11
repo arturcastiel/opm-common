@@ -397,6 +397,30 @@ BOOST_AUTO_TEST_CASE(NewtonRecoveryRetriesFromStabilityEstimate)
     BOOST_CHECK_LT(Opm::getValue(fs.L()), 1.0);
 }
 
+// A warm start that pairs a converged liquid fraction with stale equilibrium
+// ratios (the Wilson K of the state first flashed, as a thermodynamic hint
+// carries them), at a near-critical state of 90 % C1 at 374 bar and 250 K,
+// sends Newton far outside the composition domain until a phase composition
+// collapses to zero and its EoS cubic has a double root. The solve must end in
+// a split or in a NumericalProblem, not in the assertion on a non-finite molar
+// volume.
+BOOST_AUTO_TEST_CASE(DivergedNewtonIterateIsNotFatal)
+{
+    auto fs = makeState(37404033.333333336, 250.05000000000001, 0.90009990009990004);
+    fs.setKvalue(0, 0.44718821698363259);
+    fs.setKvalue(1, 4.4226466491078623e-07);
+    fs.setLvalue(0.74147865271829072);
+
+    try {
+        BOOST_CHECK(!PtFlash::solve(fs, PTFlashMethod::SsiNewton, 1.e-8, EOSType::PR));
+        // the split found by extrapolated substitution from a cold start
+        BOOST_CHECK_CLOSE(Opm::getValue(fs.L()), 0.74638, 1e-2);
+    }
+    catch (const Opm::NumericalProblem& error) {
+        BOOST_TEST_MESSAGE("reported as a NumericalProblem: " << error.what());
+    }
+}
+
 // A singular FieldMatrix solve must trigger the hybrid SSI fallback rather
 // than escape as an uncaught Dune::FMatrixError.
 BOOST_AUTO_TEST_CASE(SingularJacobianFallsBackToSsi)

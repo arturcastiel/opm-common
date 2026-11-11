@@ -333,3 +333,49 @@ BOOST_AUTO_TEST_CASE(ScalarFlashStoresFugacityCoefficients)
         }
     }
 }
+
+// A CO2-rich feed with C10 at 276 bar and 252 K splits into two liquids, a
+// CO2-rich one and one with 26 % C10 (tangent-plane distance -0.043, checked
+// independently from 400 trial compositions). Both stability trials reach the
+// same C10-rich stationary point. Their ratios of one collapsed the split, and
+// the feed was labelled single-phase.
+BOOST_AUTO_TEST_CASE(CoincidentStabilityTrialsSplit)
+{
+    // CO2-C1, CO2-C10, C1-C10
+    FluidSystem::setInteractionCoefficients({0.1, 0.1, 0.0411});
+    struct RestoreCoefficients
+    {
+        ~RestoreCoefficients() { FluidSystem::setInteractionCoefficients({}); }
+    } restore;
+
+    using ScalarFluidState = Opm::CompositionalFluidState<Scalar, FluidSystem>;
+    using Flash = Opm::PTFlash<Scalar, FluidSystem>;
+    constexpr std::array<Scalar, numComponents> z{0.888, 0.056, 0.056};
+
+    // Plain Newton, without substitution first, does not converge from the
+    // estimate of a single trial phase here.
+    for (const auto method :
+         {PTFlashMethod::Ssi, PTFlashMethod::SsiNewton, PTFlashMethod::SsiAccelerated}) {
+        BOOST_TEST_CONTEXT(Opm::ptFlashMethodToString(method)) {
+            ScalarFluidState fs;
+            fs.setPressure(FluidSystem::oilPhaseIdx, 276e5);
+            fs.setPressure(FluidSystem::gasPhaseIdx, 276e5);
+            fs.setTemperature(252.0);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fs.setMoleFraction(compIdx, z[compIdx]);
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fs.setKvalue(compIdx, fs.wilsonK_(compIdx));
+            }
+            fs.setLvalue(-1.0);
+
+            BOOST_REQUIRE(!Flash::flash_solve_scalar(fs, method, 1e-8, EOSType::PR));
+            // the split of the independent check: the C10-rich liquid is the oil
+            BOOST_CHECK_SMALL(fs.L() - 0.1674, 1e-3);
+            BOOST_CHECK_SMALL(fs.moleFraction(FluidSystem::oilPhaseIdx, 0) - 0.6615, 1e-3);
+            BOOST_CHECK_SMALL(fs.moleFraction(FluidSystem::oilPhaseIdx, 2) - 0.2611, 1e-3);
+            BOOST_CHECK_SMALL(fs.moleFraction(FluidSystem::gasPhaseIdx, 0) - 0.9336, 1e-3);
+            BOOST_CHECK_SMALL(fs.moleFraction(FluidSystem::gasPhaseIdx, 2) - 0.0147, 1e-3);
+        }
+    }
+}

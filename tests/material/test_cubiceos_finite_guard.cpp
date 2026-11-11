@@ -44,6 +44,7 @@
 
 #include <opm/common/Exceptions.hpp>
 
+#include <opm/material/common/PolynomialUtils.hpp>
 #include <opm/material/components/C1.hpp>
 #include <opm/material/components/N2.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
@@ -57,6 +58,8 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <array>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -253,5 +256,72 @@ BOOST_AUTO_TEST_CASE(BenignStateUnaffected)
     for (const auto method : {PTFlashMethod::Ssi, PTFlashMethod::SsiNewton}) {
         auto fs = makeState(100e5, 300.0);
         BOOST_CHECK_NO_THROW(PtFlash::solve(fs, method, 1e-8, EOSType::PR));
+    }
+}
+
+// A cubic with a double root has a zero discriminant, whose computed sign is
+// round-off. acos or acosh then received an argument just outside its domain
+// and the roots came back NaN, which computeMolarVolume() asserts against.
+// The first two cubics are (Z - 0.001)^2 (Z - s), which round-off sent to the
+// one-root and to the three-root branch. The third is the cubic of a phase
+// composition that collapsed to zero (A and B near zero: Z^2 (Z - 1)) in a
+// diverged Newton iterate of a recorded ssi+newton flash.
+BOOST_AUTO_TEST_CASE(CubicRootsOfADoubleRootAreFinite)
+{
+    struct Cubic
+    {
+        Scalar b, c, d, largestRoot;
+    };
+    const auto doubleRoot = [](const Scalar r, const Scalar s) {
+        return Cubic{-(2 * r + s), r * r + 2 * r * s, -r * r * s, s};
+    };
+    const std::array cubics{
+        doubleRoot(0.001, 0.042),
+        doubleRoot(0.001, 0.524),
+        Cubic{-0.99999999868340983, -2.6331803564856712e-09, 1.7334096928811222e-18, 1.0}};
+
+    const auto check = [](const Cubic& cubic, const auto& roots, const unsigned numRoots) {
+        BOOST_REQUIRE(numRoots == 1 || numRoots == 3);
+        for (unsigned rootIdx = 0; rootIdx < numRoots; ++rootIdx) {
+            const Scalar Z = Opm::getValue(roots[rootIdx]);
+            BOOST_REQUIRE(std::isfinite(Z));
+            BOOST_CHECK_SMALL(((Z + cubic.b) * Z + cubic.c) * Z + cubic.d, 1e-15);
+        }
+        BOOST_CHECK_CLOSE(Opm::getValue(roots[numRoots - 1]), cubic.largestRoot, 1e-6);
+    };
+
+    for (const auto& cubic : cubics) {
+        BOOST_TEST_CONTEXT("largest root " << cubic.largestRoot) {
+            std::array<Scalar, 3> roots{};
+            const unsigned numRoots = Opm::cubicRoots(roots.data(), Scalar{1}, cubic.b, cubic.c, cubic.d);
+            check(cubic, roots, numRoots);
+
+            // The derivatives of the roots, as the Newton flash takes them,
+            // are finite too.
+            std::array<Evaluation, 3> rootEvals{0.0, 0.0, 0.0};
+            const unsigned numRootEvals = Opm::cubicRoots(rootEvals.data(),
+                                                          Evaluation(1.0),
+                                                          Evaluation(cubic.b, 0),
+                                                          Evaluation(cubic.c, 1),
+                                                          Evaluation(cubic.d, 2));
+            check(cubic, rootEvals, numRootEvals);
+            for (unsigned rootIdx = 0; rootIdx < numRootEvals; ++rootIdx) {
+                for (unsigned varIdx = 0; varIdx < 3; ++varIdx) {
+                    BOOST_CHECK(std::isfinite(rootEvals[rootIdx].derivative(varIdx)));
+                }
+            }
+
+            // The single extreme root the equation of state asks for is the
+            // same, finite root.
+            for (const bool largest : {false, true}) {
+                std::array<Scalar, 3> extreme{};
+                const unsigned numExtreme = Opm::cubicExtremeRoot(
+                    extreme.data(), Scalar{1}, cubic.b, cubic.c, cubic.d, largest);
+                BOOST_REQUIRE_EQUAL(numExtreme, numRoots);
+                const Scalar Z = largest ? extreme[numExtreme - 1] : extreme[0];
+                BOOST_REQUIRE(std::isfinite(Z));
+                BOOST_CHECK_EQUAL(Z, largest ? roots[numRoots - 1] : roots[0]);
+            }
+        }
     }
 }
