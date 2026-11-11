@@ -1508,6 +1508,17 @@ protected:
                   fluid_state, param_cache, 0u, coefficients, derivatives);
           };
 
+    //! Whether the fluid system also gives the pressure derivatives of the
+    //! logarithms of the fugacity coefficients; see analyticFugacityJacobians_().
+    static constexpr bool hasFugacityPressureDerivatives_
+        = requires(const CompositionalFluidState<Scalar, FluidSystem>& fluid_state,
+                   const typename FluidSystem::template ParameterCache<Scalar>& param_cache,
+                   std::array<Scalar, numComponents>& coefficients,
+                   std::array<std::array<Scalar, numComponents>, numComponents>& derivatives) {
+              FluidSystem::fugacityCoefficientsAndDerivatives(
+                  fluid_state, param_cache, 0u, coefficients, derivatives, coefficients);
+          };
+
     /*!
      * \brief Solves \f$(H + s\,\mathrm{diag}(d))\,\Delta = r\f$ for the
      *        leading n x n block, by Cholesky factorisation of the lower
@@ -2290,12 +2301,19 @@ protected:
      *        \f$\partial (f_i / p) / \partial w_j = (p_\alpha / p)\, \phi_i
      *        (\delta_{ij} + w_i\, \partial \ln\phi_i / \partial w_j)\f$
      *        for the mole fractions \f$\mathbf w\f$ of phase \f$\alpha\f$.
+     *
+     * With \p fugacity_state, for an isothermal flash with both phases at one
+     * pressure and a fluid system that gives the pressure derivatives of
+     * \f$\ln\phi\f$, also the state column of fugacityDerivatives_(),
+     * \f$G = \partial ((f^L - f^V) / p) / \partial p\f$ with
+     * \f$\partial f_i / \partial p = w_i \phi_i (1 + p\, \partial \ln\phi_i / \partial p)\f$.
      */
     template <typename FlashFluidStateScalar>
     static void analyticFugacityJacobians_(const FlashFluidStateScalar& fluid_state_scalar,
                                            const EOSType& eos_type,
                                            ComponentMatrix& liquid_jacobian,
-                                           ComponentMatrix& vapour_jacobian)
+                                           ComponentMatrix& vapour_jacobian,
+                                           FugacityStateColumns* fugacity_state = nullptr)
     {
         using Vector = std::array<Scalar, numComponents>;
         using Matrix = std::array<Vector, numComponents>;
@@ -2320,10 +2338,24 @@ protected:
             param_cache.updatePhase(state, phaseIdx);
             Vector coefficients;
             Matrix derivatives;
-            FluidSystem::fugacityCoefficientsAndDerivatives(
-                state, param_cache, phaseIdx, coefficients, derivatives);
-            ComponentMatrix& jacobian
-                = phaseIdx == static_cast<unsigned>(oilPhaseIdx) ? liquid_jacobian : vapour_jacobian;
+            Vector pressure_derivatives;
+            if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+                if (fugacity_state) {
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        state, param_cache, phaseIdx, coefficients, derivatives,
+                        pressure_derivatives);
+                }
+                else {
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        state, param_cache, phaseIdx, coefficients, derivatives);
+                }
+            }
+            else {
+                FluidSystem::fugacityCoefficientsAndDerivatives(
+                    state, param_cache, phaseIdx, coefficients, derivatives);
+            }
+            const bool liquid = phaseIdx == static_cast<unsigned>(oilPhaseIdx);
+            ComponentMatrix& jacobian = liquid ? liquid_jacobian : vapour_jacobian;
             const Scalar pressure_ratio = state.pressure(phaseIdx) / pref;
             for (unsigned i = 0; i < numComponents; ++i) {
                 const Scalar scaled = pressure_ratio * coefficients[i];
@@ -2333,7 +2365,28 @@ protected:
                 }
                 jacobian[i][i] += scaled;
             }
+            if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+                if (fugacity_state) {
+                    for (unsigned i = 0; i < numComponents; ++i) {
+                        const Scalar w = state.moleFraction(phaseIdx, i);
+                        const Scalar column = w * coefficients[i]
+                            * (1.0 + pref * pressure_derivatives[i]) / pref;
+                        (*fugacity_state)[i][0] = liquid ? column : (*fugacity_state)[i][0] - column;
+                    }
+                }
+            }
         }
+    }
+
+    //! Whether analyticFugacityJacobians_() gives the state column too.
+    template <typename FlashFluidStateScalar>
+    static bool hasAnalyticStateColumn_(const FlashFluidStateScalar& fluid_state_scalar)
+    {
+        if constexpr (!isThermal && hasFugacityPressureDerivatives_) {
+            return Opm::getValue(fluid_state_scalar.pressure(oilPhaseIdx))
+                == Opm::getValue(fluid_state_scalar.pressure(gasPhaseIdx));
+        }
+        return false;
     }
 
     /*!
@@ -2556,6 +2609,20 @@ protected:
         if (newton_jacobian && newton_jacobian->state == jacobianState_(fluid_state_scalar)) {
             // Newton assembled the fugacity rows of dF/du at this state; only
             // those of dF/ds remain.
+            bool analytic_column = false;
+            if constexpr (hasFugacityPressureDerivatives_) {
+                if (hasAnalyticStateColumn_(fluid_state_scalar)) {
+                    ComponentMatrix unused_liquid;
+                    ComponentMatrix unused_vapour;
+                    analyticFugacityJacobians_(fluid_state_scalar, eos_type, unused_liquid,
+                                               unused_vapour, &fugacity_state);
+                    analytic_column = true;
+                }
+            }
+            if (!analytic_column) {
+                fugacityDerivatives_<false>(
+                    fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+            }
             const auto& jacobian = newton_jacobian->jacobian;
             for (unsigned row = 0; row < numComponents; ++row) {
                 for (unsigned col = 0; col < numComponents; ++col) {
@@ -2563,15 +2630,21 @@ protected:
                     vapour_jacobian[row][col] = -jacobian[numComponents + row][numComponents + col];
                 }
             }
-            fugacityDerivatives_<false>(
-                fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
         }
         else if constexpr (hasFugacityDerivatives_) {
             // The fugacity rows of dF/du on values; only those of dF/ds need
             // automatic differentiation.
-            analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian);
-            fugacityDerivatives_<false>(
-                fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+            if (hasAnalyticStateColumn_(fluid_state_scalar)) {
+                // And the column of dF/ds too.
+                analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
+                                           vapour_jacobian, &fugacity_state);
+            }
+            else {
+                analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
+                                           vapour_jacobian);
+                fugacityDerivatives_<false>(
+                    fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+            }
         }
         else {
             fugacityDerivatives_<true>(
