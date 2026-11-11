@@ -122,6 +122,22 @@ class PTFlash
     // does not give a tangent-plane distance.
     static constexpr Scalar maxFugacityCoefficient = 1e10;
     static constexpr Scalar minFugacityCoefficient = 1e-10;
+    // The iteration limit of the Newton methods of the two-phase split.
+    // Newton that has not halved its residual for
+    // newtonMaxStepsWithoutProgress steps is not converging to the root it
+    // started near: it wanders, or stalls on a local minimum of the residual
+    // norm where the Jacobian is nearly singular, and would only stop at the
+    // iteration limit. It is stopped, so that the hybrid method falls back to
+    // substitution from the same ratios at once. Converging Newton halves the
+    // residual every step.
+    static constexpr unsigned newtonMaxIterations = 1000;
+    static constexpr unsigned newtonMaxStepsWithoutProgress = 10;
+    static constexpr Scalar newtonProgressFactor = 0.5;
+    // The shifts of the modified Cholesky factorisation of
+    // gibbsNewtonComposition_(), relative to the ideal-mixture diagonal of
+    // the Hessian: none, then firstHessianShift times powers of ten.
+    static constexpr Scalar firstHessianShift = 1e-4;
+    static constexpr int maxHessianShifts = 8;
 
 public:
     /*!
@@ -1384,8 +1400,351 @@ protected:
             && trivialSolutionMeasure_(equilibrium_ratios) < trivialSolutionTolerance;
     }
 
+    //! Whether the fluid system gives, with the fugacity coefficients of a
+    //! phase on values, the derivatives of their logarithms in the phase
+    //! mole fractions; see gibbsNewtonComposition_().
+    static constexpr bool hasFugacityDerivatives_
+        = requires(const CompositionalFluidState<Scalar, FluidSystem>& fluid_state,
+                   const typename FluidSystem::template ParameterCache<Scalar>& param_cache,
+                   std::array<Scalar, numComponents>& coefficients,
+                   std::array<std::array<Scalar, numComponents>, numComponents>& derivatives) {
+              FluidSystem::fugacityCoefficientsAndDerivatives(
+                  fluid_state, param_cache, 0u, coefficients, derivatives);
+          };
+
+    /*!
+     * \brief Solves \f$(H + s\,\mathrm{diag}(d))\,\Delta = r\f$ for the
+     *        leading n x n block, by Cholesky factorisation of the lower
+     *        triangle, with the smallest shift s of 0, firstHessianShift,
+     *        10 firstHessianShift, ... that leaves the matrix positive
+     *        definite.
+     *
+     * \return false where no shift does
+     */
+    template <class Vector, class Matrix>
+    static bool solveModifiedCholesky_(const Matrix& hessian,
+                                       const Vector& diagonal,
+                                       const Vector& rhs,
+                                       const unsigned size,
+                                       Vector& solution)
+    {
+        const unsigned n = std::min<unsigned>(size, std::tuple_size_v<Vector>);
+        Matrix factor{};
+        Scalar shift = 0.;
+        for (int attempt = 0; attempt < maxHessianShifts; ++attempt) {
+            bool positive_definite = true;
+            for (unsigned j = 0; j < n && positive_definite; ++j) {
+                Scalar pivot = hessian[j][j] + shift * diagonal[j];
+                for (unsigned k = 0; k < j; ++k) {
+                    pivot -= factor[j][k] * factor[j][k];
+                }
+                // Relative to the ideal-mixture diagonal, which is positive.
+                if (!(pivot > 1e-12 * diagonal[j])) {
+                    positive_definite = false;
+                    break;
+                }
+                factor[j][j] = std::sqrt(pivot);
+                for (unsigned i = j + 1; i < n; ++i) {
+                    Scalar entry = hessian[i][j];
+                    for (unsigned k = 0; k < j; ++k) {
+                        entry -= factor[i][k] * factor[j][k];
+                    }
+                    factor[i][j] = entry / factor[j][j];
+                }
+            }
+            if (positive_definite) {
+                for (unsigned i = 0; i < n; ++i) {
+                    Scalar entry = rhs[i];
+                    for (unsigned k = 0; k < i; ++k) {
+                        entry -= factor[i][k] * solution[k];
+                    }
+                    solution[i] = entry / factor[i][i];
+                }
+                for (unsigned i = n; i-- > 0;) {
+                    Scalar entry = solution[i];
+                    for (unsigned k = i + 1; k < n; ++k) {
+                        entry -= factor[k][i] * solution[k];
+                    }
+                    solution[i] = entry / factor[i][i];
+                }
+                return true;
+            }
+            shift = attempt == 0 ? firstHessianShift : 10. * shift;
+        }
+        return false;
+    }
+
+    /*!
+     * \brief Newton's method for the two-phase compositions as the
+     *        minimisation of the Gibbs energy in the vapour mole numbers.
+     *
+     * With \f$v_i\f$ the vapour and \f$l_i = z_i - v_i\f$ the liquid mole
+     * numbers per mole of feed, \f$V = \sum_i v_i\f$ and \f$L = \sum_i l_i\f$,
+     * the gradient of the Gibbs energy is
+     * \f$g_i = \ln f_i^{V} - \ln f_i^{L}\f$ and its Hessian
+     *
+     * \f[ H_{ij} = \frac{1}{V}\left(\frac{\delta_{ij}}{y_i} - 1 + \Phi^{V}_{ij}\right)
+     *   + \frac{1}{L}\left(\frac{\delta_{ij}}{x_i} - 1 + \Phi^{L}_{ij}\right), \qquad
+     *   \Phi_{ij} = n \frac{\partial \ln\phi_i}{\partial n_j}, \f]
+     *
+     * from the analytic composition derivatives of the fluid system
+     * (Michelsen 1982; Michelsen and Mollerup 2007): one unknown per present
+     * component instead of \f$2 N_c + 1\f$, a symmetric Hessian that is
+     * positive definite at a stable split, and no automatic differentiation.
+     * Where the Hessian is not positive definite, a multiple of its
+     * ideal-mixture diagonal is added (solveModifiedCholesky_()); in the
+     * limit the step becomes a scaled substitution step.
+     *
+     * The convergence test, the stall stop and the iteration limit are those
+     * of the composition Newton on \f$(\mathbf x, \mathbf y, L)\f$, on its
+     * residual, so that both stop at the same accuracy. The converged
+     * iterate then takes the step computed there, without a further
+     * evaluation. That Newton's Jacobian at the answer is returned for the
+     * derivative pass.
+     *
+     * Mole numbers keep both phases present: a split whose answer is a
+     * negative flash, with a phase amount below zero, lies outside them.
+     * Where a step leaves \f$0 < v_i < z_i\f$, or Newton stalls or finds no
+     * positive definite Hessian, it gives up, and the composition Newton
+     * restarts from the same ratios, as without this method.
+     *
+     * \return nothing where the start is not a split (L outside (0, 1),
+     *         fewer than two present components, coincident phases) or
+     *         Newton gave up.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static std::optional<NewtonJacobian> gibbsNewtonComposition_(ComponentVector& K,
+                                                                 Scalar& L,
+                                                                 FlashFluidState& fluid_state,
+                                                                 const ComponentVector& z,
+                                                                 const Scalar tolerance,
+                                                                 const EOSType& eos_type,
+                                                                 const int verbosity)
+    {
+        using Vector = std::array<Scalar, numComponents>;
+        using Matrix = std::array<Vector, numComponents>;
+
+        // The unknowns are the vapour mole numbers of the components present
+        // in the feed, by position in present; absent components stay absent
+        // from both phases.
+        std::array<unsigned, numComponents> present{};
+        unsigned num_present = 0;
+        Vector vapour{};
+        Vector feed{};
+        if (!(L > 0. && L < 1.)) {
+            return std::nullopt;
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(z[compIdx] > 0.)) {
+                continue;
+            }
+            const Scalar moles
+                = z[compIdx] * (1. - L) * K[compIdx] / (L + (1. - L) * K[compIdx]);
+            if (!(moles > 0. && moles < z[compIdx])) {
+                return std::nullopt;
+            }
+            present[num_present] = compIdx;
+            vapour[num_present] = moles;
+            feed[num_present] = z[compIdx];
+            ++num_present;
+        }
+        if (num_present < 2) {
+            return std::nullopt;
+        }
+
+        constexpr std::size_t num_equations = numFlashUnknowns;
+        Dune::FieldVector<Scalar, num_equations> residual;
+        Vector liquid_composition{};
+        Vector vapour_composition{};
+        Scalar liquid_moles = 0.;
+        Scalar vapour_moles = 0.;
+        Scalar liquid_fraction = 0.;
+        const auto set_compositions = [&]() {
+            liquid_moles = 0.;
+            vapour_moles = 0.;
+            for (unsigned a = 0; a < num_present; ++a) {
+                vapour_moles += vapour[a];
+                liquid_moles += feed[a] - vapour[a];
+            }
+            for (unsigned a = 0; a < num_present; ++a) {
+                liquid_composition[present[a]] = (feed[a] - vapour[a]) / liquid_moles;
+                vapour_composition[present[a]] = vapour[a] / vapour_moles;
+            }
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, liquid_composition[compIdx]);
+                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, vapour_composition[compIdx]);
+            }
+            liquid_fraction = liquid_moles / (liquid_moles + vapour_moles);
+        };
+
+        // The trivial solution is a stationary point of the Gibbs energy too;
+        // the composition Newton rejects a start on it.
+        set_compositions();
+        if (phasesCoincide_(fluid_state)) {
+            return std::nullopt;
+        }
+
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        const Scalar pressure = Opm::getValue(fluid_state.pressure(oilPhaseIdx));
+        Matrix liquid_derivatives{};
+        Matrix vapour_derivatives{};
+
+        // The state at the current unknowns, with its fugacity coefficients,
+        // their derivatives and the residual of the composition Newton;
+        // returns the residual norm, infinite where it is not finite.
+        const auto evaluate = [&]() {
+            OPM_FLASH_COUNT(newtonIterations);
+            set_compositions();
+            for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                            static_cast<unsigned>(gasPhaseIdx)}) {
+                param_cache.updatePhase(fluid_state, phaseIdx);
+                Vector coefficients;
+                FluidSystem::fugacityCoefficientsAndDerivatives(
+                    fluid_state, param_cache, phaseIdx, coefficients,
+                    phaseIdx == static_cast<unsigned>(oilPhaseIdx) ? liquid_derivatives
+                                                                   : vapour_derivatives);
+                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    fluid_state.setFugacityCoefficient(phaseIdx, compIdx, coefficients[compIdx]);
+                }
+            }
+            Scalar liquid_sum = 0.;
+            Scalar vapour_sum = 0.;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                residual[compIdx] = -z[compIdx]
+                    + liquid_fraction * liquid_composition[compIdx]
+                    + (1 - liquid_fraction) * vapour_composition[compIdx];
+                residual[compIdx + numComponents] = (fluid_state.fugacity(oilPhaseIdx, compIdx)
+                    - fluid_state.fugacity(gasPhaseIdx, compIdx)) / pressure;
+                liquid_sum += liquid_composition[compIdx];
+                vapour_sum += vapour_composition[compIdx];
+            }
+            residual[num_equations - 1] = liquid_sum - vapour_sum;
+            const Scalar norm = residual.two_norm();
+            return std::isfinite(norm) ? norm : std::numeric_limits<Scalar>::infinity();
+        };
+
+        // The Newton step on the present components, from the gradient and
+        // Hessian of the Gibbs energy at the last evaluation.
+        const auto newton_step = [&](Vector& step) {
+            Vector gradient{};
+            Vector ideal_diagonal{};
+            Matrix hessian{};
+            for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                            static_cast<unsigned>(gasPhaseIdx)}) {
+                const bool liquid = phaseIdx == static_cast<unsigned>(oilPhaseIdx);
+                const Vector& composition = liquid ? liquid_composition : vapour_composition;
+                const Matrix& derivatives = liquid ? liquid_derivatives : vapour_derivatives;
+                const Scalar moles = liquid ? liquid_moles : vapour_moles;
+                for (unsigned a = 0; a < num_present; ++a) {
+                    const unsigned i = present[a];
+                    // n d ln phi_i / d n_j = d ln phi_i / d x_j - sum_k x_k d ln phi_i / d x_k
+                    Scalar weighted = 0.;
+                    for (unsigned b = 0; b < num_present; ++b) {
+                        weighted += composition[present[b]] * derivatives[i][present[b]];
+                    }
+                    for (unsigned b = 0; b < num_present; ++b) {
+                        hessian[a][b] += (derivatives[i][present[b]] - weighted - 1.) / moles;
+                    }
+                    const Scalar ideal = 1. / (moles * composition[i]);
+                    hessian[a][a] += ideal;
+                    ideal_diagonal[a] += ideal;
+                }
+            }
+            for (unsigned a = 0; a < num_present; ++a) {
+                const unsigned i = present[a];
+                // -g_i = ln f_i^L - ln f_i^V
+                gradient[a] = log(fluid_state.fugacity(oilPhaseIdx, i)
+                                  / fluid_state.fugacity(gasPhaseIdx, i));
+            }
+            return solveModifiedCholesky_(hessian, ideal_diagonal, gradient, num_present, step);
+        };
+
+        // The composition Newton in (x, y, L) takes over from the start.
+        const auto give_up = [verbosity](const char* reason) -> std::optional<NewtonJacobian> {
+            if (verbosity >= 1) {
+                OpmLog::debug(fmt::format(" The Gibbs-energy Newton {}; Newton in (x, y, L) "
+                                          "restarts from the same ratios.", reason));
+            }
+            return std::nullopt;
+        };
+
+        bool converged = false;
+        unsigned iteration = 0;
+        unsigned steps_without_progress = 0;
+        Scalar residual_norm = evaluate();
+        Scalar progress_residual = residual_norm;
+        while (iteration < newtonMaxIterations) {
+            if (verbosity >= 1) {
+                OpmLog::debug(fmt::format(" newton residual is {}", residual_norm));
+            }
+            converged = residual_norm < tolerance;
+            if (converged) {
+                break;
+            }
+            if (residual_norm < newtonProgressFactor * progress_residual) {
+                progress_residual = residual_norm;
+                steps_without_progress = 0;
+            }
+            else if (++steps_without_progress >= newtonMaxStepsWithoutProgress
+                     || !std::isfinite(residual_norm)) {
+                return give_up("did not halve its residual");
+            }
+
+            Vector step{};
+            if (!newton_step(step)) {
+                return give_up("has no positive definite Hessian");
+            }
+            for (unsigned a = 0; a < num_present; ++a) {
+                vapour[a] += step[a];
+                if (!(vapour[a] > 0. && vapour[a] < feed[a])) {
+                    return give_up("leaves the mole-number bounds");
+                }
+            }
+            residual_norm = evaluate();
+            ++iteration;
+        }
+        if (!converged) {
+            return give_up("reached the iteration limit");
+        }
+        // The step at the converged iterate costs a factorisation, not an
+        // evaluation, and takes the answer from within the tolerance to within
+        // about the square of the remaining error of the exact split. Close to
+        // a critical point, where a residual just below the tolerance leaves
+        // L uncertain in the fifth digit, this matters.
+        Vector last_step{};
+        if (newton_step(last_step)) {
+            bool inside = true;
+            for (unsigned a = 0; a < num_present; ++a) {
+                inside = inside && vapour[a] + last_step[a] > 0.
+                    && vapour[a] + last_step[a] < feed[a];
+            }
+            if (inside) {
+                for (unsigned a = 0; a < num_present; ++a) {
+                    vapour[a] += last_step[a];
+                }
+                set_compositions();
+            }
+        }
+
+        // The compositions of the answer are in the fluid state.
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            K[compIdx] = vapour_composition[compIdx] / liquid_composition[compIdx];
+            fluid_state.setKvalue(compIdx, K[compIdx]);
+        }
+        L = liquid_fraction;
+        fluid_state.setLvalue(L);
+        return NewtonJacobian{compositionJacobian_(fluid_state, eos_type),
+                              jacobianState_(fluid_state)};
+    }
+
     /*!
      * \brief Newton's method for the two-phase compositions.
+     *
+     * Where the fluid system gives the composition derivatives of its
+     * fugacity coefficients and the start is a split, the Gibbs-energy
+     * Newton of gibbsNewtonComposition_() in N unknowns solves the same
+     * equations; otherwise:
      *
      * The unknowns are \f$(\mathbf x, \mathbf y, L)\f$ and the residuals,
      * assembled by assembleNewton_(), are the component balances, equal
@@ -1414,6 +1773,16 @@ protected:
         constexpr std::size_t num_unknowns = numMisciblePhases * numMiscibleComponents + 1;
         using NewtonVector = Dune::FieldVector<Scalar, num_equations>;
         using NewtonMatrix = Dune::FieldMatrix<Scalar, num_equations, num_unknowns>;
+
+        // Newton in the vapour mole numbers where the fluid system gives the
+        // composition derivatives and the start is a split.
+        if constexpr (hasFugacityDerivatives_
+                      && std::is_same_v<typename FlashFluidState::ValueType, Scalar>) {
+            if (auto gibbs_jacobian = gibbsNewtonComposition_(
+                    K, L, fluid_state, z, tolerance, eos_type, verbosity)) {
+                return *std::move(gibbs_jacobian);
+            }
+        }
 
         NewtonVector newton_step(0.);
         NewtonVector residual(0.);
@@ -1520,15 +1889,9 @@ protected:
 
         bool converged = false;
         unsigned iteration = 0;
-        constexpr unsigned max_iterations = 1000;
-        // Newton that has not halved its residual for this many steps is not
-        // converging to the root it started near: it wanders, or stalls on a
-        // local minimum of the residual norm where the Jacobian is nearly
-        // singular, and would only stop at the iteration limit. Stop it, so
-        // that the hybrid method falls back to substitution from the same
-        // ratios at once. Converging Newton halves the residual every step.
-        constexpr unsigned max_steps_without_progress = 10;
-        constexpr Scalar progress_factor = 0.5;
+        constexpr unsigned max_iterations = newtonMaxIterations;
+        constexpr unsigned max_steps_without_progress = newtonMaxStepsWithoutProgress;
+        constexpr Scalar progress_factor = newtonProgressFactor;
         unsigned steps_without_progress = 0;
 
         Scalar residual_norm = evaluate();
