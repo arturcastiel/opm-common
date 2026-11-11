@@ -73,6 +73,8 @@
 #include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
 #include <opm/material/constraintsolvers/PTFlashMethod.hpp>
+#include <opm/material/densead/Evaluation.hpp>
+#include <opm/material/fluidstates/CompositionalFluidState.hpp>
 
 #include <opm/common/OpmLog/OpmLog.hpp>
 
@@ -215,7 +217,8 @@ struct PHFlash {
         WarmStart warmStart(std::min(Scalar(0.1) * (tHi - tLo), Scalar(15.0)));
 
         auto residualAt = [&](const Scalar T) {
-            return flashedResidual(fluidState, T, hSpec, cfg, warmStart,
+            using ValueType = typename FluidState::ValueType;
+            return flashedResidual(fluidState, ValueType(T), hSpec, cfg, warmStart,
                                    twoPhaseMethod, ptTolerance, eosType, verbosity);
         };
 
@@ -246,9 +249,11 @@ struct PHFlash {
         // A flashing search with the built-in provider starts from the
         // incoming temperature, which a simulator changes little between
         // iterations and time steps, and from the incoming equilibrium
-        // ratios of a two-phase state (K only, rule 1 of WarmStart). Where
-        // no bracket is found next to it, the whole interval is searched.
-        std::optional<Bracket> bracket;
+        // ratios of a two-phase state (K only, rule 1 of WarmStart). It runs
+        // Newton's method on a copy of the state whose temperature is its one
+        // AD variable, so that every flash also gives dr/dT. Where it does
+        // not converge, or the flash of the state at its solution does not
+        // confirm it, the whole interval is searched.
         const Scalar incoming = getValue(fluidState.temperature(0));
         if (builtInProvider && !searchWithoutFlash && incoming > tLo && incoming < tHi) {
             warmStart.storeIncoming(fluidState, incoming);
@@ -260,11 +265,36 @@ struct PHFlash {
                 }
                 return cp;
             };
-            bracket = localBracket(evaluate, incoming, tLo, tHi, idealGasCp, cfg);
+            SearchState searchState;
+            for (const unsigned phaseIdx : {static_cast<unsigned>(FluidSystem::oilPhaseIdx),
+                                            static_cast<unsigned>(FluidSystem::gasPhaseIdx)}) {
+                searchState.setPressure(phaseIdx, getValue(fluidState.pressure(phaseIdx)));
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                searchState.setMoleFraction(compIdx, getValue(fluidState.moleFraction(compIdx)));
+            }
+            auto evaluateWithSlope = [&](const Scalar T) -> std::optional<SlopedTrial> {
+                const auto r = flashedResidual(searchState, SearchEval::createVariable(T, 0),
+                                               hSpec, cfg, warmStart, twoPhaseMethod,
+                                               ptTolerance, eosType, verbosity);
+                if (!r) {
+                    return std::nullopt;
+                }
+                return SlopedTrial{Trial{T, *r}, slopeAlongFlash(searchState, cfg, eosType)};
+            };
+            if (const auto solution = newton(evaluateWithSlope, incoming, tLo, tHi, idealGasCp, cfg)) {
+                const auto residual = residualAt(solution->temperature);
+                if (residual && std::abs(*residual) <= cfg.enthalpyTolerance
+                    && !(solution->slope > 0.0
+                         && std::abs(*residual) > confirmSteps * cfg.temperatureTolerance
+                                                  * solution->slope))
+                {
+                    return true;
+                }
+            }
         }
-        if (!bracket) {
-            bracket = findBracket(evaluate, tLo, tHi, cfg, verbosity);
-        }
+
+        const auto bracket = findBracket(evaluate, tLo, tHi, cfg, verbosity);
         if (!bracket) {
             return false;
         }
@@ -297,6 +327,40 @@ private:
 
     //! Limit on the evaluations of one bracketToward() call.
     static constexpr int maxBoundarySteps = 64;
+
+    //! A trial with the slope dr/dT [J/(mol K)], where that can be evaluated.
+    struct SlopedTrial
+    {
+        Trial trial;
+        std::optional<Scalar> slope;
+    };
+
+    //! A converged Newton iteration: the temperature, and the last slope
+    //! dr/dT it used (0 where it converged on a bracket without one).
+    struct NewtonSolution
+    {
+        Scalar temperature;
+        Scalar slope;
+    };
+
+    //! The state of the Newton iteration: the temperature is the one AD
+    //! variable, so that the isothermal flash carries dx/dT, dy/dT, dL/dT.
+    using SearchEval = DenseAd::Evaluation<Scalar, 1>;
+    using SearchState = CompositionalFluidState<SearchEval, FluidSystem>;
+
+    //! Distance [K] from T of the two states whose enthalpies give dr/dT:
+    //! small against the curvature of H(T), large against its round-off.
+    static constexpr Scalar slopeStep = 1e-3;
+
+    //! Limit on the iterations of newton().
+    static constexpr int maxNewtonIterations = 30;
+
+    //! Limit on one Newton step [K] before a bracket is found.
+    static constexpr Scalar maxNewtonStep = 50.0;
+
+    //! The flash of the state at the Newton solution confirms it when its
+    //! residual is within this many temperature tolerances times dr/dT.
+    static constexpr Scalar confirmSteps = 10.0;
 
     /*!
      * \brief Warm start between nearby trials: the equilibrium ratios of a
@@ -397,7 +461,8 @@ private:
      * \brief Flash the state at T and return r = H(T) - hSpec of the flashed
      *        state.
      *
-     * A warm-started flash that fails drops the seed and retries cold.
+     * A warm-started flash that fails drops the seed and retries cold. A
+     * temperature that carries a derivative passes it on to the split.
      *
      * \return r(T), or nothing where the isothermal flash or the enthalpy
      *         throws std::runtime_error or Dune::FMatrixError, or where r is
@@ -405,7 +470,7 @@ private:
      */
     template <class FluidState>
     static std::optional<Scalar> flashedResidual(FluidState& fluidState,
-                                                 const Scalar T,
+                                                 const typename FluidState::ValueType& temperature,
                                                  const Scalar hSpec,
                                                  const Config& cfg,
                                                  WarmStart& warmStart,
@@ -418,7 +483,8 @@ private:
         using ValueType = typename FluidState::ValueType;
 
         OPM_FLASH_COUNT(phEvaluations);
-        fluidState.setTemperature(ValueType(T));
+        const Scalar T = getValue(temperature);
+        fluidState.setTemperature(temperature);
 
         bool solved = false;
         if (warmStart.seed(fluidState, T)) {
@@ -457,71 +523,180 @@ private:
         return std::nullopt;
     }
 
-    //! Limit on the evaluations of one localBracket() call.
-    static constexpr int maxLocalSteps = 8;
-
     /*!
-     * \brief A bracket of the root of r(T) next to the start temperature t0.
+     * \brief dr/dT of a search state flashed at T.
      *
-     * The search steps from t0 toward the root (H increases with T, so down
-     * where r > 0). The first step is twice the Newton step with the
-     * ideal-gas heat capacity of the feed, which the departure enthalpy and
-     * the latent heat of a two-phase state only make larger than the true
-     * slope, so that it usually overshoots the root by a little; each further
-     * step is four times the previous one, up to the end of the interval.
+     * The mixture enthalpy of the built-in provider is evaluated at
+     * T - slopeStep and T + slopeStep on the split moved along the
+     * sensitivities dx/dT, dy/dT, dL/dT that the flash carries: a central
+     * difference of the total derivative, latent heat included, without a
+     * further flash. A single phase keeps its composition.
      *
-     * \param idealGasCp sum_i z_i cp_i(T) [J/(mol K)]
-     * \return the bracket, or nothing where a trial cannot be evaluated or
-     *         the end of the interval is reached without a sign change; the
-     *         caller then searches the whole interval
+     * \return the slope, or nothing where a moved split leaves (0, 1) or the
+     *         enthalpy cannot be evaluated
      */
-    template <class Evaluate, class Cp>
-    static std::optional<Bracket> localBracket(const Evaluate& evaluate,
-                                               const Scalar t0,
-                                               const Scalar tLo,
-                                               const Scalar tHi,
-                                               const Cp& idealGasCp,
-                                               const Config& cfg)
+    static std::optional<Scalar> slopeAlongFlash(const SearchState& state,
+                                                 const Config& cfg,
+                                                 const EOSType& eosType)
     {
-        const auto r0 = evaluate(t0);
-        if (!r0) {
+        using ScalarState = CompositionalFluidState<Scalar, FluidSystem>;
+        using Enthalpy = MixtureEnthalpy<Scalar, FluidSystem>;
+
+        const Scalar T = state.temperature(0).value();
+        const Scalar L = state.L().value();
+        const bool twoPhase = L > 0.0 && L < 1.0;
+        std::array<Scalar, 2> h{};
+        for (int side = 0; side < 2; ++side) {
+            const Scalar d = side == 0 ? -slopeStep : slopeStep;
+            ScalarState moved;
+            moved.setTemperature(T + d);
+            for (const unsigned phaseIdx : {static_cast<unsigned>(FluidSystem::oilPhaseIdx),
+                                            static_cast<unsigned>(FluidSystem::gasPhaseIdx)}) {
+                moved.setPressure(phaseIdx, state.pressure(phaseIdx).value());
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const auto& x = state.moleFraction(phaseIdx, compIdx);
+                    moved.setMoleFraction(phaseIdx, compIdx,
+                                          twoPhase ? x.value() + x.derivative(0) * d : x.value());
+                }
+            }
+            const Scalar movedL = twoPhase ? L + state.L().derivative(0) * d : L;
+            if (twoPhase && !(movedL > 0.0 && movedL < 1.0)) {
+                return std::nullopt;
+            }
+            moved.setLvalue(movedL);
+            try {
+                h[side] = Enthalpy::mixtureEnthalpy(moved, cfg.cpTable, eosType, cfg.model);
+            }
+            catch (const std::runtime_error&) {
+                return std::nullopt;
+            }
+            catch (const Dune::FMatrixError&) {
+                return std::nullopt;
+            }
+        }
+        const Scalar slope = (h[1] - h[0]) / (Scalar(2.0) * slopeStep);
+        if (!std::isfinite(slope)) {
             return std::nullopt;
         }
-        Trial s{t0, *r0};
-        if (s.residual == 0.0) {
-            return Bracket{s, s};
+        return slope;
+    }
+
+    /*!
+     * \brief Safeguarded Newton's method on r(T) from t0.
+     *
+     * Until the residual changes sign, a Newton step toward the root (H
+     * increases with T, so down where r > 0) is taken, limited to
+     * maxNewtonStep and to the interval. Where the slope is not positive or
+     * points away from the root, the step is the expansion step: first twice
+     * the Newton step with the ideal-gas heat capacity of the feed, which the
+     * departure enthalpy and the latent heat only make larger than the true
+     * slope, then four times the previous expansion step. Once two trials
+     * bracket the root, a Newton step that leaves the bracket or does not
+     * halve the step before the last one is replaced by bisection
+     * (rtsafe).
+     *
+     * The iteration has converged when a Newton step is within
+     * cfg.temperatureTolerance; the solution is the end of that step, which
+     * the caller flashes. On a bracket, it has also converged when the
+     * bracket is within the tolerance; the solution is then its midpoint.
+     *
+     * \param idealGasCp sum_i z_i cp_i(T) [J/(mol K)]
+     * \return the solution, or nothing where a trial cannot be evaluated,
+     *         the end of the interval is reached without a sign change, or
+     *         after maxNewtonIterations
+     */
+    template <class EvaluateWithSlope, class Cp>
+    static std::optional<NewtonSolution> newton(const EvaluateWithSlope& evaluate,
+                                                const Scalar t0,
+                                                const Scalar tLo,
+                                                const Scalar tHi,
+                                                const Cp& idealGasCp,
+                                                const Config& cfg)
+    {
+        auto current = evaluate(t0);
+        if (!current) {
+            return std::nullopt;
         }
-        const Scalar direction = s.residual > 0.0 ? -1.0 : 1.0;
-        const Scalar end = direction > 0.0 ? tHi : tLo;
-        const Scalar cp = idealGasCp(t0);
-        Scalar step = cp > 0.0 && std::isfinite(cp) ? Scalar(2.0) * std::abs(s.residual) / cp
-                                                    : Scalar(1.0);
-        step = std::max(step, Scalar(10.0) * cfg.temperatureTolerance);
-        for (int i = 0; i < maxLocalSteps; ++i) {
-            const bool last = !(direction * (end - s.temperature) > step);
-            const Scalar t = last ? end : s.temperature + direction * step;
-            const auto rt = evaluate(t);
-            if (!rt) {
-                return std::nullopt;
+        std::optional<Bracket> bracket;
+        Scalar expansion = 0.0;
+        Scalar lastStep = tHi - tLo;
+        Scalar stepBeforeLast = tHi - tLo;
+        Scalar slope = 0.0;
+        for (int iteration = 0; iteration < maxNewtonIterations; ++iteration) {
+            const Trial c = current->trial;
+            if (c.residual == 0.0) {
+                return NewtonSolution{c.temperature, slope};
             }
-            const Trial trial{t, *rt};
-            if (trial.residual == 0.0 || (trial.residual < 0.0) != (s.residual < 0.0)) {
-                return s.temperature < t ? Bracket{s, trial} : Bracket{trial, s};
+            const bool newtonStep = current->slope && *current->slope > 0.0;
+            if (newtonStep) {
+                slope = *current->slope;
             }
-            if (last) {
-                // A root on the end itself can show a residual of either
-                // sign: accept the end if the secant through the last two
-                // trials places the root within the tolerance beyond it.
-                if (trial.residual != s.residual
-                    && std::abs(trial.residual * (trial.temperature - s.temperature)
-                                / (trial.residual - s.residual)) <= cfg.temperatureTolerance)
-                {
-                    return Bracket{trial, trial};
+            Scalar target = newtonStep ? c.temperature - c.residual / *current->slope
+                                       : c.temperature;
+            if (bracket) {
+                const Scalar lo = bracket->lo.temperature;
+                const Scalar hi = bracket->hi.temperature;
+                const Scalar mid = Scalar(0.5) * (lo + hi);
+                if (hi - lo <= cfg.temperatureTolerance || mid == lo || mid == hi) {
+                    return NewtonSolution{mid, slope};
                 }
+                const bool accept = newtonStep && target > lo && target < hi
+                    && Scalar(2.0) * std::abs(target - c.temperature) <= std::abs(stepBeforeLast);
+                if (!accept) {
+                    target = mid;
+                }
+                else if (std::abs(target - c.temperature) <= cfg.temperatureTolerance) {
+                    return NewtonSolution{target, slope};
+                }
+            }
+            else {
+                const Scalar direction = c.residual > 0.0 ? -1.0 : 1.0;
+                const Scalar end = direction > 0.0 ? tHi : tLo;
+                if (newtonStep && std::abs(target - c.temperature) <= cfg.temperatureTolerance) {
+                    return NewtonSolution{std::clamp(target, tLo, tHi), slope};
+                }
+                Scalar step = direction * (target - c.temperature);
+                if (!(step > 0.0)) {
+                    if (expansion == 0.0) {
+                        const Scalar cp = idealGasCp(c.temperature);
+                        expansion = cp > 0.0 && std::isfinite(cp)
+                            ? Scalar(2.0) * std::abs(c.residual) / cp
+                            : Scalar(1.0);
+                        expansion = std::max(expansion,
+                                             Scalar(10.0) * cfg.temperatureTolerance);
+                    }
+                    else {
+                        expansion *= Scalar(4.0);
+                    }
+                    step = expansion;
+                }
+                step = std::min(step, maxNewtonStep);
+                if (!(direction * (end - c.temperature) > 0.0)) {
+                    return std::nullopt; // at the end, without a sign change
+                }
+                target = direction * (end - c.temperature) > step ? c.temperature + direction * step
+                                                                  : end;
+            }
+            stepBeforeLast = lastStep;
+            lastStep = target - c.temperature;
+
+            auto next = evaluate(target);
+            if (!next) {
                 return std::nullopt;
             }
-            s = trial;
-            step *= Scalar(4.0);
+            const Trial t = next->trial;
+            if (bracket) {
+                if ((t.residual < 0.0) == (bracket->lo.residual < 0.0)) {
+                    bracket->lo = t;
+                }
+                else {
+                    bracket->hi = t;
+                }
+            }
+            else if (t.residual == 0.0 || (t.residual < 0.0) != (c.residual < 0.0)) {
+                bracket = c.temperature < t.temperature ? Bracket{c, t} : Bracket{t, c};
+            }
+            current = next;
         }
         return std::nullopt;
     }
