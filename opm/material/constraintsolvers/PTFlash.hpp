@@ -1866,28 +1866,14 @@ protected:
             ? newton_jacobian->jacobian
             : compositionJacobian_(fluid_state_scalar, eos_type);
 
-        // DUNE 2.6 cannot solve directly with a matrix right-hand side, so form
-        // the inverse explicitly before multiplying the state Jacobian.
-        // StateJacobian xx;
-        // unknown_jacobian.solve(xx, state_jacobian);
-        unknown_jacobian.invert();
-        state_jacobian.template leftmultiply<UnknownJacobian>(unknown_jacobian);
-        // state_jacobian now stores (dF/du)^-1 dF/ds; the minus sign is
-        // applied while transferring each sensitivity below.
+        // Factorise dF/du once and solve for one right-hand side per
+        // derivative of the caller: du/dθ = -(dF/du)^-1 dF/ds ds/dθ.
+        std::array<int, numFlashUnknowns> pivots;
+        luFactor_(unknown_jacobian, pivots);
 
         ComponentVector liquid_composition(numComponents);
         ComponentVector vapour_composition(numComponents);
         InputEval liquid_fraction_with_derivatives = scalar_liquid_fraction;
-
-        // Apply du/ds = -(dF/du)^-1 dF/ds, then compose it with the
-        // caller's derivatives of s.
-
-        const auto liquid_pressure = fluid_state.pressure(FluidSystem::oilPhaseIdx);
-        const auto vapour_pressure = fluid_state.pressure(FluidSystem::gasPhaseIdx);
-        // at the moment, the temperature is the same for both phases
-        // input_temperature is not used for non-thermal case
-        [[maybe_unused]] const auto& input_temperature = fluid_state.temperature(0);
-
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             liquid_composition[compIdx]
                 = fluid_state_scalar.moleFraction(FluidSystem::oilPhaseIdx, compIdx);
@@ -1895,88 +1881,37 @@ protected:
                 = fluid_state_scalar.moleFraction(FluidSystem::gasPhaseIdx, compIdx);
         }
 
-        // The two pressures are equal today. Keep both inputs explicit so this
-        // chain rule can accommodate capillary pressure later.
+        // Both phases are at the pressure of the liquid, as in the EOS
+        // evaluation above.
+        const auto& input_pressure = fluid_state.pressure(FluidSystem::oilPhaseIdx);
+        // input_temperature is not used for non-thermal case
+        [[maybe_unused]] const auto& input_temperature = fluid_state.temperature(0);
 
-        constexpr std::size_t num_derivatives = InputEval::numVars;
-        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            std::vector<double> derivatives(num_derivatives, 0.);
-            // derivatives from P
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                derivatives[idx] = -state_jacobian[compIdx][0] * liquid_pressure.derivative(idx);
-            }
-            // derivatives from T (only for thermal case)
+        constexpr int num_derivatives = InputEval::numVars;
+        for (int idx = 0; idx < num_derivatives; ++idx) {
+            // ds/dθ for this derivative of the caller.
+            std::array<Scalar, num_state_variables> state_derivative;
+            state_derivative[0] = input_pressure.derivative(idx);
             if constexpr (isThermal) {
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    derivatives[idx]
-                        += -state_jacobian[compIdx][1] * input_temperature.derivative(idx);
-                }
-            }
-
-            for (unsigned cIdx = 0; cIdx < numComponents; ++cIdx) {
-                const double composition_sensitivity
-                    = -state_jacobian[compIdx][cIdx + composition_offset];
-                const auto& overall_mole_fraction = z[cIdx];
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    derivatives[idx]
-                        += composition_sensitivity * overall_mole_fraction.derivative(idx);
-                }
-            }
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                liquid_composition[compIdx].setDerivative(idx, derivatives[idx]);
-            }
-            // handling y
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                derivatives[idx]
-                    = -state_jacobian[compIdx + numComponents][0] * vapour_pressure.derivative(idx);
-            }
-            // derivatives from T (only for thermal case)
-            if constexpr (isThermal) {
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    derivatives[idx] += -state_jacobian[compIdx + numComponents][1]
-                        * input_temperature.derivative(idx);
-                }
+                state_derivative[1] = input_temperature.derivative(idx);
             }
             for (unsigned cIdx = 0; cIdx < numComponents; ++cIdx) {
-                const double composition_sensitivity
-                    = -state_jacobian[compIdx + numComponents][cIdx + composition_offset];
-                const auto& overall_mole_fraction = z[cIdx];
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    derivatives[idx]
-                        += composition_sensitivity * overall_mole_fraction.derivative(idx);
+                state_derivative[cIdx + composition_offset] = z[cIdx].derivative(idx);
+            }
+            Dune::FieldVector<Scalar, num_equations> sensitivity;
+            for (std::size_t eqIdx = 0; eqIdx < num_equations; ++eqIdx) {
+                Scalar rhs = 0.0;
+                for (std::size_t varIdx = 0; varIdx < num_state_variables; ++varIdx) {
+                    rhs -= state_jacobian[eqIdx][varIdx] * state_derivative[varIdx];
                 }
+                sensitivity[eqIdx] = rhs;
             }
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                vapour_composition[compIdx].setDerivative(idx, derivatives[idx]);
+            luSolve_(unknown_jacobian, pivots, sensitivity);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                liquid_composition[compIdx].setDerivative(idx, sensitivity[compIdx]);
+                vapour_composition[compIdx].setDerivative(idx, sensitivity[compIdx + numComponents]);
             }
-
-            // handling derivatives of L
-            std::vector<double> liquid_fraction_derivatives(num_derivatives, 0.);
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                liquid_fraction_derivatives[idx]
-                    = -state_jacobian[2 * numComponents][0] * vapour_pressure.derivative(idx);
-            }
-            // derivatives from T (only for thermal case)
-            if constexpr (isThermal) {
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    liquid_fraction_derivatives[idx] += -state_jacobian[2 * numComponents][1]
-                        * input_temperature.derivative(idx);
-                }
-            }
-            for (unsigned cIdx = 0; cIdx < numComponents; ++cIdx) {
-                const double composition_sensitivity
-                    = -state_jacobian[2 * numComponents][cIdx + composition_offset];
-                const auto& overall_mole_fraction = z[cIdx];
-                for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                    liquid_fraction_derivatives[idx]
-                        += composition_sensitivity * overall_mole_fraction.derivative(idx);
-                }
-            }
-
-            for (unsigned idx = 0; idx < num_derivatives; ++idx) {
-                liquid_fraction_with_derivatives.setDerivative(idx,
-                                                               liquid_fraction_derivatives[idx]);
-            }
+            liquid_fraction_with_derivatives.setDerivative(idx, sensitivity[2 * numComponents]);
         }
 
         // set up the mole fractions
@@ -1988,6 +1923,66 @@ protected:
         }
         fluid_state.setLvalue(liquid_fraction_with_derivatives);
     } //end updateDerivativesTwoPhase
+
+    /*!
+     * \brief LU factorisation with partial pivoting of a small dense matrix,
+     *        in place: the unit lower factor below the diagonal, the upper
+     *        factor on and above it, and the row exchanged with each row.
+     *
+     * \throws Dune::FMatrixError where a pivot column is zero, as
+     *         Dune::FieldMatrix::invert() does.
+     */
+    template <int n>
+    static void luFactor_(Dune::FieldMatrix<Scalar, n, n>& matrix,
+                          std::array<int, static_cast<std::size_t>(n)>& pivots)
+    {
+        for (int col = 0; col < n; ++col) {
+            int pivot = col;
+            Scalar largest = std::abs(matrix[col][col]);
+            for (int row = col + 1; row < n; ++row) {
+                if (std::abs(matrix[row][col]) > largest) {
+                    largest = std::abs(matrix[row][col]);
+                    pivot = row;
+                }
+            }
+            pivots[col] = pivot;
+            if (pivot != col) {
+                std::swap(matrix[col], matrix[pivot]);
+            }
+            if (largest == 0.0) {
+                DUNE_THROW(Dune::FMatrixError, "matrix is singular");
+            }
+            for (int row = col + 1; row < n; ++row) {
+                const Scalar factor = matrix[row][col] / matrix[col][col];
+                matrix[row][col] = factor;
+                for (int j = col + 1; j < n; ++j) {
+                    matrix[row][j] -= factor * matrix[col][j];
+                }
+            }
+        }
+    }
+
+    //! Solves with a factorisation of luFactor_(), in place.
+    template <int n>
+    static void luSolve_(const Dune::FieldMatrix<Scalar, n, n>& lu,
+                         const std::array<int, static_cast<std::size_t>(n)>& pivots,
+                         Dune::FieldVector<Scalar, n>& rhs)
+    {
+        for (int row = 0; row < n; ++row) {
+            std::swap(rhs[row], rhs[pivots[row]]);
+        }
+        for (int row = 1; row < n; ++row) {
+            for (int col = 0; col < row; ++col) {
+                rhs[row] -= lu[row][col] * rhs[col];
+            }
+        }
+        for (int row = n - 1; row >= 0; --row) {
+            for (int col = row + 1; col < n; ++col) {
+                rhs[row] -= lu[row][col] * rhs[col];
+            }
+            rhs[row] /= lu[row][row];
+        }
+    }
 
     /*!
      * \brief A single-phase result: both phases take the mixture composition,
