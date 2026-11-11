@@ -39,10 +39,13 @@
  * thermal/compositional nonlinear flow and transport with buoyancy, SPE J. 23
  * (2018).
  *
- * PTFlash consults the table when PTFlashTableSettings::get().mode is Exact:
- * in an all-two-phase cell the interpolated K start the split and the
- * stability test is skipped; a split that does not converge to a distinct
- * interior split is redone by the flash without the table.
+ * PTFlash consults the table when PTFlashTableSettings::get().mode is not Off:
+ * - Exact: in an all-two-phase cell the interpolated K start the split and
+ *   the stability test is skipped; a split that does not converge to a
+ *   distinct interior split is redone by the flash without the table.
+ * - Approximate: in an all-two-phase cell the answer is Rachford-Rice on the
+ *   interpolated K; in a cell whose vertices are all single-phase with one
+ *   label the answer is that phase; elsewhere the flash without the table.
  *
  * The table is thread-local and is cleared when the fluid system parameters,
  * the equation of state, the method or the tolerance change.
@@ -67,6 +70,7 @@ namespace Opm {
 enum class PTFlashTableMode {
     Off,         //!< every flash is solved without the table
     Exact,       //!< all-two-phase cells give the start of the split
+    Approximate, //!< cells with one phase state give the answer
 };
 
 //! The table settings, read once from the environment.
@@ -85,7 +89,7 @@ struct PTFlashTableSettings
     enum class Interpolation { Automatic, Multilinear, Simplex };
     Interpolation interpolation = Interpolation::Automatic;
 
-    //! OPM_FLASH_OBL = off | exact, OPM_FLASH_OBL_N = intervals,
+    //! OPM_FLASH_OBL = off | exact | approx, OPM_FLASH_OBL_N = intervals,
     //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_STATS = 1.
     static PTFlashTableSettings& get()
     {
@@ -103,6 +107,9 @@ struct PTFlashTableSettings
             }
             else if (value == "exact") {
                 settings.mode = PTFlashTableMode::Exact;
+            }
+            else if (value == "approx") {
+                settings.mode = PTFlashTableMode::Approximate;
             }
         }
         if (const char* n = std::getenv("OPM_FLASH_OBL_N")) {

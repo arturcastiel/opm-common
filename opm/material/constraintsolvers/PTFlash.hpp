@@ -416,9 +416,11 @@ protected:
      * \brief The flash through the table of PTFlashTable.hpp, or nothing when
      *        the flash without the table has to answer.
      *
-     * In an all-two-phase cell the split starts from the interpolated K
-     * without a stability test, and is kept only if it converges to a
+     * Exact: in an all-two-phase cell the split starts from the interpolated
+     * K without a stability test, and is kept only if it converges to a
      * distinct split with 0 < L < 1; otherwise the state is restored.
+     * Approximate: Rachford-Rice on the interpolated K in an all-two-phase
+     * cell, the label of an all-single-phase cell; no iteration.
      */
     template <typename FluidState>
     static std::optional<ScalarFlashResult> flashFromTable_(FluidState& fluid_state,
@@ -429,6 +431,7 @@ protected:
     {
         using ScalarVector = Dune::FieldVector<Scalar, numComponents>;
         using TablePhase = typename FlashTable::Phase;
+        const bool exact = PTFlashTableSettings::get().mode == PTFlashTableMode::Exact;
         auto& table = FlashTable::get();
         ScalarVector z_scalar;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -445,8 +448,8 @@ protected:
         const auto vertex_flash = [&](Scalar p, Scalar T, const auto& z) {
             return vertexFlash_(p, T, z, twoPhaseMethod, flash_tolerance, eos_type);
         };
-        const auto useful = [](TablePhase phase) {
-            return phase == TablePhase::TwoPhase;
+        const auto useful = [exact](TablePhase phase) {
+            return phase == TablePhase::TwoPhase || !exact;
         };
         std::array<Scalar, numComponents> ln_K;
         const TablePhase phase = table.evaluate(location, vertex_flash, useful, ln_K);
@@ -457,6 +460,22 @@ protected:
                 K_scalar[compIdx] = std::exp(ln_K[compIdx]);
             }
             OPM_FLASH_COUNT(cacheHits);
+            if (!exact) {
+                // Mass balance holds exactly, equal fugacities to the
+                // interpolation error of ln K.
+                try {
+                    OPM_FLASH_COUNT(rachfordRiceSolves);
+                    Scalar L_scalar = RachfordRice::solve(K_scalar, z_scalar, verbosity);
+                    if (L_scalar > 0. && L_scalar < 1.) {
+                        computeLiquidVapor_(fluid_state, L_scalar, K_scalar, z_scalar);
+                        fluid_state.setLvalue(L_scalar);
+                        return ScalarFlashResult{false, std::nullopt};
+                    }
+                }
+                catch (const NumericalProblem&) {
+                }
+                return std::nullopt;
+            }
             const FluidState input_state = fluid_state;
             try {
                 OPM_FLASH_COUNT(rachfordRiceSolves);
@@ -474,6 +493,15 @@ protected:
             }
             OPM_FLASH_COUNT(splitRetries);
             fluid_state = input_state;
+        }
+        else if (!exact && (phase == TablePhase::Liquid || phase == TablePhase::Vapour)) {
+            OPM_FLASH_COUNT(cacheHits);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z_scalar[compIdx]);
+                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z_scalar[compIdx]);
+            }
+            fluid_state.setLvalue(phase == TablePhase::Liquid ? 1.0 : 0.0);
+            return ScalarFlashResult{true, std::nullopt};
         }
         return std::nullopt;
     }
