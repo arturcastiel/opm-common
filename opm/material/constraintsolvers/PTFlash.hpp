@@ -2997,15 +2997,19 @@ protected:
                 // The hand-over to Newton, see substitutionStepsBeforeNewton.
                 if (run_newton_afterwards) {
                     const Scalar residual = Opm::getValue(fugacity_residual.two_norm());
-                    const Scalar rate = iteration > 0 ? residual / previous_residual : Scalar{1.};
-                    const Scalar predicted_steps = rate > 0. && rate < 1.
-                        ? std::log(flash_tolerance / residual) / std::log(rate)
-                        : std::numeric_limits<Scalar>::infinity();
-                    previous_residual = residual;
-                    if (!(predicted_steps <= maxPredictedSubstitutionSteps)
-                        && iteration + 1 >= substitutionStepsBeforeNewton) {
-                        break;
+                    // The prediction decides from substitutionStepsBeforeNewton
+                    // steps on; before, its logarithms are not needed.
+                    if (iteration + 1 >= substitutionStepsBeforeNewton) {
+                        const Scalar rate
+                            = iteration > 0 ? residual / previous_residual : Scalar{1.};
+                        const Scalar predicted_steps = rate > 0. && rate < 1.
+                            ? std::log(flash_tolerance / residual) / std::log(rate)
+                            : std::numeric_limits<Scalar>::infinity();
+                        if (!(predicted_steps <= maxPredictedSubstitutionSteps)) {
+                            break;
+                        }
                     }
+                    previous_residual = residual;
                 }
 
                 steps = {step, steps[0], steps[1]};
