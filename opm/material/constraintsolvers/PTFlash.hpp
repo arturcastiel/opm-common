@@ -211,6 +211,41 @@ public:
     } //end solve
 
     /*!
+     * \brief A start temperature for a P-H flash from the flash table, see
+     *        PTFlashTable::temperature(); nothing when the table is off.
+     *
+     * \param enthalpy (p, T, z, vertex) -> the enthalpy of a vertex state
+     * \param enthalpyKey identifies the enthalpy model of \p enthalpy
+     */
+    template <class Composition, class Enthalpy>
+    static std::optional<Scalar> tableTemperature(const Scalar pressure,
+                                                  const Scalar temperature,
+                                                  const Composition& z,
+                                                  const Scalar hSpec,
+                                                  const Scalar tMin,
+                                                  const Scalar tMax,
+                                                  const std::uint64_t enthalpyKey,
+                                                  const Enthalpy& enthalpy,
+                                                  const PTFlashMethod twoPhaseMethod,
+                                                  const Scalar flash_tolerance,
+                                                  const EOSType& eos_type)
+    {
+        if (PTFlashTableSettings::get().mode == PTFlashTableMode::Off
+            || twoPhaseMethod == PTFlashMethod::Newton) {
+            return std::nullopt;
+        }
+        auto& table = FlashTable::get();
+        table.prepare(FlashTable::fingerprint(static_cast<int>(eos_type),
+                                              static_cast<int>(twoPhaseMethod), flash_tolerance),
+                      z);
+        const auto vertex_flash = [&](Scalar p, Scalar T, const auto& zv) {
+            return vertexFlash_(p, T, zv, twoPhaseMethod, flash_tolerance, eos_type);
+        };
+        return table.temperature(pressure, temperature, z, hSpec, tMin, tMax, enthalpyKey,
+                                 vertex_flash, enthalpy);
+    }
+
+    /*!
      * \brief Calculates the chemical equilibrium from the component
      *        fugacities in a phase.
      *

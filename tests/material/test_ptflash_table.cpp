@@ -32,7 +32,12 @@
 #define BOOST_TEST_MODULE PtFlashTable
 #include <boost/test/unit_test.hpp>
 
+#include <opm/material/components/C1.hpp>
+#include <opm/material/components/C10.hpp>
+#include <opm/material/components/SimpleCO2.hpp>
 #include <opm/material/constraintsolvers/FlashStatistics.hpp>
+#include <opm/material/constraintsolvers/MixtureEnthalpy.hpp>
+#include <opm/material/constraintsolvers/PHFlash.hpp>
 #include <opm/material/constraintsolvers/PTFlash.hpp>
 #include <opm/material/constraintsolvers/PTFlashMethod.hpp>
 #include <opm/material/constraintsolvers/PTFlashTable.hpp>
@@ -278,4 +283,76 @@ BOOST_AUTO_TEST_CASE(NegativeFlashVerticesKeepTheAnswers)
     Settings::get().negativeFlash = false;
     Settings::get().acceptance = 0.0;
     Settings::get().interpolation = Settings::Interpolation::Automatic;
+}
+
+BOOST_AUTO_TEST_CASE(EnthalpyOfTheVerticesStartsThePHSearch)
+{
+    // A P-H flash without a phase state from an earlier flash starts its
+    // temperature search where the enthalpy of the table's vertices matches:
+    // the same answers, from fewer isothermal flashes than from the middle
+    // of the interval.
+    using PhFlash = Opm::PHFlash<Scalar, FluidSystem>;
+    using Enthalpy = Opm::MixtureEnthalpy<Scalar, FluidSystem>;
+    makeFluid(0.0411);
+    PhFlash::Config cfg;
+    cfg.cpTable = {Opm::SimpleCO2<Scalar>::idealGasHeatCapacityPolynomial(),
+                   Opm::C1<Scalar>::idealGasHeatCapacityPolynomial(),
+                   Opm::C10<Scalar>::idealGasHeatCapacityPolynomial()};
+    cfg.model = Opm::EnthalpyModel::eos_departure;
+    cfg.tempMin = 250.0;
+    cfg.tempMax = 600.0;
+    cfg.temperatureTolerance = 1e-6;
+    cfg.enthalpyTolerance = 1.0;
+    cfg.maxIterations = 100;
+    struct PhAnswer
+    {
+        bool ok;
+        Scalar temperature;
+        Scalar L;
+    };
+    const auto solveAll = [&](const Settings::EnthalpyStart start, long& evaluations) {
+        Settings::get().mode = start == Settings::EnthalpyStart::Never
+            ? Opm::PTFlashTableMode::Off : Opm::PTFlashTableMode::Approximate;
+        Settings::get().enthalpyStart = start;
+        Opm::FlashStatistics::get().reset();
+        std::vector<PhAnswer> answers;
+        for (Scalar pressure = 20e5; pressure <= 200e5; pressure += 30e5) {
+            for (Scalar temperature = 280.0; temperature <= 420.0; temperature += 20.0) {
+                const Composition z{0.4, 0.3, 0.3};
+                auto reference = makeState(pressure, temperature, z);
+                Flash::solve(reference, Opm::PTFlashMethod::SsiNewton, flashTolerance, eosType);
+                const Scalar hSpec
+                    = Enthalpy::mixtureEnthalpy(reference, cfg.cpTable, eosType, cfg.model);
+                auto fs = makeState(pressure, 425.0, z);
+                const bool ok = PhFlash::solve(fs, hSpec, cfg, Opm::PTFlashMethod::SsiNewton,
+                                               flashTolerance, eosType);
+                answers.push_back({ok, Opm::getValue(fs.temperature(0)), Opm::getValue(fs.L())});
+            }
+        }
+        evaluations = Opm::FlashStatistics::get().phEvaluations;
+        Settings::get().mode = Opm::PTFlashTableMode::Off;
+        Settings::get().enthalpyStart = Settings::EnthalpyStart::Never;
+        return answers;
+    };
+    Settings::get().acceptance = 1e-6;
+    Table::get().reset();
+    long fromMiddle = 0;
+    long fromTable = 0;
+    const auto expected = solveAll(Settings::EnthalpyStart::Never, fromMiddle);
+    const auto started = solveAll(Settings::EnthalpyStart::Cold, fromTable);
+    BOOST_REQUIRE_EQUAL(expected.size(), started.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        BOOST_TEST_CONTEXT("state " << i)
+        {
+            BOOST_CHECK(expected[i].ok);
+            BOOST_CHECK_EQUAL(expected[i].ok, started[i].ok);
+            BOOST_CHECK_SMALL(expected[i].temperature - started[i].temperature, 1e-5);
+            BOOST_CHECK_SMALL(expected[i].L - started[i].L, 1e-5);
+        }
+    }
+    BOOST_TEST_MESSAGE("isothermal flashes per P-H flash: " << double(fromMiddle) / expected.size()
+                       << " from the middle, " << double(fromTable) / expected.size()
+                       << " from the table");
+    BOOST_CHECK_LT(fromTable, fromMiddle);
+    Settings::get().acceptance = 0.0;
 }
