@@ -644,9 +644,11 @@ protected:
         }
         std::optional<PlaneVector> plane;
         Scalar plane_gibbs = 0.0;
+        // One cache for both roots: temperature and pressure are fixed.
+        ParamCache param_cache(eos_type);
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
-            ParamCache param_cache(eos_type);
             param_cache.updatePhase(feed_state, phaseIdx);
+            updateFugacityCoefficients_(feed_state, param_cache, phaseIdx);
             PlaneVector phase_plane(0.0);
             Scalar phase_gibbs = 0.0;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -654,8 +656,7 @@ protected:
                 if (!(z_i > 0.)) {
                     continue;
                 }
-                const Scalar phi = Opm::getValue(
-                    FluidSystem::fugacityCoefficient(feed_state, param_cache, phaseIdx, compIdx));
+                const Scalar phi = Opm::getValue(feed_state.fugacityCoefficient(phaseIdx, compIdx));
                 if (!(phi > minFugacityCoefficient && phi < maxFugacityCoefficient)) {
                     return std::nullopt;
                 }
@@ -734,6 +735,8 @@ protected:
         ValueType trial_L = 0.;
         std::optional<Dune::FieldVector<Scalar, numComponents>> feed_plane;
         bool feed_is_unstable = false;
+        // One cache for all trial steps: temperature and pressure are fixed.
+        ParamCache param_cache(eos_type);
         for (int iteration = 0; iteration < flashFirstMaxIterations; ++iteration) {
             try {
                 OPM_FLASH_COUNT(rachfordRiceSolves);
@@ -748,15 +751,13 @@ protected:
             OPM_FLASH_COUNT(ssiIterations);
             computeLiquidVapor_(fluid_state, trial_L, trial_K, z);
             bool is_clamped = false;
-            ParamCache param_cache(eos_type);
             for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
                 param_cache.updatePhase(fluid_state, phaseIdx);
+                updateFugacityCoefficients_(fluid_state, param_cache, phaseIdx);
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                    const auto phi = FluidSystem::fugacityCoefficient(
-                        fluid_state, param_cache, phaseIdx, compIdx);
-                    fluid_state.setFugacityCoefficient(phaseIdx, compIdx, phi);
-                    is_clamped = is_clamped || !(Opm::getValue(phi) > minFugacityCoefficient
-                                                 && Opm::getValue(phi) < maxFugacityCoefficient);
+                    const Scalar phi = Opm::getValue(fluid_state.fugacityCoefficient(phaseIdx, compIdx));
+                    is_clamped = is_clamped
+                        || !(phi > minFugacityCoefficient && phi < maxFugacityCoefficient);
                 }
             }
             if (is_clamped) {
