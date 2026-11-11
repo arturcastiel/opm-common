@@ -248,3 +248,34 @@ BOOST_AUTO_TEST_CASE(AcceptanceTestBoundsTheApproximateAnswers)
     Settings::get().acceptance = 0.0;
     Settings::get().interpolation = Settings::Interpolation::Automatic;
 }
+
+BOOST_AUTO_TEST_CASE(NegativeFlashVerticesKeepTheAnswers)
+{
+    // Boundary cells: single-phase vertices next to two-phase ones store a
+    // negative flash. With a tight acceptance, a state inside such a cell is
+    // either split from the interpolated K, kept only with a Gibbs energy
+    // below the feed's, or declared single-phase when its interpolated L is
+    // beyond the margin: the answers stay those of the flash.
+    makeFluid(0.0411);
+    Settings::get().interpolation = Settings::Interpolation::Multilinear;
+    Settings::get().acceptance = 1e-6;
+    Settings::get().negativeFlash = true;
+    Table::get().reset();
+    const auto expected = flashAll(Opm::PTFlashTableMode::Off);
+    flashAll(Opm::PTFlashTableMode::Approximate);
+    const auto boundary = flashAll(Opm::PTFlashTableMode::Approximate);
+    checkSame(expected, boundary);
+    using Outcome = Table::Outcome;
+    BOOST_TEST_MESSAGE("boundary splits " << Table::get().count(Outcome::BoundarySplit)
+                       << ", boundary single-phase " << Table::get().count(Outcome::BoundarySingle));
+    BOOST_CHECK_GT(Table::get().count(Outcome::BoundarySplit), 0);
+    BOOST_CHECK_GT(Table::get().count(Outcome::BoundarySingle), 0);
+    // The exact mode keeps only the proven splits of boundary cells.
+    Table::get().reset();
+    flashAll(Opm::PTFlashTableMode::Exact);
+    checkSame(expected, flashAll(Opm::PTFlashTableMode::Exact));
+    BOOST_CHECK_EQUAL(Table::get().count(Outcome::BoundarySingle), 0);
+    Settings::get().negativeFlash = false;
+    Settings::get().acceptance = 0.0;
+    Settings::get().interpolation = Settings::Interpolation::Automatic;
+}

@@ -47,6 +47,14 @@
  *   interpolated K; in a cell whose vertices are all single-phase with one
  *   label the answer is that phase; elsewhere the flash without the table.
  *
+ * With negative-flash vertices (PTFlashTableSettings::negativeFlash), a cell
+ * whose vertices are partly two-phase and partly single-phase is kept as a
+ * boundary cell when every single-phase vertex has a negative flash: a split
+ * with L outside [0, 1] that continues the tie-lines of the two-phase region
+ * across its boundary (Whitson and Michelsen 1989). ln K then interpolates
+ * over the whole cell, and Rachford-Rice at the state's own composition
+ * places the boundary inside it.
+ *
  * The table is thread-local and is cleared when the fluid system parameters,
  * the equation of state, the method or the tolerance change.
  */
@@ -55,11 +63,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -84,6 +94,13 @@ struct PTFlashTableSettings
     double temperatureMin = 250.0; //!< [K], the 1/T axis
     double temperatureMax = 700.0;
     bool printStatistics = false; //!< table sizes on stderr when a table is cleared
+    //! Boundary cells: single-phase vertices next to two-phase ones also
+    //! store a negative flash, see PTFlashTable.
+    bool negativeFlash = false;
+    //! Boundary cells: a state whose interpolated split stays outside
+    //! [0, 1] when every ln K is off by this much is single-phase without a
+    //! stability test (not in the exact mode).
+    double margin = 0.05;
     //! Approximate mode: the largest |ln(f_L / f_V)| a two-phase answer may
     //! have; above it the split is converged from there. Zero: no test.
     double acceptance = 0.0;
@@ -95,7 +112,8 @@ struct PTFlashTableSettings
 
     //! OPM_FLASH_OBL = off | exact | approx, OPM_FLASH_OBL_N = intervals,
     //! OPM_FLASH_OBL_INTERP = multilinear | simplex, OPM_FLASH_OBL_ACCEPT =
-    //! acceptance, OPM_FLASH_OBL_STATS = 1.
+    //! acceptance, OPM_FLASH_OBL_STATS = 1, OPM_FLASH_OBL_NEGATIVE = 1,
+    //! OPM_FLASH_OBL_MARGIN = margin.
     static PTFlashTableSettings& get()
     {
         static PTFlashTableSettings settings = fromEnvironment();
@@ -135,6 +153,12 @@ struct PTFlashTableSettings
         if (const char* stats = std::getenv("OPM_FLASH_OBL_STATS")) {
             settings.printStatistics = std::string(stats) == "1";
         }
+        if (const char* negative = std::getenv("OPM_FLASH_OBL_NEGATIVE")) {
+            settings.negativeFlash = std::string(negative) == "1";
+        }
+        if (const char* margin = std::getenv("OPM_FLASH_OBL_MARGIN")) {
+            settings.margin = std::atof(margin);
+        }
         return settings;
     }
 };
@@ -153,14 +177,39 @@ public:
     static_assert(numAxes <= 16, "the lattice key packs at most 16 axes");
 
     //! Unused: a cell that stopped flashing its corners once it could not be used.
-    enum class Phase : std::uint8_t { Failed, TwoPhase, Liquid, Vapour, Mixed, Unused };
+    //! Boundary: two-phase and single-phase vertices, all with a split.
+    enum class Phase : std::uint8_t { Failed, TwoPhase, Liquid, Vapour, Mixed, Unused, Boundary };
 
-    //! An exact flash at a lattice point.
+    //! Whether a single-phase vertex has a negative flash; not tried until a
+    //! boundary cell needs it.
+    enum class Split : std::uint8_t { Unknown, Yes, No };
+
+    //! An exact flash at a lattice point. L and ln K hold the split of a
+    //! two-phase vertex, or the negative flash of a single-phase one.
     struct Vertex
     {
         Phase phase = Phase::Failed;
+        Split negative = Split::Unknown;
         Scalar L = 0.0;
         std::array<Scalar, numComponents> lnK{};
+
+        bool hasSplit() const
+        {
+            return phase == Phase::TwoPhase || negative == Split::Yes;
+        }
+    };
+
+    //! What a query led to, for the statistics.
+    enum class Outcome : std::uint8_t {
+        TwoPhaseStart,  //!< all-two-phase vertices: split from the table's K, kept
+        TwoPhaseRetry,  //!< all-two-phase vertices: that split not kept
+        SinglePhase,    //!< all-single-phase vertices: answered single-phase
+        BoundarySplit,  //!< boundary cell, interior L: split kept
+        BoundaryRetry,  //!< boundary cell, interior L: split not kept
+        BoundarySingle, //!< boundary cell, L beyond the margin: single-phase, no test
+        BoundaryBand,   //!< boundary cell, L inside the margin: the flash
+        Flash,          //!< any other: the flash without the table
+        Count
     };
 
     //! A hypercube: the common phase state of its vertices, Mixed when they
@@ -239,11 +288,13 @@ public:
         report();
         vertices_.clear();
         cells_.clear();
-        queries_ = hits_ = vertexFlashes_ = 0;
+        queries_ = hits_ = vertexFlashes_ = negativeFlashes_ = 0;
+        outcomes_.fill(0);
         fingerprint_ = fingerprint;
         initialized_ = true;
         const auto& s = PTFlashTableSettings::get();
         intervals_ = s.intervals;
+        negative_ = s.negativeFlash;
         using Interpolation = PTFlashTableSettings::Interpolation;
         simplex_ = s.interpolation == Interpolation::Simplex
             || (s.interpolation == Interpolation::Automatic && numAxes >= 5);
@@ -301,16 +352,20 @@ public:
      * lower corner one step along each axis in that order, and the weights
      * are 1 - f_(1), f_(1) - f_(2), ..., f_(d).
      */
-    template <class VertexFlash, class Useful>
-    Phase evaluate(const Location& location, const VertexFlash& flash, const Useful& useful,
+    template <class VertexFlash, class NegativeFlash, class Useful>
+    Phase evaluate(const Location& location, const VertexFlash& flash,
+                   const NegativeFlash& negativeFlash, const Useful& useful,
                    std::array<Scalar, numComponents>& lnK)
     {
         if (!simplex_) {
-            const Cell& c = cell(location, flash, useful);
-            if (c.phase == Phase::TwoPhase) {
+            const Cell& c = cell(location, flash, negativeFlash, useful);
+            if (c.phase == Phase::TwoPhase || c.phase == Phase::Boundary) {
                 interpolate(c, location, lnK);
             }
             return c.phase;
+        }
+        if (negative_) {
+            return evaluateSimplexWithBoundary(location, flash, negativeFlash, useful, lnK);
         }
         std::array<int, numAxes> order;
         for (int a = 0; a < numAxes; ++a) {
@@ -361,14 +416,18 @@ public:
      * \param useful whether a cell of the phase state would be used; a cell
      *        stops flashing its corners once it cannot be.
      */
-    template <class VertexFlash, class Useful>
-    const Cell& cell(const Location& location, const VertexFlash& flash, const Useful& useful)
+    template <class VertexFlash, class NegativeFlash, class Useful>
+    const Cell& cell(const Location& location, const VertexFlash& flash,
+                     const NegativeFlash& negativeFlash, const Useful& useful)
     {
         const std::uint64_t key = pack(location.index);
         const auto found = cells_.find(key);
         if (found != cells_.end()) {
             ++hits_;
             return found->second;
+        }
+        if (negative_) {
+            return cellWithBoundary(key, location, flash, negativeFlash, useful);
         }
         building_ = true;
         Cell cell;
@@ -424,6 +483,110 @@ public:
         }
     }
 
+    /*!
+     * \brief As cell(), when boundary cells are kept: every corner is flashed,
+     *        and a cell with two-phase and single-phase corners is a boundary
+     *        cell when each single-phase corner has a negative flash, started
+     *        from ln K of the nearest two-phase corner.
+     */
+    template <class VertexFlash, class NegativeFlash, class Useful>
+    const Cell& cellWithBoundary(std::uint64_t key, const Location& location,
+                                 const VertexFlash& flash, const NegativeFlash& negativeFlash,
+                                 const Useful& useful)
+    {
+        building_ = true;
+        std::array<Vertex*, numCorners> corners{};
+        std::array<std::array<int, numAxes>, numCorners> indices{};
+        for (int corner = 0; corner < numCorners; ++corner) {
+            indices[corner] = location.index;
+            for (int a = 0; a < numAxes; ++a) {
+                indices[corner][a] += (corner >> a) & 1;
+            }
+            corners[corner] = &vertex(indices[corner], flash);
+        }
+        const auto distance = [](int a, int b) { return std::popcount(static_cast<unsigned>(a ^ b)); };
+        Cell cell;
+        cell.phase = classify(corners, indices, distance, negativeFlash);
+        building_ = false;
+        if (cell.phase != Phase::Boundary && cell.phase != Phase::Mixed
+            && cell.phase != Phase::Failed && !useful(cell.phase)) {
+            cell.phase = Phase::Unused;
+        }
+        if (cell.phase == Phase::TwoPhase || cell.phase == Phase::Boundary) {
+            cell.lnK.resize(numCorners * numComponents);
+            for (int corner = 0; corner < numCorners; ++corner) {
+                std::copy(corners[corner]->lnK.begin(), corners[corner]->lnK.end(),
+                          cell.lnK.begin() + corner * numComponents);
+            }
+        }
+        return cells_.emplace(key, std::move(cell)).first->second;
+    }
+
+    /*!
+     * \brief As the simplex part of evaluate(), when boundary cells are kept:
+     *        the d + 1 vertices of the simplex, a boundary when two-phase and
+     *        single-phase vertices all have a split.
+     */
+    template <class VertexFlash, class NegativeFlash, class Useful>
+    Phase evaluateSimplexWithBoundary(const Location& location, const VertexFlash& flash,
+                                      const NegativeFlash& negativeFlash, const Useful& useful,
+                                      std::array<Scalar, numComponents>& lnK)
+    {
+        std::array<int, numAxes> order;
+        for (int a = 0; a < numAxes; ++a) {
+            order[a] = a;
+        }
+        std::sort(order.begin(), order.end(), [&location](int a, int b) {
+            return location.fraction[a] > location.fraction[b];
+        });
+        std::array<Vertex*, numAxes + 1> vertices{};
+        std::array<std::array<int, numAxes>, numAxes + 1> indices{};
+        std::array<Scalar, numAxes + 1> weights{};
+        bool present = true;
+        building_ = true;
+        std::array<int, numAxes> index = location.index;
+        for (int k = 0; k <= numAxes; ++k) {
+            if (k > 0) {
+                ++index[order[k - 1]];
+            }
+            weights[k] = k == 0 ? 1.0 - location.fraction[order[0]]
+                : (k == numAxes ? location.fraction[order[k - 1]]
+                                : location.fraction[order[k - 1]] - location.fraction[order[k]]);
+            indices[k] = index;
+            vertices[k] = &vertex(index, flash, &present);
+        }
+        // Along the walk, vertex k and j differ in |k - j| coordinates.
+        const auto distance = [](int a, int b) { return a > b ? a - b : b - a; };
+        Phase phase = classify(vertices, indices, distance, negativeFlash);
+        building_ = false;
+        hits_ += present;
+        if (phase != Phase::Boundary && phase != Phase::Mixed && phase != Phase::Failed
+            && !useful(phase)) {
+            return Phase::Unused;
+        }
+        if (phase == Phase::TwoPhase || phase == Phase::Boundary) {
+            lnK.fill(0.0);
+            for (int k = 0; k <= numAxes; ++k) {
+                for (int c = 0; c < numComponents; ++c) {
+                    lnK[c] += weights[k] * vertices[k]->lnK[c];
+                }
+            }
+        }
+        return phase;
+    }
+
+    //! Counts what a query led to.
+    void note(Outcome outcome)
+    {
+        ++outcomes_[static_cast<int>(outcome)];
+    }
+
+    //! How many queries led to an outcome since the table was last emptied.
+    long count(Outcome outcome) const
+    {
+        return outcomes_[static_cast<int>(outcome)];
+    }
+
     std::size_t vertices() const
     {
         return vertices_.size();
@@ -440,7 +603,7 @@ public:
         if (!PTFlashTableSettings::get().printStatistics || queries_ == 0) {
             return;
         }
-        std::size_t phases[6] = {0, 0, 0, 0, 0, 0};
+        std::size_t phases[7] = {0, 0, 0, 0, 0, 0, 0};
         std::size_t cellBytes = 0;
         for (const auto& [key, c] : cells_) {
             ++phases[static_cast<int>(c.phase)];
@@ -458,8 +621,19 @@ public:
                   << vertexFlashes_ << " vertices " << vertices_.size() << " (failed " << failedVertices
                   << ") cells " << cells_.size() << " (two-phase " << phases[1] << ", liquid " << phases[2]
                   << ", vapour " << phases[3] << ", mixed " << phases[4] << ", unused " << phases[5]
-                  << ", failed " << phases[0]
-                  << ") bytes " << vertexBytes + cellBytes << std::endl;
+                  << ", failed " << phases[0] << ", boundary " << phases[6]
+                  << ") negative-flashes " << negativeFlashes_
+                  << " bytes " << vertexBytes + cellBytes << std::endl;
+        if (std::accumulate(outcomes_.begin(), outcomes_.end(), 0L) > 0) {
+            static constexpr const char* names[] = {"two-phase-start", "two-phase-retry",
+                "single-phase", "boundary-split", "boundary-retry", "boundary-single",
+                "boundary-band", "flash"};
+            std::cerr << "OBL-OUTCOMES";
+            for (int o = 0; o < static_cast<int>(Outcome::Count); ++o) {
+                std::cerr << ' ' << names[o] << ' ' << outcomes_[o];
+            }
+            std::cerr << std::endl;
+        }
     }
 
 private:
@@ -494,9 +668,40 @@ private:
         return key;
     }
 
+    /*!
+     * \brief The state of a lattice point; false for a point outside the
+     *        simplex. A mole fraction on the lower face is a trace, so that
+     *        its K is defined.
+     */
+    bool point(const std::array<int, numAxes>& index, Scalar& p, Scalar& T,
+               std::array<Scalar, numComponents>& z) const
+    {
+        constexpr Scalar trace = 1e-6;
+        Scalar sum = 0.0;
+        for (int c = 0, a = 2; c < numComponents; ++c) {
+            if (c != dependent_) {
+                z[c] = std::max(origin_[a] + index[a] * step_[a], trace);
+                sum += z[c];
+                ++a;
+            }
+        }
+        const Scalar zDependent = 1.0 - sum;
+        if (!(zDependent > -1e-12)) {
+            return false;
+        }
+        z[dependent_] = std::max(zDependent, trace);
+        sum += z[dependent_];
+        for (auto& zc : z) {
+            zc /= sum;
+        }
+        p = std::exp(origin_[0] + index[0] * step_[0]);
+        T = 1.0 / (origin_[1] + index[1] * step_[1]);
+        return true;
+    }
+
     template <class VertexFlash>
-    const Vertex& vertex(const std::array<int, numAxes>& index, const VertexFlash& flash,
-                         bool* present = nullptr)
+    Vertex& vertex(const std::array<int, numAxes>& index, const VertexFlash& flash,
+                   bool* present = nullptr)
     {
         const std::uint64_t key = pack(index);
         const auto found = vertices_.find(key);
@@ -506,36 +711,77 @@ private:
         if (present) {
             *present = false;
         }
-        // The lattice point; a mole fraction on the lower face is flashed as a
-        // trace, so its K is defined, and a point outside the simplex is Failed.
-        constexpr Scalar trace = 1e-6;
-        std::array<Scalar, numComponents> z{};
-        Scalar sum = 0.0;
-        for (int c = 0, a = 2; c < numComponents; ++c) {
-            if (c != dependent_) {
-                z[c] = std::max(origin_[a] + index[a] * step_[a], trace);
-                sum += z[c];
-                ++a;
-            }
-        }
         Vertex v;
-        const Scalar zDependent = 1.0 - sum;
-        if (zDependent > -1e-12) {
-            z[dependent_] = std::max(zDependent, trace);
-            sum += z[dependent_];
-            for (auto& zc : z) {
-                zc /= sum;
-            }
-            const Scalar p = std::exp(origin_[0] + index[0] * step_[0]);
-            const Scalar T = 1.0 / (origin_[1] + index[1] * step_[1]);
+        Scalar p = 0.0;
+        Scalar T = 0.0;
+        std::array<Scalar, numComponents> z{};
+        if (point(index, p, T, z)) {
             ++vertexFlashes_;
             v = flash(p, T, z);
+            if (v.phase == Phase::TwoPhase) {
+                v.negative = Split::Yes;
+            }
         }
         return vertices_.emplace(key, v).first->second;
     }
 
+    /*!
+     * \brief The phase state of the vertices of a cell or simplex, with the
+     *        negative flashes a boundary needs.
+     *
+     * \param distance the number of coordinates in which two vertices differ;
+     *        a negative flash starts from ln K of the nearest two-phase vertex.
+     */
+    template <std::size_t size, class Distance, class NegativeFlash>
+    Phase classify(const std::array<Vertex*, size>& vertices,
+                   const std::array<std::array<int, numAxes>, size>& indices,
+                   const Distance& distance, const NegativeFlash& negativeFlash)
+    {
+        bool same = true;
+        bool twoPhase = false;
+        for (std::size_t k = 0; k < size; ++k) {
+            if (vertices[k]->phase == Phase::Failed) {
+                return Phase::Failed;
+            }
+            same = same && vertices[k]->phase == vertices[0]->phase;
+            twoPhase = twoPhase || vertices[k]->phase == Phase::TwoPhase;
+        }
+        if (same) {
+            return vertices[0]->phase;
+        }
+        if (!twoPhase) {
+            return Phase::Mixed;
+        }
+        for (std::size_t k = 0; k < size; ++k) {
+            Vertex& v = *vertices[k];
+            if (v.negative == Split::Unknown) {
+                std::size_t nearest = size;
+                for (std::size_t j = 0; j < size; ++j) {
+                    if (vertices[j]->phase == Phase::TwoPhase
+                        && (nearest == size
+                            || distance(static_cast<int>(j), static_cast<int>(k))
+                                < distance(static_cast<int>(nearest), static_cast<int>(k)))) {
+                        nearest = j;
+                    }
+                }
+                Scalar p = 0.0;
+                Scalar T = 0.0;
+                std::array<Scalar, numComponents> z{};
+                point(indices[k], p, T, z);
+                ++negativeFlashes_;
+                v.negative = negativeFlash(p, T, z, vertices[nearest]->lnK, v.L, v.lnK)
+                    ? Split::Yes : Split::No;
+            }
+            if (v.negative != Split::Yes) {
+                return Phase::Mixed;
+            }
+        }
+        return Phase::Boundary;
+    }
+
     bool initialized_ = false;
     bool simplex_ = false;
+    bool negative_ = false;
     std::uint64_t fingerprint_ = 0;
     int dependent_ = 0;
     int intervals_ = 0;
@@ -545,6 +791,8 @@ private:
     long queries_ = 0;
     long hits_ = 0;
     long vertexFlashes_ = 0;
+    long negativeFlashes_ = 0;
+    std::array<long, static_cast<int>(Outcome::Count)> outcomes_{};
     std::unordered_map<std::uint64_t, Vertex, KeyHash> vertices_;
     std::unordered_map<std::uint64_t, Cell, KeyHash> cells_;
 };
