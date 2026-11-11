@@ -600,6 +600,47 @@ namespace Opm {
             }
         }
 
+        /*!
+         * \brief fugacityCoefficientsAndDerivatives() with the pressure
+         *        derivatives, and the derivatives of the logarithms in
+         *        temperature at fixed pressure and composition, see
+         *        CubicEOS::computeFugacityCoefficientsAndDerivatives().
+         *
+         * The translation factor \f$\exp(-s_i B_i)\f$ adds \f$-s_i B_i / p\f$
+         * and \f$s_i B_i / T\f$, as \f$B_i \propto p / T\f$, also to a
+         * coefficient at its limits.
+         */
+        template <class FluidState, class Coefficients, class Derivatives, class ParamCacheEval>
+        static void fugacityCoefficientsAndDerivatives(const FluidState& fluidState,
+                                                       const ParameterCache<ParamCacheEval>& paramCache,
+                                                       unsigned phaseIdx,
+                                                       Coefficients& fugCoeffs,
+                                                       Derivatives& lnPhiDerivatives,
+                                                       Coefficients& lnPhiPressureDerivatives,
+                                                       Coefficients& lnPhiTemperatureDerivatives)
+        {
+            using LhsEval = typename FluidState::ValueType;
+            assert(isConsistent());
+            assert(phaseIdx == static_cast<unsigned>(oilPhaseIdx)
+                   || phaseIdx == static_cast<unsigned>(gasPhaseIdx));
+
+            CubicEOS::computeFugacityCoefficientsAndDerivatives(
+                fluidState, paramCache, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                lnPhiPressureDerivatives, lnPhiTemperatureDerivatives);
+            const LhsEval pressure = fluidState.pressure(phaseIdx);
+            const LhsEval temperature = fluidState.temperature(phaseIdx);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
+                fugCoeffs[compIdx] = decay<LhsEval>(fugCoeffs[compIdx] * translation);
+                const Scalar shift = volumeShift(compIdx);
+                if (shift != 0.0) {
+                    const LhsEval shiftedB = shift * paramCache.Bi(phaseIdx, compIdx);
+                    lnPhiPressureDerivatives[compIdx] -= shiftedB / pressure;
+                    lnPhiTemperatureDerivatives[compIdx] += shiftedB / temperature;
+                }
+            }
+        }
+
         // TODO: the following interfaces are needed by function checkFluidSystem()
         //! \copydoc BaseFluidSystem::isCompressible
         static bool isCompressible([[maybe_unused]] unsigned phaseIdx)

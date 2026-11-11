@@ -50,6 +50,12 @@ public:
         return omegaA() / sqrt(Tr);
     }
 
+    //! \f$\partial \ln \Omega_a / \partial T\f$ of calcOmegaA().
+    static Scalar calcLnOmegaATemperatureDerivative(Scalar temperature, unsigned /*compIdx*/)
+    {
+        return -0.5 / temperature;
+    }
+
     static Scalar calcOmegaB()
     {
         return Scalar(0.08664035);

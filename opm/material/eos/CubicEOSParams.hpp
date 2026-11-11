@@ -254,6 +254,35 @@ public:
         return Bi_[compIdx];
     }
 
+    /*!
+     * \brief \f$\partial \ln A_i / \partial T\f$ at the temperature and
+     *        pressure of the pure-component parameters:
+     *        \f$A_i \propto \Omega_{a,i}(T)\, p / T^2\f$, and OMEGAA scales
+     *        \f$\Omega_{a,i}\f$ by a constant. \f$B_i \propto p / T\f$.
+     */
+    Scalar lnAiTemperatureDerivative(unsigned compIdx) const
+    {
+        const Scalar& T = pureTemperature_;
+        Scalar lnOmegaA;
+        switch (EosType_) {
+            case EOSType::PRCORR:
+                lnOmegaA = PR::calcLnOmegaATemperatureDerivative(T, compIdx, /*modified=*/true);
+                break;
+            case EOSType::PR:
+                lnOmegaA = PR::calcLnOmegaATemperatureDerivative(T, compIdx, /*modified=*/false);
+                break;
+            case EOSType::RK:
+                lnOmegaA = RK::calcLnOmegaATemperatureDerivative(T, compIdx);
+                break;
+            case EOSType::SRK:
+                lnOmegaA = SRK::calcLnOmegaATemperatureDerivative(T, compIdx);
+                break;
+            default:
+                throw std::runtime_error("EOS type not implemented!");
+        }
+        return lnOmegaA - 2 / T;
+    }
+
     void setA(Scalar value)
     {
         A_ = value;

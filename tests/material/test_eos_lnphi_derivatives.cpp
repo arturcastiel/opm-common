@@ -35,7 +35,10 @@
  *        - the pressure derivatives are those automatic differentiation in
  *          pressure gives, to 1e-10, with the volume shift; the coefficients
  *          and composition derivatives given with them are those without them,
- *          bit for bit.
+ *          bit for bit;
+ *        - the temperature derivatives are those automatic differentiation in
+ *          temperature gives, to 1e-10, for every equation of state; the
+ *          pressure derivatives given with them are bit for bit the same.
  */
 #include "config.h"
 
@@ -241,6 +244,68 @@ BOOST_AUTO_TEST_CASE(PressureDerivativesAreThoseOfAutomaticDifferentiation)
         }
     }
     BOOST_TEST_MESSAGE("largest relative difference to automatic differentiation in pressure: "
+                       << largestDifference);
+}
+
+BOOST_AUTO_TEST_CASE(TemperatureDerivativesAreThoseOfAutomaticDifferentiation)
+{
+    using TemperatureEval = Opm::DenseAd::Evaluation<Scalar, 1>;
+    Scalar largestDifference = 0.0;
+    for (const auto eos : eosTypes) {
+        for (const auto& state : states) {
+            for (const unsigned phaseIdx : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                BOOST_TEST_CONTEXT("EoS " << static_cast<int>(eos) << ", p = " << state.pressure
+                                   << ", T = " << state.temperature << ", phase " << phaseIdx) {
+                    auto fs = fluidState<Scalar>(state);
+                    FluidSystem::ParameterCache<Scalar> cache(eos);
+                    cache.updatePhase(fs, phaseIdx);
+                    std::array<Scalar, numComponents> reference;
+                    Derivatives referenceDerivatives;
+                    std::array<Scalar, numComponents> referencePressure;
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        fs, cache, phaseIdx, reference, referenceDerivatives, referencePressure);
+                    std::array<Scalar, numComponents> coefficients;
+                    Derivatives derivatives;
+                    std::array<Scalar, numComponents> pressureDerivatives;
+                    std::array<Scalar, numComponents> temperatureDerivatives;
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        fs, cache, phaseIdx, coefficients, derivatives, pressureDerivatives,
+                        temperatureDerivatives);
+
+                    // Temperature as the single variable.
+                    Opm::CompositionalFluidState<TemperatureEval, FluidSystem> adFs;
+                    for (const auto phase : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                        adFs.setPressure(phase, TemperatureEval(state.pressure));
+                        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                            adFs.setMoleFraction(phase, compIdx,
+                                                 TemperatureEval(state.composition[compIdx]));
+                        }
+                    }
+                    adFs.setTemperature(TemperatureEval::createVariable(state.temperature, 0));
+                    FluidSystem::ParameterCache<TemperatureEval> adCache(eos);
+                    adCache.updatePhase(adFs, phaseIdx);
+                    std::array<TemperatureEval, numComponents> adCoefficients;
+                    FluidSystem::fugacityCoefficients(adFs, adCache, phaseIdx, adCoefficients);
+
+                    for (int i = 0; i < numComponents; ++i) {
+                        BOOST_CHECK(sameBits(coefficients[i], reference[i]));
+                        BOOST_CHECK(sameBits(pressureDerivatives[i], referencePressure[i]));
+                        for (int j = 0; j < numComponents; ++j) {
+                            BOOST_CHECK(sameBits(derivatives[i][j], referenceDerivatives[i][j]));
+                        }
+                        // T d ln(phi_i) / dT is dimensionless.
+                        const Scalar ad = state.temperature * log(adCoefficients[i]).derivative(0);
+                        const Scalar analytic = state.temperature * temperatureDerivatives[i];
+                        const Scalar difference
+                            = std::abs(analytic - ad) / std::max(1.0, std::abs(ad));
+                        largestDifference = std::max(largestDifference, difference);
+                        BOOST_CHECK_SMALL(difference, 1e-10);
+                    }
+                }
+            }
+        }
+    }
+    BOOST_TEST_MESSAGE("largest relative difference to automatic differentiation in temperature: "
                        << largestDifference);
 }
 
