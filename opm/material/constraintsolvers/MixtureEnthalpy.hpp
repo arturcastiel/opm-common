@@ -77,6 +77,8 @@
 
 #include <opm/input/eclipse/EclipseState/Compositional/CompositionalConfig.hpp>
 
+#include <utility>
+
 namespace Opm {
 
 //! Which enthalpy model the P-H stack evaluates.
@@ -252,8 +254,11 @@ struct MixtureEnthalpy {
         Scalar hGas = Opm::getValue(phaseEnthalpy(fluidState, FluidSystem::gasPhaseIdx, cpTable));
         if (model == EnthalpyModel::eos_departure) {
             if (L > 0.0 && L < 1.0) {
-                hOil += phaseResidualEnthalpy(fluidState, FluidSystem::oilPhaseIdx, eosType);
-                hGas += phaseResidualEnthalpy(fluidState, FluidSystem::gasPhaseIdx, eosType);
+                // Each phase on its own root, from one parameter cache.
+                const auto [onLiquidRoot, onVapourRoot] = sumLnPhiOnBothRoots_(
+                    fluidState, FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx, eosType);
+                hOil += residualEnthalpy_(fluidState, FluidSystem::oilPhaseIdx, onLiquidRoot);
+                hGas += residualEnthalpy_(fluidState, FluidSystem::gasPhaseIdx, onVapourRoot);
             }
             else if (L > 0.0)
                 hOil += stableRootResidualEnthalpy_(fluidState, FluidSystem::oilPhaseIdx, eosType);
@@ -284,11 +289,22 @@ private:
         const Eval1 p = Eval1::createConstant(Opm::getValue(fluidState.pressure(phaseIdx)));
         seeded.setPressure(FluidSystem::oilPhaseIdx, p);
         seeded.setPressure(FluidSystem::gasPhaseIdx, p);
+        seedComposition_(seeded, fluidState, phaseIdx, rootIdx);
+        return seeded;
+    }
+
+    //! The composition of phase phaseIdx as phase rootIdx of a seeded copy.
+    template <class FluidState>
+    static void seedComposition_(CompositionalFluidState<DenseAd::Evaluation<Scalar, 1>, FluidSystem>& seeded,
+                                 const FluidState& fluidState,
+                                 const unsigned phaseIdx,
+                                 const unsigned rootIdx)
+    {
+        using Eval1 = DenseAd::Evaluation<Scalar, 1>;
         for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
             seeded.setMoleFraction(rootIdx, compIdx,
                 Eval1::createConstant(Opm::getValue(fluidState.moleFraction(phaseIdx, compIdx))));
         }
-        return seeded;
     }
 
     /*!
@@ -309,6 +325,21 @@ private:
 
         const auto seeded = temperatureSeededCopy_(fluidState, phaseIdx, rootIdx);
         ParamCache paramCache(eosType);
+        return sumLnPhi_(seeded, paramCache, rootIdx);
+    }
+
+    /*!
+     * \brief sumLnPhi_() of the composition held as phase rootIdx of a seeded
+     *        copy, on the root of that phase, with a parameter cache that the
+     *        call updates for it.
+     */
+    template <class ParamCache>
+    static DenseAd::Evaluation<Scalar, 1>
+    sumLnPhi_(const CompositionalFluidState<DenseAd::Evaluation<Scalar, 1>, FluidSystem>& seeded,
+              ParamCache& paramCache,
+              const unsigned rootIdx)
+    {
+        using Eval1 = DenseAd::Evaluation<Scalar, 1>;
         paramCache.updatePhase(seeded, rootIdx);
 
         const Eval1& T = seeded.temperature(rootIdx);
@@ -323,6 +354,32 @@ private:
                        + A / ((m1 - m2) * B) * log((Z + m2 * B) / (Z + m1 * B));
         sumLnPhi -= p * paramCache.phaseVolumeShift(rootIdx) / (Constants<Scalar>::R * T);
         return sumLnPhi;
+    }
+
+    /*!
+     * \brief sumLnPhi_() of the composition of phase liquidIdx on the liquid
+     *        root and of phase vapourIdx on the vapour root, from one
+     *        parameter cache: the second takes the pure-component parameters
+     *        of the first, as they share temperature and pressure.
+     */
+    template <class FluidState>
+    static std::pair<DenseAd::Evaluation<Scalar, 1>, DenseAd::Evaluation<Scalar, 1>>
+    sumLnPhiOnBothRoots_(const FluidState& fluidState,
+                         const unsigned liquidIdx,
+                         const unsigned vapourIdx,
+                         const EOSType& eosType)
+    {
+        using Eval1 = DenseAd::Evaluation<Scalar, 1>;
+        using ParamCache = typename FluidSystem::template ParameterCache<Eval1>;
+        constexpr unsigned oil = FluidSystem::oilPhaseIdx;
+        constexpr unsigned gas = FluidSystem::gasPhaseIdx;
+
+        auto seeded = temperatureSeededCopy_(fluidState, liquidIdx, oil);
+        seedComposition_(seeded, fluidState, vapourIdx, gas);
+        ParamCache paramCache(eosType);
+        const Eval1 onLiquidRoot = sumLnPhi_(seeded, paramCache, oil);
+        const Eval1 onVapourRoot = sumLnPhi_(seeded, paramCache, gas);
+        return {onLiquidRoot, onVapourRoot};
     }
 
     //! -R T^2 d/dT [sum_i w_i ln(phi_i)] of phase phaseIdx, from sumLnPhi_.
@@ -346,8 +403,8 @@ private:
                                               const unsigned phaseIdx,
                                               const EOSType& eosType)
     {
-        const auto onLiquidRoot = sumLnPhi_(fluidState, phaseIdx, FluidSystem::oilPhaseIdx, eosType);
-        const auto onVapourRoot = sumLnPhi_(fluidState, phaseIdx, FluidSystem::gasPhaseIdx, eosType);
+        const auto [onLiquidRoot, onVapourRoot]
+            = sumLnPhiOnBothRoots_(fluidState, phaseIdx, phaseIdx, eosType);
         return residualEnthalpy_(fluidState, phaseIdx,
                                  onLiquidRoot.value() <= onVapourRoot.value() ? onLiquidRoot
                                                                               : onVapourRoot);
