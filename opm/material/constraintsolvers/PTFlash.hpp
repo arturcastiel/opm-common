@@ -173,11 +173,13 @@ public:
             = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
 
         // Transfer the converged values before reconstructing their derivatives.
-        for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            const auto liquid_mole_fraction = scalar_state.moleFraction(oilPhaseIdx, compIdx);
-            fluid_state.setMoleFraction(oilPhaseIdx, compIdx, liquid_mole_fraction);
-            const auto vapour_mole_fraction = scalar_state.moleFraction(gasPhaseIdx, compIdx);
-            fluid_state.setMoleFraction(gasPhaseIdx, compIdx, vapour_mole_fraction);
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            std::array<typename FluidState::ValueType, numComponents> mole_fractions;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                mole_fractions[compIdx] = scalar_state.moleFraction(phaseIdx, compIdx);
+            }
+            setPhaseMoleFractions_(fluid_state, phaseIdx, mole_fractions);
         }
 
         updateDerivatives_(scalar_state, fluid_state, eos_type, is_single_phase, newton_jacobian);
@@ -258,6 +260,26 @@ public:
     }
 
 protected:
+    /*!
+     * \brief Sets the mole fractions of all components of a phase. A fluid
+     *        state with setMoleFractions() updates its mean molar mass once,
+     *        instead of once per component, to the same values.
+     */
+    template <class FlashFluidState, class Values>
+    static void setPhaseMoleFractions_(FlashFluidState& fluid_state,
+                                       unsigned phaseIdx,
+                                       const Values& values)
+    {
+        if constexpr (requires { fluid_state.setMoleFractions(phaseIdx, values); }) {
+            fluid_state.setMoleFractions(phaseIdx, values);
+        }
+        else {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fluid_state.setMoleFraction(phaseIdx, compIdx, values[compIdx]);
+            }
+        }
+    }
+
     /*!
      * \brief Stores the fugacity coefficients of all components of a phase in
      *        the fluid state, from a parameter cache updated for the phase.
@@ -460,10 +482,8 @@ protected:
         }
         if (is_single_phase) {
             newton_jacobian.reset();
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z_scalar[compIdx]);
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z_scalar[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, z_scalar);
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, z_scalar);
             if (!is_negative_flash) {
                 // A feed whose cubic has a liquid and a vapour root is labelled
                 // by the root with the lower Gibbs energy. A single root larger
@@ -556,10 +576,8 @@ protected:
         constexpr int oil = static_cast<int>(oilPhaseIdx);
         constexpr int gas = static_cast<int>(gasPhaseIdx);
         FlashFluidState feed_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            feed_state.setMoleFraction(oil, compIdx, z[compIdx]);
-            feed_state.setMoleFraction(gas, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(feed_state, oil, z);
+        setPhaseMoleFractions_(feed_state, gas, z);
         // One cache holds both phases, which share the pure-component parameters.
         feed_cache.updatePhase(feed_state, oil);
         feed_cache.updatePhase(feed_state, gas);
@@ -684,10 +702,8 @@ protected:
             typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
         using PlaneVector = Dune::FieldVector<Scalar, numComponents>;
         FlashFluidState feed_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            feed_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
-            feed_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(feed_state, oilPhaseIdx, z);
+        setPhaseMoleFractions_(feed_state, gasPhaseIdx, z);
         std::optional<PlaneVector> plane;
         Scalar plane_gibbs = 0.0;
         // One cache for both roots: temperature and pressure are fixed.
@@ -1087,10 +1103,8 @@ protected:
         isStable = liquid_trial_finds_no_instability && vapour_trial_finds_no_instability;
         if (isStable) {
             // A single phase has the feed composition under either phase label.
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, z);
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, z);
         }
         // The two stationary trial compositions seed the equilibrium ratios.
         else {
@@ -1237,9 +1251,7 @@ protected:
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
         FlashFluidState reference_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(reference_state, reference_phase_idx, z);
         ParamCache param_cache(eos_type);
         param_cache.updatePhase(reference_state, reference_phase_idx);
         std::array<FlashEval, numComponents> reference_coefficients;
@@ -1294,8 +1306,8 @@ protected:
         }
 
         // The reference phase is the feed on its stable root throughout.
+        setPhaseMoleFractions_(reference_state, reference_phase_idx, z);
         for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
             reference_state.setFugacityCoefficient(
                 reference_phase_idx, compIdx, reference_coefficients[compIdx]);
         }
@@ -1322,8 +1334,8 @@ protected:
                 trial_composition.begin(), trial_composition.end(), FlashEval(0.0));
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 trial_composition[compIdx] /= trial_sum;
-                trial_state.setMoleFraction(trial_phase_idx, compIdx, trial_composition[compIdx]);
             }
+            setPhaseMoleFractions_(trial_state, trial_phase_idx, trial_composition);
 
             trial_param_cache.updatePhase(trial_state, trial_phase_idx);
 
@@ -1447,10 +1459,8 @@ protected:
         x /= sumx;
         y /= sumy;
 
-        for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            fluid_state.setMoleFraction(oilPhaseIdx, compIdx, x[compIdx]);
-            fluid_state.setMoleFraction(gasPhaseIdx, compIdx, y[compIdx]);
-        }
+        setPhaseMoleFractions_(fluid_state, oilPhaseIdx, x);
+        setPhaseMoleFractions_(fluid_state, gasPhaseIdx, y);
     }
 
     /*!
@@ -1792,10 +1802,8 @@ protected:
                 liquid_composition[present[a]] = (feed[a] - vapour[a]) / liquid_moles;
                 vapour_composition[present[a]] = vapour[a] / vapour_moles;
             }
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, liquid_composition[compIdx]);
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, vapour_composition[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, liquid_composition);
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, vapour_composition);
             liquid_fraction = liquid_moles / (liquid_moles + vapour_moles);
         };
 
@@ -2431,11 +2439,12 @@ protected:
         for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
                                         static_cast<unsigned>(gasPhaseIdx)}) {
             state.setPressure(phaseIdx, Opm::getValue(fluid_state_scalar.pressure(phaseIdx)));
+            Vector mole_fractions;
             for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                state.setMoleFraction(
-                    phaseIdx, compIdx,
-                    Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx)));
+                mole_fractions[compIdx]
+                    = Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx));
             }
+            setPhaseMoleFractions_(state, phaseIdx, mole_fractions);
         }
         state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
         const Scalar pref = state.pressure(oilPhaseIdx);
@@ -2498,16 +2507,18 @@ protected:
         else {
             state.setTemperature(Eval(fluid_state_scalar.temperature(0)));
         }
+        std::array<Eval, numComponents> liquid_composition;
+        std::array<Eval, numComponents> vapour_composition;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            Eval liquid_mole_fraction = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx);
-            Eval vapour_mole_fraction = fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
+            liquid_composition[compIdx] = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx);
+            vapour_composition[compIdx] = fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
             if constexpr (withComposition) {
-                liquid_mole_fraction.setDerivative(compIdx, 1.0);
-                vapour_mole_fraction.setDerivative(compIdx, 1.0);
+                liquid_composition[compIdx].setDerivative(compIdx, 1.0);
+                vapour_composition[compIdx].setDerivative(compIdx, 1.0);
             }
-            state.setMoleFraction(FluidSystem::oilPhaseIdx, compIdx, liquid_mole_fraction);
-            state.setMoleFraction(FluidSystem::gasPhaseIdx, compIdx, vapour_mole_fraction);
         }
+        setPhaseMoleFractions_(state, FluidSystem::oilPhaseIdx, liquid_composition);
+        setPhaseMoleFractions_(state, FluidSystem::gasPhaseIdx, vapour_composition);
         using ParamCache = typename FluidSystem::template ParameterCache<Eval>;
         ParamCache param_cache(eos_type);
         for (unsigned phase_idx = 0; phase_idx < numMisciblePhases; ++phase_idx) {
@@ -2649,12 +2660,8 @@ protected:
             liquid_fraction_with_derivatives.setDerivative(idx, liquid_fraction_derivative);
         }
 
-        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            fluid_state.setMoleFraction(
-                FluidSystem::oilPhaseIdx, compIdx, liquid_composition[compIdx]);
-            fluid_state.setMoleFraction(
-                FluidSystem::gasPhaseIdx, compIdx, vapour_composition[compIdx]);
-        }
+        setPhaseMoleFractions_(fluid_state, FluidSystem::oilPhaseIdx, liquid_composition);
+        setPhaseMoleFractions_(fluid_state, FluidSystem::gasPhaseIdx, vapour_composition);
         fluid_state.setLvalue(liquid_fraction_with_derivatives);
     }
 
@@ -2783,10 +2790,12 @@ protected:
         InputEval liquid_fraction = fluid_state_scalar.L();
 
         // A single phase uses the overall composition under both phase labels.
+        std::array<InputEval, numComponents> overall_composition;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            fluid_state.setMoleFraction(FluidSystem::oilPhaseIdx, compIdx, fluid_state.moleFraction(compIdx) );
-            fluid_state.setMoleFraction(FluidSystem::gasPhaseIdx, compIdx, fluid_state.moleFraction(compIdx) );
+            overall_composition[compIdx] = fluid_state.moleFraction(compIdx);
         }
+        setPhaseMoleFractions_(fluid_state, FluidSystem::oilPhaseIdx, overall_composition);
+        setPhaseMoleFractions_(fluid_state, FluidSystem::gasPhaseIdx, overall_composition);
         fluid_state.setLvalue(liquid_fraction);
     } //end updateDerivativesSinglePhase
 
