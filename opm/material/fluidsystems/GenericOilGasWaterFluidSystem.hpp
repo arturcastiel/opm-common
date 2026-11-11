@@ -531,6 +531,36 @@ namespace Opm {
             }
         }
 
+        /*!
+         * \brief fugacityCoefficients() of an oil or gas phase on values,
+         *        and the derivatives of their logarithms in the mole
+         *        fractions of the phase, see
+         *        CubicEOS::computeFugacityCoefficientsAndDerivatives().
+         *
+         * The translation factor does not depend on the composition.
+         *
+         * \param lnPhiDerivatives Receives \f$\partial \ln\phi_i / \partial x_j\f$ at [i][j].
+         */
+        template <class FluidState, class Coefficients, class Derivatives, class ParamCacheEval>
+        static void fugacityCoefficientsAndDerivatives(const FluidState& fluidState,
+                                                       const ParameterCache<ParamCacheEval>& paramCache,
+                                                       unsigned phaseIdx,
+                                                       Coefficients& fugCoeffs,
+                                                       Derivatives& lnPhiDerivatives)
+        {
+            using LhsEval = typename FluidState::ValueType;
+            assert(isConsistent());
+            assert(phaseIdx == static_cast<unsigned>(oilPhaseIdx)
+                   || phaseIdx == static_cast<unsigned>(gasPhaseIdx));
+
+            CubicEOS::computeFugacityCoefficientsAndDerivatives(
+                fluidState, paramCache, phaseIdx, fugCoeffs, lnPhiDerivatives);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
+                fugCoeffs[compIdx] = decay<LhsEval>(fugCoeffs[compIdx] * translation);
+            }
+        }
+
         // TODO: the following interfaces are needed by function checkFluidSystem()
         //! \copydoc BaseFluidSystem::isCompressible
         static bool isCompressible([[maybe_unused]] unsigned phaseIdx)

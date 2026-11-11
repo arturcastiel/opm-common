@@ -27,6 +27,9 @@
 #include <opm/material/common/PolynomialUtils.hpp>
 #include <opm/material/common/Valgrind.hpp>
 
+#include <array>
+#include <type_traits>
+
 namespace Opm
 {
 /*!
@@ -97,6 +100,114 @@ public:
         const auto terms = phaseFugacityTerms_<LhsEval>(fs, params, phaseIdx);
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             fugCoeffs[compIdx] = componentFugacityCoefficient_(terms, fs, params, phaseIdx, compIdx);
+        }
+    }
+
+    /*!
+     * \brief The fugacity coefficients of all components of a phase, as
+     *        computeFugacityCoefficients() gives them, and the derivatives
+     *        of their logarithms in the mole fractions of the phase.
+     *
+     * The mole fractions are the independent variables, as automatic
+     * differentiation in them gives: with \f$S_i = \sum_j A_{ij} x_j\f$,
+     * \f$\partial A / \partial x_j = 2 S_j\f$ and
+     * \f$\partial B / \partial x_j = B_j\f$, the compressibility factor follows
+     * the cubic \f$F(Z, A, B) = 0\f$,
+     *
+     * \f[ \frac{\partial Z}{\partial x_j}
+     *   = -\frac{F_A\, \partial A / \partial x_j + F_B\, \partial B / \partial x_j}{F_Z}, \f]
+     *
+     * and \f$\partial \ln\phi_i / \partial x_j\f$ is the derivative of the
+     * expression of computeFugacityCoefficient() term by term. The mole
+     * fractions are taken in \f$[0, 1]\f$, where the mixing rule does not
+     * limit them. A coefficient at its limits has no derivative, as for
+     * automatic differentiation.
+     *
+     * Mole-number derivatives follow from
+     * \f$n \partial \ln\phi_i / \partial n_j
+     *   = \partial \ln\phi_i / \partial x_j - \sum_k x_k \partial \ln\phi_i / \partial x_k\f$.
+     *
+     * \param fugCoeffs Receives the coefficient of component i at index i.
+     * \param lnPhiDerivatives Receives \f$\partial \ln\phi_i / \partial x_j\f$ at [i][j].
+     */
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void computeFugacityCoefficientsAndDerivatives(const FluidState& fs,
+                                                          const Params& params,
+                                                          unsigned phaseIdx,
+                                                          Coefficients& fugCoeffs,
+                                                          Derivatives& lnPhiDerivatives)
+    {
+        using LhsEval = typename FluidState::ValueType;
+        static_assert(std::is_floating_point_v<LhsEval>,
+                      "The derivatives are those of a value-only evaluation");
+        const auto terms = phaseFugacityTerms_<LhsEval>(fs, params, phaseIdx);
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fugCoeffs[compIdx] = componentFugacityCoefficient_(terms, fs, params, phaseIdx, compIdx);
+        }
+
+        const LhsEval A = params.A(phaseIdx);
+        const LhsEval B = params.B(phaseIdx);
+        const LhsEval m1 = params.m1(phaseIdx);
+        const LhsEval m2 = params.m2(phaseIdx);
+        const LhsEval Z = terms.Z;
+        std::array<LhsEval, numComponents> S;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            S[compIdx] = 0.0;
+            for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+                S[compIdx] += params.aCache(phaseIdx, compIdx, compJIdx)
+                    * fs.moleFraction(phaseIdx, compJIdx);
+            }
+        }
+
+        // The cubic of computeMolarVolume() and its partial derivatives; a
+        // molar volume at its floor does not move.
+        const LhsEval c2 = (m1 + m2 - 1) * B - 1;
+        const LhsEval c1 = A + m1 * m2 * B * B - (m1 + m2) * B * (B + 1);
+        const LhsEval FZ = (3 * Z + 2 * c2) * Z + c1;
+        const LhsEval FA = Z - B;
+        const LhsEval FB = (m1 + m2 - 1) * Z * Z + (2 * m1 * m2 * B - (m1 + m2) * (2 * B + 1)) * Z
+            - (A + m1 * m2 * (3 * B + 2) * B);
+        const bool volumeAtFloor = !(params.molarVolume(phaseIdx) > minMolarVolume);
+
+        const LhsEval ZB = Z - B;
+        const LhsEval P1 = Z + m1 * B;
+        const LhsEval P2 = Z + m2 * B;
+        const LhsEval Lambda = log(P2 / P1);
+        const LhsEval Delta = m1 - m2;
+        const LhsEval beta = terms.beta;
+        const LhsEval Zm1 = Z - 1;
+        const LhsEval invA = 1 / A;
+        const LhsEval invB = 1 / B;
+        std::array<LhsEval, numComponents> gamma;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            gamma[compIdx] = 2 * invA * S[compIdx] - params.Bi(phaseIdx, compIdx) * invB;
+        }
+
+        for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+            const LhsEval Bj = params.Bi(phaseIdx, compJIdx);
+            const LhsEval Aj = 2 * S[compJIdx];
+            const LhsEval Zj = volumeAtFloor ? LhsEval{0.0} : -(FA * Aj + FB * Bj) / FZ;
+            const LhsEval LambdaJ = (Zj + m2 * Bj) / P2 - (Zj + m1 * Bj) / P1;
+            const LhsEval betaJ = ((Aj * invB - A * Bj * invB * invB) * Lambda + A * invB * LambdaJ)
+                / Delta;
+            // The parts common to every component i.
+            const LhsEval common = -(Zj - Bj) / ZB;
+            const LhsEval perBi = Zj * invB - Bj * Zm1 * invB * invB + beta * Bj * invB * invB;
+            const LhsEval perS = -2 * beta * Aj * invA * invA;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                lnPhiDerivatives[compIdx][compJIdx] = common
+                    + params.Bi(phaseIdx, compIdx) * perBi + betaJ * gamma[compIdx]
+                    + 2 * beta * invA * params.aCache(phaseIdx, compIdx, compJIdx)
+                    + perS * S[compIdx];
+            }
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(fugCoeffs[compIdx] < maxFugacityCoefficient)
+                || !(fugCoeffs[compIdx] > minFugacityCoefficient)) {
+                for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+                    lnPhiDerivatives[compIdx][compJIdx] = 0.0;
+                }
+            }
         }
     }
 
