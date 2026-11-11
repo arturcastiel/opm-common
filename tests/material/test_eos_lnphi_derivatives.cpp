@@ -31,7 +31,11 @@
  *        - the derivatives are those automatic differentiation gives, to
  *          1e-10, for every equation of state, on liquid and vapour roots;
  *        - the mole-number derivatives formed from them are symmetric and
- *          satisfy the Gibbs-Duhem relation.
+ *          satisfy the Gibbs-Duhem relation;
+ *        - the pressure derivatives are those automatic differentiation in
+ *          pressure gives, to 1e-10, with the volume shift; the coefficients
+ *          and composition derivatives given with them are those without them,
+ *          bit for bit.
  */
 #include "config.h"
 
@@ -178,6 +182,65 @@ BOOST_AUTO_TEST_CASE(DerivativesAreThoseOfAutomaticDifferentiation)
         }
     }
     BOOST_TEST_MESSAGE("largest relative difference to automatic differentiation: "
+                       << largestDifference);
+}
+
+BOOST_AUTO_TEST_CASE(PressureDerivativesAreThoseOfAutomaticDifferentiation)
+{
+    using PressureEval = Opm::DenseAd::Evaluation<Scalar, 1>;
+    Scalar largestDifference = 0.0;
+    for (const auto eos : eosTypes) {
+        for (const auto& state : states) {
+            for (const unsigned phaseIdx : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                BOOST_TEST_CONTEXT("EoS " << static_cast<int>(eos) << ", p = " << state.pressure
+                                   << ", T = " << state.temperature << ", phase " << phaseIdx) {
+                    auto fs = fluidState<Scalar>(state);
+                    FluidSystem::ParameterCache<Scalar> cache(eos);
+                    cache.updatePhase(fs, phaseIdx);
+                    std::array<Scalar, numComponents> reference;
+                    Derivatives referenceDerivatives;
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        fs, cache, phaseIdx, reference, referenceDerivatives);
+                    std::array<Scalar, numComponents> coefficients;
+                    Derivatives derivatives;
+                    std::array<Scalar, numComponents> pressureDerivatives;
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        fs, cache, phaseIdx, coefficients, derivatives, pressureDerivatives);
+
+                    // Pressure as the single variable of both phases.
+                    Opm::CompositionalFluidState<PressureEval, FluidSystem> adFs;
+                    const auto pressure = PressureEval::createVariable(state.pressure, 0);
+                    for (const auto phase : {FluidSystem::oilPhaseIdx, FluidSystem::gasPhaseIdx}) {
+                        adFs.setPressure(phase, pressure);
+                        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                            adFs.setMoleFraction(phase, compIdx,
+                                                 PressureEval(state.composition[compIdx]));
+                        }
+                    }
+                    adFs.setTemperature(PressureEval(state.temperature));
+                    FluidSystem::ParameterCache<PressureEval> adCache(eos);
+                    adCache.updatePhase(adFs, phaseIdx);
+                    std::array<PressureEval, numComponents> adCoefficients;
+                    FluidSystem::fugacityCoefficients(adFs, adCache, phaseIdx, adCoefficients);
+
+                    for (int i = 0; i < numComponents; ++i) {
+                        BOOST_CHECK(sameBits(coefficients[i], reference[i]));
+                        for (int j = 0; j < numComponents; ++j) {
+                            BOOST_CHECK(sameBits(derivatives[i][j], referenceDerivatives[i][j]));
+                        }
+                        // p d ln(phi_i) / dp is dimensionless.
+                        const Scalar ad = state.pressure * log(adCoefficients[i]).derivative(0);
+                        const Scalar analytic = state.pressure * pressureDerivatives[i];
+                        const Scalar difference
+                            = std::abs(analytic - ad) / std::max(1.0, std::abs(ad));
+                        largestDifference = std::max(largestDifference, difference);
+                        BOOST_CHECK_SMALL(difference, 1e-10);
+                    }
+                }
+            }
+        }
+    }
+    BOOST_TEST_MESSAGE("largest relative difference to automatic differentiation in pressure: "
                        << largestDifference);
 }
 

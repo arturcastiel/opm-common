@@ -137,6 +137,53 @@ public:
                                                           Coefficients& fugCoeffs,
                                                           Derivatives& lnPhiDerivatives)
     {
+        Coefficients* noPressureDerivatives = nullptr;
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    noPressureDerivatives);
+    }
+
+    /*!
+     * \brief computeFugacityCoefficientsAndDerivatives(), and the derivatives
+     *        of the logarithms in pressure at fixed temperature and phase
+     *        composition.
+     *
+     * \f$A_{ij}\f$, \f$B_i\f$ and so \f$A\f$ and \f$B\f$ are proportional to
+     * pressure, so \f$\partial A / \partial p = A / p\f$,
+     * \f$\partial B / \partial p = B / p\f$, and only \f$Z\f$ and the
+     * logarithms move:
+     *
+     * \f[ \frac{\partial \ln\phi_i}{\partial p}
+     *   = \frac{B_i}{B} Z_p - \frac{Z_p - B_p}{Z - B}
+     *   + \frac{A}{(m_1 - m_2) B}
+     *     \left(\frac{Z_p + m_2 B_p}{Z + m_2 B} - \frac{Z_p + m_1 B_p}{Z + m_1 B}\right)
+     *     \left(\frac{2 \sum_j x_j A_{ij}}{A} - \frac{B_i}{B}\right), \f]
+     *
+     * with \f$Z_p\f$ from the cubic, or \f$Z / p\f$ where the molar volume is
+     * at its floor. A coefficient at its limits has no derivative.
+     *
+     * \param lnPhiPressureDerivatives Receives \f$\partial \ln\phi_i / \partial p\f$ at i.
+     */
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void computeFugacityCoefficientsAndDerivatives(const FluidState& fs,
+                                                          const Params& params,
+                                                          unsigned phaseIdx,
+                                                          Coefficients& fugCoeffs,
+                                                          Derivatives& lnPhiDerivatives,
+                                                          Coefficients& lnPhiPressureDerivatives)
+    {
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    &lnPhiPressureDerivatives);
+    }
+
+private:
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void coefficientsAndDerivatives_(const FluidState& fs,
+                                            const Params& params,
+                                            unsigned phaseIdx,
+                                            Coefficients& fugCoeffs,
+                                            Derivatives& lnPhiDerivatives,
+                                            Coefficients* lnPhiPressureDerivatives)
+    {
         using LhsEval = typename FluidState::ValueType;
         static_assert(std::is_floating_point_v<LhsEval>,
                       "The derivatives are those of a value-only evaluation");
@@ -201,15 +248,33 @@ public:
                     + perS * S[compIdx];
             }
         }
+        if (lnPhiPressureDerivatives) {
+            const LhsEval p = fs.pressure(phaseIdx);
+            const LhsEval Ap = A / p;
+            const LhsEval Bp = B / p;
+            const LhsEval Zp = volumeAtFloor ? Z / p : -(FA * Ap + FB * Bp) / FZ;
+            const LhsEval LambdaP = (Zp + m2 * Bp) / P2 - (Zp + m1 * Bp) / P1;
+            const LhsEval common = -(Zp - Bp) / ZB;
+            const LhsEval betaP = A * invB * LambdaP / Delta;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                (*lnPhiPressureDerivatives)[compIdx] = common
+                    + params.Bi(phaseIdx, compIdx) * invB * Zp + betaP * gamma[compIdx];
+            }
+        }
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             if (!(fugCoeffs[compIdx] < maxFugacityCoefficient)
                 || !(fugCoeffs[compIdx] > minFugacityCoefficient)) {
                 for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
                     lnPhiDerivatives[compIdx][compJIdx] = 0.0;
                 }
+                if (lnPhiPressureDerivatives) {
+                    (*lnPhiPressureDerivatives)[compIdx] = 0.0;
+                }
             }
         }
     }
+
+public:
 
     /*!
      * \brief The molar volume of a phase from the cubic in \f$Z\f$.
