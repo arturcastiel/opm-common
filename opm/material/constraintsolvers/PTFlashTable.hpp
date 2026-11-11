@@ -65,13 +65,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -204,6 +207,69 @@ struct PTFlashTableSettings
 };
 
 /*!
+ * \brief The reports of OPM_FLASH_OBL_STATS = 1, one per thread and store.
+ *
+ * A thread's table and the stability memory of PTFlash register their
+ * report here, and report when their thread ends. The threads of a pool
+ * (OpenMP) do not end before the process, so what is still registered
+ * reports when the process exits. Nothing registers without the statistics.
+ */
+class PTFlashReports
+{
+public:
+    static PTFlashReports& get()
+    {
+        // Never destroyed: a thread may end after the static destructors.
+        static PTFlashReports* reports = [] {
+            auto* r = new PTFlashReports;
+            std::atexit([] { PTFlashReports::get().reportAll(); });
+            return r;
+        }();
+        return *reports;
+    }
+
+    //! The number of the calling thread in the reports, in order of first use.
+    static int threadNumber()
+    {
+        static std::atomic<int> next{0};
+        thread_local const int number = next++;
+        return number;
+    }
+
+    void add(const void* owner, std::function<void()> report)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.emplace_back(owner, std::move(report));
+    }
+
+    //! Reports for \p owner and forgets it.
+    void remove(const void* owner)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->first == owner) {
+                it->second();
+                entries_.erase(it);
+                return;
+            }
+        }
+    }
+
+private:
+    void reportAll()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : entries_) {
+            entry.second();
+        }
+        entries_.clear();
+    }
+
+    std::mutex mutex_;
+    std::vector<std::pair<const void*, std::function<void()>>> entries_;
+};
+
+/*!
  * \brief The vertex and cell stores of one fluid system and thread.
  */
 template <class Scalar, class FluidSystem>
@@ -274,10 +340,23 @@ public:
         return table;
     }
 
+    PTFlashTable()
+    {
+        if (PTFlashTableSettings::get().printStatistics) {
+            thread_ = PTFlashReports::threadNumber();
+            PTFlashReports::get().add(this, [this] { report(); });
+        }
+    }
+
     ~PTFlashTable()
     {
-        report();
+        if (PTFlashTableSettings::get().printStatistics) {
+            PTFlashReports::get().remove(this);
+        }
     }
+
+    PTFlashTable(const PTFlashTable&) = delete;
+    PTFlashTable& operator=(const PTFlashTable&) = delete;
 
     //! Empties the table at the next flash, which also reads the settings again.
     void reset()
@@ -753,7 +832,8 @@ public:
         }
         const std::size_t vertexBytes
             = vertices_.size() * (sizeof(Vertex) + sizeof(std::uint64_t) + 2 * sizeof(void*));
-        std::cerr << "OBL-TABLE components " << numComponents << " intervals " << intervals_
+        std::cerr << "OBL-TABLE thread " << thread_ << " components " << numComponents
+                  << " intervals " << intervals_
                   << (simplex_ ? " simplex" : " multilinear")
                   << " queries " << queries_ << " present " << hits_ << " vertex-flashes "
                   << vertexFlashes_ << " vertices " << vertices_.size() << " (failed " << failedVertices
@@ -766,15 +846,16 @@ public:
             static constexpr const char* names[] = {"two-phase-start", "two-phase-retry",
                 "single-phase", "boundary-split", "boundary-retry", "boundary-single",
                 "boundary-band", "flash"};
-            std::cerr << "OBL-OUTCOMES";
+            std::cerr << "OBL-OUTCOMES thread " << thread_;
             for (int o = 0; o < static_cast<int>(Outcome::Count); ++o) {
                 std::cerr << ' ' << names[o] << ' ' << outcomes_[o];
             }
             std::cerr << std::endl;
         }
         if (enthalpyQueries_ > 0) {
-            std::cerr << "OBL-ENTHALPY queries " << enthalpyQueries_ << " starts " << enthalpyStarts_
-                      << " vertex-enthalpies " << enthalpies_.size() << std::endl;
+            std::cerr << "OBL-ENTHALPY thread " << thread_ << " queries " << enthalpyQueries_
+                      << " starts " << enthalpyStarts_ << " vertex-enthalpies "
+                      << enthalpies_.size() << std::endl;
         }
     }
 
@@ -947,6 +1028,7 @@ private:
     }
 
     bool initialized_ = false;
+    int thread_ = 0;
     bool simplex_ = false;
     bool negative_ = false;
     std::uint64_t fingerprint_ = 0;

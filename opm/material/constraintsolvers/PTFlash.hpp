@@ -369,11 +369,50 @@ protected:
         Scalar critical_distance = 0.0;
     };
 
-    //! The reference states of one thread, in slots chosen by the incoming ratios.
+    //! The reference states of one thread, in slots chosen by the incoming
+    //! ratios, and what the bypass did (reported with OPM_FLASH_OBL_STATS = 1).
     struct StabilityMemory
     {
         std::vector<StabilityReference> references
             = std::vector<StabilityReference>(stabilityMemorySize);
+        //! States without a split (L outside (0, 1)) that looked for a
+        //! reference, those of them single-phase without a stability test,
+        //! and the references stored.
+        long checks = 0;
+        long hits = 0;
+        long remembered = 0;
+
+        StabilityMemory()
+        {
+            if (PTFlashTableSettings::get().printStatistics) {
+                thread = PTFlashReports::threadNumber();
+                PTFlashReports::get().add(this, [this] { report(); });
+            }
+        }
+
+        ~StabilityMemory()
+        {
+            if (PTFlashTableSettings::get().printStatistics) {
+                PTFlashReports::get().remove(this);
+            }
+        }
+
+        StabilityMemory(const StabilityMemory&) = delete;
+        StabilityMemory& operator=(const StabilityMemory&) = delete;
+
+        void report() const
+        {
+            std::size_t held = 0;
+            for (const auto& reference : references) {
+                held += reference.critical_distance != 0.;
+            }
+            std::cerr << "BYPASS thread " << thread << " components " << numComponents
+                      << " checks " << checks << " hits " << hits << " remembered " << remembered
+                      << " references-held " << held << " bytes "
+                      << references.size() * sizeof(StabilityReference) << std::endl;
+        }
+
+        int thread = 0;
     };
 
     static StabilityMemory& stabilityMemory_()
@@ -428,13 +467,18 @@ protected:
         // reference state whose stability test was decisive stays
         // single-phase without a test. The reference is found by the
         // incoming ratios.
-        StabilityReference* stability_reference = settings.stabilityBypass
-            ? &stabilityMemory_().references[referenceSlot_(K_scalar)] : nullptr;
+        StabilityMemory* stability_memory = settings.stabilityBypass ? &stabilityMemory_() : nullptr;
+        StabilityReference* stability_reference = stability_memory
+            ? &stability_memory->references[referenceSlot_(K_scalar)] : nullptr;
         const auto incoming_K = K_scalar;
         const bool stability_bypassed = single_phase_from_table
             || (is_cold_start && stability_reference
                 && stabilityBypass_(*stability_reference, K_scalar, L_scalar, fluid_state,
                                     z_scalar, eos_type));
+        if (stability_memory && is_cold_start && !single_phase_from_table) {
+            ++stability_memory->checks;
+            stability_memory->hits += stability_bypassed;
+        }
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
         const bool split_from_flash_first = is_cold_start && !stability_bypassed
@@ -603,6 +647,7 @@ protected:
                     is_new_reference = rememberReference_(*stability_reference, incoming_K,
                                                           fluid_state, z_scalar,
                                                           stable_phase_idx);
+                    stability_memory->remembered += is_new_reference;
                 }
             }
         }
