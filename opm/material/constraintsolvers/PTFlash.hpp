@@ -902,12 +902,37 @@ protected:
         }
         // The two stationary trial compositions seed the equilibrium ratios.
         else {
+            ComponentVector starting_k = K;
             for (int compIdx = 0; compIdx<numComponents; ++compIdx) {
                 if (Opm::getValue(z[compIdx]) > 0.) {
                     K[compIdx]
                         = vapour_trial_composition[compIdx] / liquid_trial_composition[compIdx];
                 } else {
                     K[compIdx] = 1.;
+                }
+            }
+            // Both trials can reach the same stationary point, as where the
+            // feed splits into two liquids, and their ratios of one would
+            // collapse the split. The feed is then the other phase. The trial
+            // is the vapour if it is richer than the feed in the components
+            // with the larger starting ratios, else the liquid.
+            if (trivialSolutionMeasure_(K) < trivialSolutionTolerance) {
+                const auto& trial_composition = vapour_trial_sum > liquid_trial_sum
+                    ? vapour_trial_composition : liquid_trial_composition;
+                Scalar lightness = 0.;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar ratio = Opm::getValue(starting_k[compIdx]);
+                    if (Opm::getValue(z[compIdx]) > 0. && ratio > 0.) {
+                        lightness += Opm::getValue(trial_composition[compIdx] - z[compIdx])
+                            * std::log(ratio);
+                    }
+                }
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    if (Opm::getValue(z[compIdx]) > 0.) {
+                        K[compIdx] = lightness > 0.
+                            ? trial_composition[compIdx] / z[compIdx]
+                            : z[compIdx] / trial_composition[compIdx];
+                    }
                 }
             }
         }
