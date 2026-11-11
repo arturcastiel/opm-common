@@ -56,14 +56,17 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -139,6 +142,16 @@ class PTFlash
     // the Hessian: none, then firstHessianShift times powers of ten.
     static constexpr Scalar firstHessianShift = 1e-4;
     static constexpr int maxHessianShifts = 8;
+    // The stability bypass of single-phase states, see stabilityBypass_():
+    // the windows in composition and relative pressure (b / tolerance) and in
+    // temperature (b times the temperature window, in K), with b the
+    // critical distance of the reference state, and the number of reference
+    // states each thread remembers. MultiComponentFlash.jl uses 10 and 10;
+    // these are the widest windows that changed no phase state on the
+    // benchmark maps (10 and 10 changed 45 states, 50 and 0.5 changed 2).
+    static constexpr Scalar stabilityBypassTolerance = 100;
+    static constexpr Scalar stabilityBypassTemperatureWindow = 0.3;
+    static constexpr std::size_t stabilityMemorySize = std::size_t{1} << 16;
 
 public:
     /*!
@@ -309,6 +322,30 @@ protected:
         std::optional<NewtonJacobian> newton_jacobian;
     };
 
+    //! A single-phase state whose stability test found both trial phases
+    //! collapsing onto the feed, see stabilityBypass_().
+    struct StabilityReference
+    {
+        std::array<Scalar, numComponents> ratios{}; //!< the incoming ratios, its key
+        std::array<Scalar, numComponents> composition{};
+        Scalar pressure = 0.0;
+        Scalar temperature = 0.0;
+        Scalar critical_distance = 0.0; //!< see criticalDistance_()
+    };
+
+    //! The reference states of one thread, in slots chosen by the incoming ratios.
+    struct StabilityMemory
+    {
+        std::vector<StabilityReference> references
+            = std::vector<StabilityReference>(stabilityMemorySize);
+    };
+
+    static StabilityMemory& stabilityMemory_()
+    {
+        thread_local StabilityMemory memory;
+        return memory;
+    }
+
     //! flash_solve_scalar(), also returning the composition Jacobian when
     //! Newton finished the split.
     template <typename FluidState>
@@ -347,17 +384,29 @@ protected:
         // Here, a cold start means there is no usable previous two-phase split
         // (L is outside (0, 1)); a warm start reuses previous K and L values.
         const bool is_cold_start = L_scalar <= 0 || L_scalar >= 1;
+        // A single-phase state close to a reference state whose stability
+        // test was decisive stays single-phase without a test. The reference
+        // is found by the incoming ratios.
+        auto& stability_reference = stabilityMemory_().references[referenceSlot_(K_scalar)];
+        const auto incoming_K = K_scalar;
+        const bool stability_bypassed = is_cold_start
+            && stabilityBypass_(stability_reference, K_scalar, L_scalar, fluid_state, z_scalar);
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
-        const bool split_from_flash_first = is_cold_start
+        const bool split_from_flash_first = is_cold_start && !stability_bypassed
             && flashFirst_(K_scalar, L_scalar, newton_jacobian, fluid_state, z_scalar,
                            twoPhaseMethod, flash_tolerance, eos_type, verbosity);
-        if (is_cold_start && !split_from_flash_first) {
+        bool both_trials_trivial = false;
+        if (is_cold_start && !stability_bypassed && !split_from_flash_first) {
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
-            stable_feed_root = phaseStabilityTest_(
-                is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
+            stable_feed_root = phaseStabilityTest_(is_single_phase, K_scalar, fluid_state,
+                                                   z_scalar, eos_type, verbosity,
+                                                   &both_trials_trivial);
+        }
+        if (stability_bypassed) {
+            is_single_phase = true;
         }
         if (verbosity >= 1) {
             OpmLog::debug(fmt::format("Inputs after stability test are K = [{}], L = [{}], z = [{}], P = {}, and T = {}",
@@ -470,6 +519,7 @@ protected:
                 }
             }
         }
+        bool is_new_reference = false;
         if (is_single_phase) {
             newton_jacobian.reset();
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -505,7 +555,16 @@ protected:
                         L_scalar = li_single_phase_label_(fluid_state, z_scalar, verbosity);
                     }
                 }
+                if (both_trials_trivial) {
+                    is_new_reference = rememberReference_(stability_reference, incoming_K,
+                                                          fluid_state, z_scalar, eos_type,
+                                                          stable_phase_idx);
+                }
             }
+        }
+        // Any other outcome leaves no reference for the incoming ratios.
+        if (!stability_bypassed && !is_new_reference) {
+            stability_reference = StabilityReference{};
         }
         fluid_state.setLvalue(L_scalar);
         return {is_single_phase, newton_jacobian};
@@ -1067,6 +1126,228 @@ protected:
     }
 
     /*!
+     * \brief Michelsen's critical-point distance of the feed,
+     *
+     * \f[ b = \lambda_{\min}(\mathbf B), \qquad
+     *     B_{ij} = \delta_{ij} + \sqrt{z_i z_j}\,
+     *              \frac{\partial \ln\varphi_i}{\partial n_j}, \f]
+     *
+     * the curvature of the Gibbs energy of the feed in the scaled mole
+     * numbers \f$2\sqrt{n_i}\f$ on its stable root (Michelsen 1982; as
+     * MultiComponentFlash.jl, michelsen_critical_point_measure!). It is one
+     * for an ideal mixture and vanishes at a critical point or on the
+     * spinodal.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static Scalar criticalDistance_(const FlashFluidState& fluid_state,
+                                    const ComponentVector& z,
+                                    const EOSType& eos_type,
+                                    const int phase_idx)
+    {
+        using DistanceEval = DenseAd::Evaluation<Scalar, numComponents>;
+        using ParamCache = typename FluidSystem::template ParameterCache<DistanceEval>;
+        CompositionalFluidState<DistanceEval, FluidSystem> state;
+        const Scalar pressure = Opm::getValue(fluid_state.pressure(0));
+        state.setPressure(oilPhaseIdx, pressure);
+        state.setPressure(gasPhaseIdx, pressure);
+        state.setTemperature(Opm::getValue(fluid_state.temperature(0)));
+
+        // The mole numbers n = z carry the derivatives; the phase holds n / sum(n).
+        std::array<DistanceEval, numComponents> moles;
+        DistanceEval total_moles = 0.;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            moles[compIdx] = DistanceEval::createVariable(Opm::getValue(z[compIdx]), compIdx);
+            total_moles += moles[compIdx];
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            state.setMoleFraction(phase_idx, compIdx, moles[compIdx] / total_moles);
+        }
+        ParamCache param_cache(eos_type);
+        param_cache.updatePhase(state, phase_idx);
+
+        Dune::FieldMatrix<Scalar, numComponents, numComponents> curvature(0.);
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const DistanceEval ln_phi
+                = log(FluidSystem::fugacityCoefficient(state, param_cache, phase_idx, compIdx));
+            for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                curvature[compIdx][otherIdx] = std::sqrt(Opm::getValue(z[compIdx])
+                                                         * Opm::getValue(z[otherIdx]))
+                    * ln_phi.derivative(otherIdx);
+            }
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            for (int otherIdx = 0; otherIdx < compIdx; ++otherIdx) {
+                const Scalar mean
+                    = 0.5 * (curvature[compIdx][otherIdx] + curvature[otherIdx][compIdx]);
+                curvature[compIdx][otherIdx] = mean;
+                curvature[otherIdx][compIdx] = mean;
+            }
+            curvature[compIdx][compIdx] += 1.;
+        }
+        return smallestEigenvalue_(curvature);
+    }
+
+    /*!
+     * \brief The smallest eigenvalue of a small symmetric matrix, by cyclic
+     *        Jacobi rotations.
+     */
+    template <class Matrix>
+    static Scalar smallestEigenvalue_(Matrix a)
+    {
+        constexpr int size = Matrix::rows;
+        for (int sweep = 0; sweep < 50; ++sweep) {
+            Scalar off_diagonal = 0.;
+            Scalar diagonal = 0.;
+            for (int row = 0; row < size; ++row) {
+                diagonal += a[row][row] * a[row][row];
+                for (int col = row + 1; col < size; ++col) {
+                    off_diagonal += a[row][col] * a[row][col];
+                }
+            }
+            if (!(off_diagonal > 1e-30 * diagonal)) {
+                break;
+            }
+            for (int row = 0; row < size; ++row) {
+                for (int col = row + 1; col < size; ++col) {
+                    if (a[row][col] == 0.) {
+                        continue;
+                    }
+                    // The rotation that annihilates a[row][col].
+                    const Scalar theta = (a[col][col] - a[row][row]) / (2. * a[row][col]);
+                    const Scalar t = (theta >= 0. ? 1. : -1.)
+                        / (std::abs(theta) + std::sqrt(theta * theta + 1.));
+                    const Scalar c = 1. / std::sqrt(t * t + 1.);
+                    const Scalar s = t * c;
+                    for (int k = 0; k < size; ++k) {
+                        const Scalar a_kr = a[k][row];
+                        const Scalar a_kc = a[k][col];
+                        a[k][row] = c * a_kr - s * a_kc;
+                        a[k][col] = s * a_kr + c * a_kc;
+                    }
+                    for (int k = 0; k < size; ++k) {
+                        const Scalar a_rk = a[row][k];
+                        const Scalar a_ck = a[col][k];
+                        a[row][k] = c * a_rk - s * a_ck;
+                        a[col][k] = s * a_rk + c * a_ck;
+                    }
+                }
+            }
+        }
+        Scalar smallest = a[0][0];
+        for (int row = 1; row < size; ++row) {
+            smallest = std::min(smallest, a[row][row]);
+        }
+        return smallest;
+    }
+
+    //! The memory slot of the incoming ratios: a hash of their bits.
+    template <class ComponentVector>
+    static std::size_t referenceSlot_(const ComponentVector& K)
+    {
+        std::uint64_t hash = 0x9e3779b97f4a7c15ULL;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const double ratio = Opm::getValue(K[compIdx]);
+            hash ^= std::bit_cast<std::uint64_t>(ratio) + 0x9e3779b97f4a7c15ULL + (hash << 6)
+                + (hash >> 2);
+            // The finaliser of MurmurHash3.
+            hash ^= hash >> 33;
+            hash *= 0xff51afd7ed558ccdULL;
+            hash ^= hash >> 33;
+        }
+        return static_cast<std::size_t>(hash) % stabilityMemorySize;
+    }
+
+    /*!
+     * \brief Remember a single-phase state whose stability test found both
+     *        trial phases collapsing onto the feed, as the reference of its
+     *        incoming ratios for stabilityBypass_().
+     *
+     * The ratios are not changed: the caller keeps them, and the next call
+     * with them finds the reference. States with the same ratios share a
+     * slot, and the last one stays. Each reference stands for the states
+     * around it, so whichever is found is as good a reference for a state
+     * inside its window.
+     *
+     * \return whether the state was remembered
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool rememberReference_(StabilityReference& reference,
+                                   const ComponentVector& K,
+                                   const FlashFluidState& fluid_state,
+                                   const ComponentVector& z,
+                                   const EOSType& eos_type,
+                                   const int phase_idx)
+    {
+        const Scalar distance = criticalDistance_(fluid_state, z, eos_type, phase_idx);
+        if (!(distance > 0.)) {
+            return false;
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            reference.ratios[compIdx] = Opm::getValue(K[compIdx]);
+            reference.composition[compIdx] = Opm::getValue(z[compIdx]);
+        }
+        reference.pressure = Opm::getValue(fluid_state.pressure(0));
+        reference.temperature = Opm::getValue(fluid_state.temperature(0));
+        reference.critical_distance = distance;
+        return true;
+    }
+
+    /*!
+     * \brief The stability bypass of single-phase states (the critical-distance
+     *        test of Michelsen 1982 and Rasmussen et al. 2006, as
+     *        MultiComponentFlash.jl, stability_bypass_available).
+     *
+     * A state that comes in single-phase (\f$L\f$ of 0 or 1) with the
+     * incoming ratios of a reference state from rememberReference_() stays
+     * single-phase
+     * without a stability test when, with the critical distance \f$b\f$ of
+     * the reference, the tolerance \f$t\f$ (stabilityBypassTolerance) and
+     * the temperature window \f$w\f$ (stabilityBypassTemperatureWindow),
+     *
+     * \f[ \max_i |z_i - z_i^{\mathrm{ref}}| < b / t, \qquad
+     *     |p - p^{\mathrm{ref}}| < b\,p / t, \qquad
+     *     |T - T^{\mathrm{ref}}| < w\,b \text{ [K]}. \f]
+     *
+     * A bypass does not move the reference, so a chain of small steps
+     * cannot drift away from it without a new test. This is a heuristic, not a proof: \f$b\f$ measures the
+     * distance to the spinodal and the critical point, not to the phase
+     * boundary.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool stabilityBypass_(const StabilityReference& reference,
+                                 const ComponentVector& K,
+                                 const typename FlashFluidState::ValueType& L,
+                                 const FlashFluidState& fluid_state,
+                                 const ComponentVector& z)
+    {
+        if (!(L == 0. || L == 1.)) {
+            return false;
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(reference.ratios[compIdx] == Opm::getValue(K[compIdx]))) {
+                return false;
+            }
+        }
+        const Scalar distance = reference.critical_distance;
+        const Scalar pressure = Opm::getValue(fluid_state.pressure(0));
+        const Scalar temperature = Opm::getValue(fluid_state.temperature(0));
+        if (!(std::abs(pressure - reference.pressure)
+                  < distance * pressure / stabilityBypassTolerance
+              && std::abs(temperature - reference.temperature)
+                  < stabilityBypassTemperatureWindow * distance)) {
+            return false;
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(std::abs(Opm::getValue(z[compIdx]) - reference.composition[compIdx])
+                  < distance / stabilityBypassTolerance)) {
+                return false;
+            }
+        }
+        OPM_FLASH_COUNT(cacheHits);
+        return true;
+    }
+
+    /*!
      * \brief Michelsen's stability analysis of the mixture.
      *
      * A vapour-like and a liquid-like trial phase are each grown from the
@@ -1081,10 +1362,12 @@ protected:
      * \param z The mixture composition.
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
+     * \param[out] both_trials_trivial If given, whether both trials collapsed onto the feed.
      * \return The stable cubic root of the feed, which labels a stable one.
      */
     template <class FlashFluidState, class ComponentVector>
-    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
+    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity,
+                                    bool* both_trials_trivial = nullptr)
     {
         OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
@@ -1141,6 +1424,9 @@ protected:
 
         // Neither trial phase found a negative tangent-plane distance.
         isStable = liquid_trial_finds_no_instability && vapour_trial_finds_no_instability;
+        if (both_trials_trivial != nullptr) {
+            *both_trials_trivial = liquid_trial_is_trivial && vapour_trial_is_trivial;
+        }
         if (isStable) {
             // A single phase has the feed composition under either phase label.
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
