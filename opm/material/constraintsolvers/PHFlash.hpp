@@ -161,8 +161,9 @@ struct PHFlash {
      * \param[in,out] fluidState in: the pressure and the overall mole
      *        fractions. Out, on success: the solution temperature, and the
      *        liquid fraction and phase compositions of the state flashed
-     *        there. On failure the state is left at the last trial and is not
-     *        valid.
+     *        there. On failure the state is not valid: it is left flashed at
+     *        the converged temperature where the residual check fails there,
+     *        and otherwise where the last flash of it left it.
      * \param hSpec specified molar mixture enthalpy [J/mol]
      * \param cfg the enthalpy model and the temperature search
      * \param twoPhaseMethod iteration scheme of the isothermal flash
@@ -222,6 +223,22 @@ struct PHFlash {
                                    twoPhaseMethod, ptTolerance, eosType, verbosity);
         };
 
+        // The trials of the bracket search need values only: they flash a
+        // value-only copy of the state, without the derivative pass of
+        // PTFlash::solve. The state itself is flashed once, at the solution.
+        ScalarState trialState;
+        for (const unsigned phaseIdx : {static_cast<unsigned>(FluidSystem::oilPhaseIdx),
+                                        static_cast<unsigned>(FluidSystem::gasPhaseIdx)}) {
+            trialState.setPressure(phaseIdx, getValue(fluidState.pressure(phaseIdx)));
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            trialState.setMoleFraction(compIdx, getValue(fluidState.moleFraction(compIdx)));
+        }
+        auto trialResidualAt = [&](const Scalar T) {
+            return flashedResidual(trialState, T, hSpec, cfg, warmStart,
+                                   twoPhaseMethod, ptTolerance, eosType, verbosity);
+        };
+
         // With the caloric model of the built-in provider, H = sum_i z_i h_i(T)
         // does not depend on the phase split, and the search needs no flash.
         constexpr bool builtInProvider =
@@ -232,7 +249,7 @@ struct PHFlash {
         // finite.
         auto evaluate = [&](const Scalar T) -> std::optional<Scalar> {
             if (!searchWithoutFlash) {
-                return residualAt(T);
+                return trialResidualAt(T);
             }
             Scalar h = 0.0;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -341,6 +358,27 @@ private:
 
     //! Limit on the evaluations of one bracketToward() call.
     static constexpr int maxBoundarySteps = 64;
+
+    //! The value-only state the trials of the bracket search are flashed on.
+    using ScalarState = CompositionalFluidState<Scalar, FluidSystem>;
+
+    //! The isothermal flash: on a value-only state without the derivative
+    //! pass, on any other with it.
+    template <class FluidState>
+    static void flash(FluidState& fluidState,
+                      const PTFlashMethod twoPhaseMethod,
+                      const Scalar ptTolerance,
+                      const EOSType& eosType,
+                      const int verbosity)
+    {
+        using Flash = PTFlash<Scalar, FluidSystem, true>;
+        if constexpr (std::is_same_v<typename FluidState::ValueType, Scalar>) {
+            Flash::flash_solve_scalar(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+        }
+        else {
+            Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+        }
+    }
 
     //! A trial with the slope dr/dT [J/(mol K)], where that can be evaluated.
     struct SlopedTrial
@@ -536,7 +574,6 @@ private:
                                                  const int verbosity,
                                                  const bool reuseSplit = false)
     {
-        using Flash = PTFlash<Scalar, FluidSystem, true>;
         using ValueType = typename FluidState::ValueType;
 
         OPM_FLASH_COUNT(phEvaluations);
@@ -546,7 +583,7 @@ private:
         bool solved = false;
         if (warmStart.seed(fluidState, T, reuseSplit)) {
             try {
-                Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+                flash(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
                 solved = true;
             }
             catch (const std::runtime_error&) {
@@ -563,7 +600,7 @@ private:
                     fluidState.setKvalue(compIdx, fluidState.wilsonK_(compIdx));
                 }
                 fluidState.setLvalue(ValueType(-1.0));
-                Flash::solve(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
+                flash(fluidState, twoPhaseMethod, ptTolerance, eosType, verbosity);
             }
             warmStart.store(fluidState, T);
 
