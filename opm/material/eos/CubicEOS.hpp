@@ -28,6 +28,7 @@
 #include <opm/material/common/Valgrind.hpp>
 
 #include <array>
+#include <cmath>
 #include <type_traits>
 
 namespace Opm
@@ -393,7 +394,7 @@ public:
         Evaluation Z[3] = {0.0, 0.0, 0.0};
         // Only the root of the phase is used: the largest for the vapour,
         // the smallest for the liquid.
-        int numSol = cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+        const int numSol = extremeRootWithDerivatives_(Z, a1, a2, a3, a4, isGasPhase);
 
         // pick correct root
         const Evaluation RT_p = R * T / p;
@@ -420,6 +421,46 @@ public:
     }
 
 private:
+    /*!
+     * \brief cubicExtremeRoot() of the EOS cubic, with the derivatives of
+     *        the root from the cubic itself.
+     *
+     * The root is found on values, which gives the value cubicExtremeRoot()
+     * gives on the evaluations. Its derivatives follow from the implicit
+     * function theorem: \f$F(Z) = Z^3 + a_2 Z^2 + a_3 Z + a_4 = 0\f$ gives
+     * \f$dZ = -(Z^2\,da_2 + Z\,da_3 + da_4) / F'(Z)\f$, the derivatives of
+     * the closed-form root to round-off, without carrying them through its
+     * roots and trigonometric functions. At a double root, where
+     * \f$F'(Z) = 0\f$, the closed form decides.
+     */
+    template <class Evaluation>
+    static int extremeRootWithDerivatives_(Evaluation* Z,
+                                           const Evaluation& a1,
+                                           const Evaluation& a2,
+                                           const Evaluation& a3,
+                                           const Evaluation& a4,
+                                           const bool isGasPhase)
+    {
+        if constexpr (std::is_floating_point_v<Evaluation>) {
+            return cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+        }
+        else {
+            using Value = std::remove_cv_t<std::remove_reference_t<decltype(getValue(a1))>>;
+            Value roots[3] = {0.0, 0.0, 0.0};
+            const int numSol = cubicExtremeRoot(roots, getValue(a1), getValue(a2),
+                                                getValue(a3), getValue(a4), isGasPhase);
+            const int rootIdx = (numSol == 3 && isGasPhase) ? 2 : 0;
+            const Value root = roots[rootIdx];
+            const Value slope = (3 * root + 2 * getValue(a2)) * root + getValue(a3);
+            if (getValue(a1) != 1.0 || !(slope != 0.0) || !std::isfinite(slope)) {
+                return cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+            }
+            Z[rootIdx] = (root * root * a2 + root * a3 + a4) * (-1 / slope);
+            Z[rootIdx].setValue(root);
+            return numSol;
+        }
+    }
+
     //! The terms of \f$\ln \phi_i\f$ shared by all components of a phase.
     template <class LhsEval>
     struct PhaseFugacityTerms
