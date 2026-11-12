@@ -346,6 +346,30 @@ BOOST_AUTO_TEST_CASE(Spe5NearCritical)
     const auto failed = ptflash<Spe5>(p, T, z, wilson<Spe5>(p, T), -1.0, Opm::PTFlashMethod::SsiNewton,
                                       EOSType::PR);
     BOOST_CHECK(!failed.ok);
+
+    // Without the composition Newton, a state that needs it is handed back,
+    // and one that does not is flashed as before.
+    const auto params = K::makeParameters<double, Spe5>(EOSType::PR);
+    K::Settings<double> without;
+    without.compositionNewton = false;
+    K::Vec<double, 6> zk;
+    for (int c = 0; c < 6; ++c) {
+        zk[c] = z[c];
+    }
+    const auto flashWith = [&](int ip, int it, const K::Settings<double>& settings) {
+        const double pi = gridP(ip);
+        const double Ti = gridT(it);
+        K::Vec<double, 6> k0;
+        for (int c = 0; c < 6; ++c) {
+            k0[c] = K::wilsonK(params, pi, Ti, c);
+        }
+        return K::flash(params, pi, Ti, zk, k0, -1.0, settings);
+    };
+    BOOST_CHECK(flashWith(198, 860, without).status == K::Status::compositionNewtonNeeded);
+    const auto ordinary = flashWith(100, 500, without);
+    const auto full = flashWith(100, 500, K::Settings<double>{});
+    BOOST_CHECK(ordinary.status == K::Status::ok);
+    BOOST_CHECK_EQUAL(ordinary.L, full.L);
 }
 
 BOOST_AUTO_TEST_CASE(DerivativesAgainstSolve)
