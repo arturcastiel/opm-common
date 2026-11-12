@@ -39,8 +39,10 @@
  * - every function is OPM_PTFLASH_KERNEL_FUNCTION, OPM_HOST_DEVICE by
  *   default.
  *
- * Values only: the derivative pass of PTFlash::solve() is not part of it.
- * PTFlashKernelHost.hpp builds the parameters from a fluid system.
+ * flash() gives the values (PTFlash::flash_solve_scalar()); its overload
+ * with derivative directions adds the derivative pass of PTFlash::solve()
+ * for an isothermal flash. PTFlashKernelHost.hpp builds the parameters from
+ * a fluid system.
  */
 #ifndef OPM_PTFLASH_KERNEL_HPP
 #define OPM_PTFLASH_KERNEL_HPP
@@ -553,7 +555,9 @@ OPM_PTFK Status fugacityCoefficientsAndDerivatives(const Pure<Scalar, N>& pure,
                                                    const V<Scalar, N>& w,
                                                    bool gas,
                                                    V<Scalar, N>& phi,
-                                                   M<Scalar, N>& d)
+                                                   M<Scalar, N>& d,
+                                                   V<Scalar, N>* dp = nullptr,
+                                                   const V<Scalar, N>* shift = nullptr)
 {
     PhaseTerms<Scalar> t;
     OPM_PTFK_TRY(phaseTerms(pure, w, gas, t));
@@ -607,14 +611,34 @@ OPM_PTFK Status fugacityCoefficientsAndDerivatives(const Pure<Scalar, N>& pure,
                 + perS * S[i];
         }
     }
+    if (dp) {
+        // The pressure derivatives at fixed composition and temperature.
+        const Scalar p = pure.p;
+        const Scalar Ap = A / p;
+        const Scalar Bp = B / p;
+        const Scalar Zp = volumeAtFloor ? Z / p : -(FA * Ap + FB * Bp) / FZ;
+        const Scalar LambdaP = (Zp + m2 * Bp) / P2 - (Zp + m1 * Bp) / P1;
+        const Scalar common = -(Zp - Bp) / ZB;
+        const Scalar betaP = A * invB * LambdaP / Delta;
+        for (int i = 0; i < N; ++i) {
+            (*dp)[i] = common + pure.B[i] * invB * Zp + betaP * gamma[i];
+        }
+    }
     for (int i = 0; i < N; ++i) {
         if (!(raw[i] < Constants<Scalar>::maxFugacityCoefficient)
             || !(raw[i] > Constants<Scalar>::minFugacityCoefficient)) {
             for (int j = 0; j < N; ++j) {
                 d[i][j] = 0.0;
             }
+            if (dp) {
+                (*dp)[i] = 0.0;
+            }
         }
         phi[i] = raw[i] * pure.translation[i];
+        // The translation exp(-s_i B_i) with B_i proportional to pressure.
+        if (dp && shift && (*shift)[i] != 0.0) {
+            (*dp)[i] -= (*shift)[i] * pure.B[i] / pure.p;
+        }
     }
     return Status::ok;
 }
@@ -2046,6 +2070,157 @@ OPM_PTFK Status flashScalar(Context<Scalar, N>& ctx,
     return Status::ok;
 }
 
+/*!
+ * \brief PTFlash::luFactor_(): LU with partial pivoting in place, the
+ *        exchanged row of each row in pivots.
+ */
+template <class Scalar, int n>
+OPM_PTFK Status luFactor(Vec<Vec<Scalar, n>, n>& matrix, int (&pivots)[n])
+{
+    for (int col = 0; col < n; ++col) {
+        int pivot = col;
+        Scalar largest = math::abs(matrix[col][col]);
+        for (int row = col + 1; row < n; ++row) {
+            if (math::abs(matrix[row][col]) > largest) {
+                largest = math::abs(matrix[row][col]);
+                pivot = row;
+            }
+        }
+        pivots[col] = pivot;
+        if (pivot != col) {
+            const Vec<Scalar, n> t = matrix[col];
+            matrix[col] = matrix[pivot];
+            matrix[pivot] = t;
+        }
+        if (largest == 0.0) {
+            return Status::singularJacobian;
+        }
+        for (int row = col + 1; row < n; ++row) {
+            const Scalar factor = matrix[row][col] / matrix[col][col];
+            matrix[row][col] = factor;
+            for (int j = col + 1; j < n; ++j) {
+                matrix[row][j] -= factor * matrix[col][j];
+            }
+        }
+    }
+    return Status::ok;
+}
+
+//! PTFlash::luSolve_()
+template <class Scalar, int n>
+OPM_PTFK void luSolveFactored(const Vec<Vec<Scalar, n>, n>& lu, const int (&pivots)[n], Vec<Scalar, n>& rhs)
+{
+    for (int row = 0; row < n; ++row) {
+        const Scalar t = rhs[row];
+        rhs[row] = rhs[pivots[row]];
+        rhs[pivots[row]] = t;
+    }
+    for (int row = 1; row < n; ++row) {
+        for (int col = 0; col < row; ++col) {
+            rhs[row] -= lu[row][col] * rhs[col];
+        }
+    }
+    for (int row = n - 1; row >= 0; --row) {
+        for (int col = row + 1; col < n; ++col) {
+            rhs[row] -= lu[row][col] * rhs[col];
+        }
+        rhs[row] /= lu[row][row];
+    }
+}
+
+/*!
+ * \brief The derivative pass of a two-phase answer, isothermal: PTFlash's
+ *        analyticFugacityJacobians_() with the pressure column and
+ *        setReducedDerivatives_(), for the caller's derivative directions.
+ */
+template <class Scalar, int N, int Md>
+OPM_PTFK Status derivativesTwoPhase(const Parameters<Scalar, N>& params,
+                                    const Pure<Scalar, N>& pure,
+                                    const V<Scalar, N>& x,
+                                    const V<Scalar, N>& y,
+                                    const Scalar liquid_fraction,
+                                    const Vec<Vec<Scalar, N + 1>, Md>& directions,
+                                    Vec<Vec<Scalar, Md>, 2 * N + 1>& out)
+{
+    M<Scalar, N> jac[2];
+    V<Scalar, N> G = filled<Scalar, N>(0.);
+    const Scalar pref = pure.p;
+    for (int phase = 0; phase < 2; ++phase) {
+        const V<Scalar, N>& w = phase == liquid ? x : y;
+        V<Scalar, N> phi;
+        M<Scalar, N> d;
+        V<Scalar, N> dp;
+        OPM_PTFK_TRY(fugacityCoefficientsAndDerivatives(pure, w, phase == vapour, phi, d, &dp,
+                                                        &params.volumeShift));
+        for (int i = 0; i < N; ++i) {
+            const Scalar scaled = phi[i];
+            for (int j = 0; j < N; ++j) {
+                jac[phase][i][j] = scaled * w[i] * d[i][j];
+            }
+            jac[phase][i][i] += scaled;
+        }
+        for (int i = 0; i < N; ++i) {
+            const Scalar column = w[i] * phi[i] * (1.0 + pref * dp[i]) / pref;
+            G[i] = phase == liquid ? column : G[i] - column;
+        }
+    }
+
+    constexpr int num_reduced = N + 1;
+    const Scalar vapour_fraction = 1 - liquid_fraction;
+    V<Scalar, N> split;
+    for (int i = 0; i < N; ++i) {
+        split[i] = x[i] - y[i];
+    }
+    M<Scalar, N> difference;
+    Vec<Vec<Scalar, num_reduced>, num_reduced> reduced;
+    for (int row = 0; row < N; ++row) {
+        Scalar coupling = 0.0;
+        for (int col = 0; col < N; ++col) {
+            difference[row][col] = jac[liquid][row][col] - jac[vapour][row][col];
+            reduced[row][col] = vapour_fraction * jac[liquid][row][col] + liquid_fraction * jac[vapour][row][col];
+            coupling += difference[row][col] * split[col];
+        }
+        reduced[row][N] = coupling;
+        reduced[N][row] = 1.0;
+    }
+    reduced[N][N] = 0.0;
+    int pivots[num_reduced];
+    OPM_PTFK_TRY(luFactor(reduced, pivots));
+
+    for (int k = 0; k < Md; ++k) {
+        const Scalar state_derivative = directions[k][0];
+        bool varies = state_derivative != 0.0;
+        for (int c = 0; c < N; ++c) {
+            varies = varies || directions[k][1 + c] != 0.0;
+        }
+        if (!varies) {
+            for (int r = 0; r < 2 * N + 1; ++r) {
+                out[r][k] = 0.0;
+            }
+            continue;
+        }
+        Vec<Scalar, num_reduced> rhs;
+        for (int row = 0; row < N; ++row) {
+            Scalar value = 0.0;
+            value += G[row] * state_derivative;
+            for (int col = 0; col < N; ++col) {
+                value += difference[row][col] * directions[k][1 + col];
+            }
+            rhs[row] = value;
+        }
+        rhs[N] = 0.0;
+        luSolveFactored(reduced, pivots, rhs);
+        const Scalar dL = rhs[N];
+        for (int i = 0; i < N; ++i) {
+            const Scalar common = directions[k][1 + i] - split[i] * dL;
+            out[i][k] = common - vapour_fraction * rhs[i];
+            out[N + i][k] = common + liquid_fraction * rhs[i];
+        }
+        out[2 * N][k] = dL;
+    }
+    return Status::ok;
+}
+
 } // namespace detail
 
 /*!
@@ -2082,6 +2257,71 @@ OPM_PTFK Answer<Scalar, N> flash(const Parameters<Scalar, N>& params,
     answer.status = detail::flashScalar(ctx, z, answer.K, answer.L, s, answer.singlePhase);
     answer.x = s.x[detail::liquid];
     answer.y = s.x[detail::vapour];
+    return answer;
+}
+
+/*!
+ * \brief flash() and the derivatives of its answer in the caller's
+ *        variables, as PTFlash::solve() gives them on Evaluations
+ *        (isothermal).
+ *
+ * \param directions directions[k] = (dp/dv_k, dz_0/dv_k, ..., dz_{N-1}/dv_k)
+ *        for the caller's variables v_0 .. v_{M-1}.
+ * \param derivatives Receives d(x_0..x_{N-1}, y_0..y_{N-1}, L)/dv_k at [row][k]:
+ *        by the implicit function theorem on the two-phase equations, or
+ *        dz for both phases of a single phase (L carries none). Zero where
+ *        the answer's status is not ok; the derivative pass's own failure
+ *        (a singular reduced system) is the answer's status.
+ */
+template <class Scalar, int N, int Md>
+OPM_PTFK Answer<Scalar, N> flash(const Parameters<Scalar, N>& params,
+                                 Scalar p,
+                                 Scalar T,
+                                 const Vec<Scalar, N>& z,
+                                 const Vec<Scalar, N>& K,
+                                 Scalar L,
+                                 const Settings<Scalar>& settings,
+                                 const Vec<Vec<Scalar, N + 1>, Md>& directions,
+                                 Vec<Vec<Scalar, Md>, 2 * N + 1>& derivatives)
+{
+    Answer<Scalar, N> answer;
+    answer.K = K;
+    answer.L = L;
+    for (int r = 0; r < 2 * N + 1; ++r) {
+        derivatives[r] = filled<Scalar, Md>(0.);
+    }
+    detail::Context<Scalar, N> ctx{params, {}, K, settings.method, settings.tolerance, answer.counters};
+    answer.status = detail::makePure(params, p, T, ctx.pure);
+    if (answer.status != Status::ok) {
+        return answer;
+    }
+    detail::Phases<Scalar, N> s;
+    for (int phase = 0; phase < 2; ++phase) {
+        s.x[phase] = filled<Scalar, N>(0.);
+        s.phi[phase] = filled<Scalar, N>(0.);
+    }
+    answer.status = detail::flashScalar(ctx, z, answer.K, answer.L, s, answer.singlePhase);
+    answer.x = s.x[detail::liquid];
+    answer.y = s.x[detail::vapour];
+    if (answer.status != Status::ok) {
+        return answer;
+    }
+    if (answer.singlePhase) {
+        for (int k = 0; k < Md; ++k) {
+            for (int i = 0; i < N; ++i) {
+                derivatives[i][k] = directions[k][1 + i];
+                derivatives[N + i][k] = directions[k][1 + i];
+            }
+        }
+        return answer;
+    }
+    answer.status = detail::derivativesTwoPhase(params, ctx.pure, answer.x, answer.y, answer.L, directions,
+                                                derivatives);
+    if (answer.status != Status::ok) {
+        for (int r = 0; r < 2 * N + 1; ++r) {
+            derivatives[r] = filled<Scalar, Md>(0.);
+        }
+    }
     return answer;
 }
 
