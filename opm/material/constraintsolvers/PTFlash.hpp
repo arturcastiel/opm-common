@@ -124,8 +124,8 @@ class PTFlash
     // step: first by stabilityEscapeFactor steps, then by
     // stabilityEscapeGrowth times as many after each one that lowers tm,
     // see checkStability_(). So is one whose steps shrink by less than
-    // stabilityEscapeContraction per step after an extrapolation of the
-    // remaining steps overshot.
+    // stabilityEscapeContraction per step, or do not shrink, of any size,
+    // after an extrapolation of the remaining steps overshot.
     static constexpr Scalar maxStabilityEscapeStep = 1e-3;
     static constexpr Scalar stabilityEscapeContraction = 0.01;
     static constexpr Scalar stabilityEscapeFactor = 8;
@@ -2367,7 +2367,8 @@ protected:
             const FieldType along = steps[0] * steps[1];
             const FieldType slowest = overshot || escaped ? 1. - stabilityEscapeContraction : 1.;
             escaping = along > 0. && !(newest_squared < slowest * along)
-                && (escaped || newest_squared < maxStabilityEscapeStep * maxStabilityEscapeStep);
+                && (escaped || overshot
+                    || newest_squared < maxStabilityEscapeStep * maxStabilityEscapeStep);
             if (!escaping) {
                 escaped = false;
                 escape_factor = stabilityEscapeFactor;
