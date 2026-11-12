@@ -2563,8 +2563,8 @@ protected:
     }
 
     /*!
-     * \brief Whether a converged split is distinct and oriented like the
-     *        ratios it started from.
+     * \brief Whether distinct phases are the mirror of the split the ratios
+     *        \p start_K point to.
      *
      * Near a critical point the cubic of each phase has a single root, so the
      * equations do not tell the phase labels apart: with a split
@@ -2573,13 +2573,14 @@ protected:
      * too. A Newton step from a start far from convergence can end on
      * either. The mirror shows as equilibrium ratios \f$y_i / x_i\f$ whose
      * logarithms point against those of the start,
-     * \f$\sum_i \ln K^0_i \ln (y_i / x_i) \le 0\f$, over the components
-     * present in both phases.
+     * \f$\sum_i \ln K^0_i \ln (y_i / x_i) < 0\f$, over the components
+     * present in both phases. Coincident phases are not a mirror; see
+     * phasesCoincide_().
      */
     template <class FlashFluidState, class ComponentVector>
-    static bool keepsSplitOrientation_(const FlashFluidState& fluid_state,
-                                       const ComponentVector& start_K,
-                                       const ComponentVector& z)
+    static bool isMirrorSplit_(const FlashFluidState& fluid_state,
+                               const ComponentVector& start_K,
+                               const ComponentVector& z)
     {
         if (phasesCoincide_(fluid_state)) {
             return false;
@@ -2598,7 +2599,7 @@ protected:
             alignment += std::log(start_ratio)
                 * std::log(vapour_mole_fraction / liquid_mole_fraction);
         }
-        return alignment > 0.;
+        return alignment < 0.;
     }
 
     //! Whether the fluid system gives, with the fugacity coefficients of a
@@ -2982,14 +2983,15 @@ protected:
      * the unknowns. The convergence test follows its assembly, so the
      * Jacobian returned belongs to the converged state.
      *
-     * Newton finishes the split its start points to. One that ends on
-     * coincident phases or on the mirror split, see keepsSplitOrientation_(),
-     * has left it: a Gibbs-energy Newton that does is replaced by the
-     * composition Newton from the same ratios, and a composition Newton that
-     * does throws.
+     * Newton finishes the split its start points to. A Gibbs-energy Newton
+     * that ends on coincident phases or on the mirror split, see
+     * isMirrorSplit_(), has left it and is replaced by the composition Newton
+     * from the same ratios. A composition Newton that ends on the mirror
+     * throws; coincident phases are returned to the caller, which classifies
+     * them.
      *
      * \throws NumericalProblem when Newton does not converge, or converges to
-     *         coincident phases or to the mirror split.
+     *         the mirror split.
      */
     template <class FlashFluidState, class ComponentVector>
     static auto newtonComposition_(ComponentVector& K,
@@ -3013,7 +3015,7 @@ protected:
             const auto start_L = L;
             if (auto gibbs_jacobian = gibbsNewtonComposition_(
                     K, L, fluid_state, z, tolerance, eos_type, verbosity)) {
-                if (keepsSplitOrientation_(fluid_state, start_K, z)) {
+                if (!phasesCoincide_(fluid_state) && !isMirrorSplit_(fluid_state, start_K, z)) {
                     return *std::move(gibbs_jacobian);
                 }
                 if (verbosity >= 1) {
@@ -3195,10 +3197,10 @@ protected:
                             "composition with L = {}",
                             Opm::getValue(liquid_fraction)));
         }
-        if (!keepsSplitOrientation_(newton_state, start_K, z)) {
+        if (isMirrorSplit_(newton_state, start_K, z)) {
             OPM_THROW_NOLOG(NumericalProblem,
-                            fmt::format(" Newton composition update converged to coincident "
-                                        "phases or to the mirror split, L = {}",
+                            fmt::format(" Newton composition update converged to the mirror "
+                                        "split, L = {}",
                                         Opm::getValue(liquid_fraction)));
         }
 
