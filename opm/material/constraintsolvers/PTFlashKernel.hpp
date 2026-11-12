@@ -130,6 +130,7 @@ enum class Status : int {
     newtonNoProgress,         //!< composition Newton did not halve its residual
     newtonNotConverged,       //!< composition Newton at its iteration limit
     newtonNonPhysical,        //!< composition Newton converged outside the bounds
+    newtonMirror,             //!< composition Newton converged to the mirror split
     singularJacobian,         //!< the composition Newton's Jacobian is singular
     splitNotConverged,        //!< the two-phase method did not converge
     splitNonPhysical,         //!< the two-phase answer is not physical
@@ -187,9 +188,10 @@ struct Settings
     Method method = Method::SsiNewton;
     Scalar tolerance = 1e-8;
     /*!
-     * Where the Gibbs-energy Newton gives up, Newton in (x, y, L) takes over
-     * (about 2 states in 100 000 of the SPE5 map). Without it the flash stops
-     * there with Status::compositionNewtonNeeded, for the caller to flash the
+     * Where the Gibbs-energy Newton gives up, or ends on the mirror split or
+     * on coincident phases, Newton in (x, y, L) takes over (about 3 states in
+     * 100 000 of the SPE5 map). Without it the flash stops there with
+     * Status::compositionNewtonNeeded, for the caller to flash the
      * state again with it: on a GPU, a short list for a second pass or the
      * host, and a kernel without the largest stack frame. Compiling with
      * OPM_PTFLASH_KERNEL_NO_COMPOSITION_NEWTON removes the code.
@@ -236,6 +238,11 @@ struct Constants
     static constexpr Scalar maxPredictedSubstitutionSteps = 8;
     static constexpr int stabilityAccelerationInterval = 5;
     static constexpr Scalar maxStabilityExtrapolation = 1.0;
+    static constexpr Scalar maxStabilityEscapeStep = 1e-3;
+    static constexpr Scalar stabilityEscapeContraction = 0.01;
+    static constexpr Scalar stabilityEscapeFactor = 8;
+    static constexpr Scalar stabilityEscapeGrowth = 8;
+    static constexpr Scalar maxStabilityEscapeFactor = 1e6;
     static constexpr int flashFirstIterations = 2;
     static constexpr int flashFirstMaxIterations = 3;
     static constexpr Scalar maxFugacityCoefficient = 1e10;
@@ -818,6 +825,27 @@ OPM_PTFK bool phaseCompositionsArePhysical(const V<Scalar, N>& xl, const V<Scala
     return true;
 }
 
+/*!
+ * \brief PTFlash::isMirrorSplit_(): whether distinct phases are the mirror
+ *        of the split the ratios \p start_K point to,
+ *        \f$\sum_i (K^0_i - 1)(y_i - x_i) < 0\f$ over the feed's components.
+ */
+template <class Scalar, int N>
+OPM_PTFK bool isMirrorSplit(const V<Scalar, N>& xl,
+                            const V<Scalar, N>& xv,
+                            const V<Scalar, N>& start_K,
+                            const V<Scalar, N>& z)
+{
+    Scalar alignment = 0.;
+    for (int i = 0; i < N; ++i) {
+        if (!(z[i] > 0.)) {
+            continue;
+        }
+        alignment += (start_K[i] - 1.) * (xv[i] - xl[i]);
+    }
+    return alignment < 0.;
+}
+
 //! PTFlash::computeLiquidVapor_()
 template <class Scalar, int N>
 OPM_PTFK void computeLiquidVapor(Phases<Scalar, N>& s, Scalar L, const V<Scalar, N>& K, const V<Scalar, N>& z)
@@ -961,6 +989,14 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
     bool extrapolated = false;
     V<Scalar, N> plain_K = K;
     Scalar tm_before = 0.;
+    // The forward extrapolation of a trial whose steps do not shrink, as
+    // PTFlash: escaping: the last extrapolation was one; escaped: one lowered
+    // tm and the steps have not shrunk since; overshot: the last
+    // extrapolation of the remaining steps did not lower tm.
+    bool escaping = false;
+    bool escaped = false;
+    bool overshot = false;
+    Scalar escape_factor = C::stabilityEscapeFactor;
     V<Scalar, N> reference_fugacity;
     for (int i = 0; i < N; ++i) {
         reference_fugacity[i] = pure.p * reference_coefficients[i] * z[i];
@@ -1006,12 +1042,25 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
                 tm += is_vapour_trial ? -mole_number * step[i] : mole_number * step[i];
             }
         }
+        // A point an escape moved to decides nothing but a trivial solution.
+        const bool escape_point = extrapolated && escaping;
         if (extrapolated) {
             extrapolated = false;
             if (!(tm < tm_before) || !math::isfinite(tm)) {
                 K = plain_K;
                 plain_steps = 0;
+                overshot = !escaping;
+                if (escaping) {
+                    escape_factor = math::max(escape_factor / C::stabilityEscapeGrowth,
+                                              Scalar{C::stabilityEscapeFactor});
+                }
                 continue;
+            }
+            overshot = false;
+            if (escaping) {
+                escaped = true;
+                escape_factor = math::min(escape_factor * C::stabilityEscapeGrowth,
+                                          Scalar{C::maxStabilityEscapeFactor});
             }
         }
 
@@ -1028,7 +1077,7 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
         }
 
         isTrivial = isTrivialSolution(K);
-        if (isTrivial || substitution_residual < C::substitutionTolerance) {
+        if (isTrivial || (substitution_residual < C::substitutionTolerance && !escape_point)) {
             return Status::ok;
         }
 
@@ -1036,8 +1085,28 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
         steps[1] = steps[0];
         steps[0] = step;
         ++plain_steps;
+        if (plain_steps < C::stabilityAccelerationInterval) {
+            continue;
+        }
+        // Steps that do not shrink have no fixed point to sum towards: the
+        // trial moves on along its step, by a growing factor while tm drops.
         V<Scalar, N> extrapolation;
-        if (plain_steps >= C::stabilityAccelerationInterval && extrapolateSubstitution(steps, extrapolation)) {
+        const Scalar newest_squared = dot(steps[0], steps[0]);
+        const Scalar along = dot(steps[0], steps[1]);
+        const Scalar slowest = overshot || escaped ? 1. - C::stabilityEscapeContraction : 1.;
+        escaping = along > 0. && !(newest_squared < slowest * along)
+            && (escaped || overshot
+                || newest_squared < C::maxStabilityEscapeStep * C::maxStabilityEscapeStep);
+        if (!escaping) {
+            escaped = false;
+            escape_factor = C::stabilityEscapeFactor;
+        }
+        else {
+            for (int i = 0; i < N; ++i) {
+                extrapolation[i] = steps[0][i] * escape_factor;
+            }
+        }
+        if (escaping || extrapolateSubstitution(steps, extrapolation)) {
             plain_K = K;
             tm_before = tm;
             // Dune's infinity_norm(); a zero or NaN norm leaves the step unshortened, as there.
@@ -1555,24 +1624,22 @@ OPM_PTFK Status luSolve(Vec<Vec<Scalar, n>, n>& A, Vec<Scalar, n>& rhs)
 }
 
 /*!
- * \brief PTFlash::newtonComposition_(): the Gibbs-energy Newton, and where
- *        it gives up Newton in (x, y, L). The Jacobian of the latter is the
- *        analytic one of PTFlash::analyticCompositionJacobian_() where
- *        PTFlash differentiates automatically: the same matrix to rounding.
+ * \brief The composition Newton in (x, y, L) of PTFlash::newtonComposition_()
+ *        from (K, L), which fails on the mirror of the split \p start_K
+ *        points to. Its Jacobian is the analytic one of
+ *        PTFlash::analyticCompositionJacobian_() where PTFlash differentiates
+ *        automatically: the same matrix to rounding.
  */
 template <class Scalar, int N>
-OPM_PTFK Status newtonComposition(Context<Scalar, N>& ctx,
+OPM_PTFK Status compositionNewton(Context<Scalar, N>& ctx,
                                   V<Scalar, N>& K,
                                   Scalar& L,
                                   Phases<Scalar, N>& s,
-                                  const V<Scalar, N>& z)
+                                  const V<Scalar, N>& z,
+                                  const V<Scalar, N>& start_K)
 {
-    bool gaveUp = true;
-    OPM_PTFK_TRY(gibbsNewton(ctx, K, L, s, z, gaveUp));
-    if (!gaveUp) {
-        return Status::ok;
-    }
 #if defined(OPM_PTFLASH_KERNEL_NO_COMPOSITION_NEWTON)
+    (void)ctx, (void)K, (void)L, (void)s, (void)z, (void)start_K;
     return Status::compositionNewtonNeeded;
 #else
     using C = Constants<Scalar>;
@@ -1670,12 +1737,60 @@ OPM_PTFK Status newtonComposition(Context<Scalar, N>& ctx,
     }
     s.x[liquid] = lc;
     s.x[vapour] = vc;
+    if (isMirrorSplit(lc, vc, start_K, z) && !phasesCoincide(s)) {
+        return Status::newtonMirror;
+    }
     for (int i = 0; i < N; ++i) {
         K[i] = vc[i] / lc[i];
     }
     L = lf;
     return Status::ok;
 #endif
+}
+
+/*!
+ * \brief PTFlash::newtonComposition_(): Newton finishes the split its start
+ *        points to. The Gibbs-energy Newton first; where it gives up, or ends
+ *        on the mirror split, the composition Newton from the same ratios.
+ *        Coincident phases from the Gibbs-energy Newton get a second try by
+ *        the composition Newton; where that fails they are the answer, for
+ *        the caller to classify.
+ */
+template <class Scalar, int N>
+OPM_PTFK Status newtonComposition(Context<Scalar, N>& ctx,
+                                  V<Scalar, N>& K,
+                                  Scalar& L,
+                                  Phases<Scalar, N>& s,
+                                  const V<Scalar, N>& z)
+{
+    const V<Scalar, N> start_K = K;
+    const Scalar start_L = L;
+    bool gaveUp = true;
+    OPM_PTFK_TRY(gibbsNewton(ctx, K, L, s, z, gaveUp));
+    if (!gaveUp) {
+        const bool coincide = phasesCoincide(s);
+        if (!coincide && !isMirrorSplit(s.x[liquid], s.x[vapour], start_K, z)) {
+            return Status::ok;
+        }
+        if (coincide) {
+            const V<Scalar, N> gibbs_K = K;
+            const Scalar gibbs_L = L;
+            const Phases<Scalar, N> gibbs_s = s;
+            K = start_K;
+            L = start_L;
+            const Status second = compositionNewton(ctx, K, L, s, z, start_K);
+            if (second == Status::ok || !recoverable(second)) {
+                return second;
+            }
+            K = gibbs_K;
+            L = gibbs_L;
+            s = gibbs_s;
+            return Status::ok;
+        }
+        K = start_K;
+        L = start_L;
+    }
+    return compositionNewton(ctx, K, L, s, z, start_K);
 }
 
 //! PTFlash::flash_2ph(): the two-phase compositions by the requested method.
