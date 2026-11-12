@@ -2562,6 +2562,45 @@ protected:
         return active_components >= 2 && isTrivialSolution_(equilibrium_ratios);
     }
 
+    /*!
+     * \brief Whether a converged split is distinct and oriented like the
+     *        ratios it started from.
+     *
+     * Near a critical point the cubic of each phase has a single root, so the
+     * equations do not tell the phase labels apart: with a split
+     * \f$(\mathbf x, \mathbf y, L)\f$ its mirror
+     * \f$(\mathbf y, \mathbf x, 1 - L)\f$ and coincident phases solve them
+     * too. A Newton step from a start far from convergence can end on
+     * either. The mirror shows as equilibrium ratios \f$y_i / x_i\f$ whose
+     * logarithms point against those of the start,
+     * \f$\sum_i \ln K^0_i \ln (y_i / x_i) \le 0\f$, over the components
+     * present in both phases.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool keepsSplitOrientation_(const FlashFluidState& fluid_state,
+                                       const ComponentVector& start_K,
+                                       const ComponentVector& z)
+    {
+        if (phasesCoincide_(fluid_state)) {
+            return false;
+        }
+        Scalar alignment = 0.;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const Scalar liquid_mole_fraction
+                = Opm::getValue(fluid_state.moleFraction(oilPhaseIdx, compIdx));
+            const Scalar vapour_mole_fraction
+                = Opm::getValue(fluid_state.moleFraction(gasPhaseIdx, compIdx));
+            const Scalar start_ratio = Opm::getValue(start_K[compIdx]);
+            if (!(Opm::getValue(z[compIdx]) > 0.) || !(liquid_mole_fraction > 0.)
+                || !(vapour_mole_fraction > 0.) || !(start_ratio > 0.)) {
+                continue;
+            }
+            alignment += std::log(start_ratio)
+                * std::log(vapour_mole_fraction / liquid_mole_fraction);
+        }
+        return alignment > 0.;
+    }
+
     //! Whether the fluid system gives, with the fugacity coefficients of a
     //! phase on values, the derivatives of their logarithms in the phase
     //! mole fractions; see gibbsNewtonComposition_().
@@ -2943,7 +2982,14 @@ protected:
      * the unknowns. The convergence test follows its assembly, so the
      * Jacobian returned belongs to the converged state.
      *
-     * \throws NumericalProblem when Newton does not converge.
+     * Newton finishes the split its start points to. One that ends on
+     * coincident phases or on the mirror split, see keepsSplitOrientation_(),
+     * has left it: a Gibbs-energy Newton that does is replaced by the
+     * composition Newton from the same ratios, and a composition Newton that
+     * does throws.
+     *
+     * \throws NumericalProblem when Newton does not converge, or converges to
+     *         coincident phases or to the mirror split.
      */
     template <class FlashFluidState, class ComponentVector>
     static auto newtonComposition_(ComponentVector& K,
@@ -2959,13 +3005,24 @@ protected:
         using NewtonVector = Dune::FieldVector<Scalar, num_equations>;
         using NewtonMatrix = Dune::FieldMatrix<Scalar, num_equations, num_unknowns>;
 
+        const ComponentVector start_K = K;
         // Newton in the vapour mole numbers where the fluid system gives the
         // composition derivatives and the start is a split.
         if constexpr (hasFugacityDerivatives_
                       && std::is_same_v<typename FlashFluidState::ValueType, Scalar>) {
+            const auto start_L = L;
             if (auto gibbs_jacobian = gibbsNewtonComposition_(
                     K, L, fluid_state, z, tolerance, eos_type, verbosity)) {
-                return *std::move(gibbs_jacobian);
+                if (keepsSplitOrientation_(fluid_state, start_K, z)) {
+                    return *std::move(gibbs_jacobian);
+                }
+                if (verbosity >= 1) {
+                    OpmLog::debug(" The Gibbs-energy Newton converged to coincident phases or "
+                                  "to the mirror split; Newton in (x, y, L) restarts from the "
+                                  "same ratios.");
+                }
+                K = start_K;
+                L = start_L;
             }
         }
 
@@ -3137,6 +3194,12 @@ protected:
                 fmt::format(" Newton composition update converged to a non-physical "
                             "composition with L = {}",
                             Opm::getValue(liquid_fraction)));
+        }
+        if (!keepsSplitOrientation_(newton_state, start_K, z)) {
+            OPM_THROW_NOLOG(NumericalProblem,
+                            fmt::format(" Newton composition update converged to coincident "
+                                        "phases or to the mirror split, L = {}",
+                                        Opm::getValue(liquid_fraction)));
         }
 
         // Copy the converged unknowns to the caller and the explicit K/L outputs.
