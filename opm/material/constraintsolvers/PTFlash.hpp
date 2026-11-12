@@ -2414,7 +2414,6 @@ protected:
         // feed composition supplies the reference fugacities on its stable
         // root, the state whose tangent plane the trial is measured against.
         FlashFluidState trial_state = fluid_state;
-        FlashFluidState reference_state = fluid_state;
         const int trial_phase_idx
             = is_vapour_trial ? static_cast<int>(gasPhaseIdx) : static_cast<int>(oilPhaseIdx);
 
@@ -2431,11 +2430,12 @@ protected:
             OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", "Iteration", "K-Norm", "R-Norm"));
         }
 
-        // The reference phase is the feed on its stable root throughout.
-        setPhaseMoleFractions_(reference_state, reference_phase_idx, z);
+        // The reference phase is the feed on its stable root throughout:
+        // its fugacities p phi_i z_i, as a fluid state holding it gives them.
+        std::array<FlashEval, numComponents> reference_fugacities;
         for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            reference_state.setFugacityCoefficient(
-                reference_phase_idx, compIdx, reference_coefficients[compIdx]);
+            reference_fugacities[compIdx] = fluid_state.pressure(reference_phase_idx)
+                * reference_coefficients[compIdx] * static_cast<FlashEval>(z[compIdx]);
         }
         // The last three plain steps in ln K, newest first, and the plain
         // point to return to when an extrapolation does not lower tm.
@@ -2482,8 +2482,7 @@ protected:
                     continue;
                 }
                 const auto trial_fugacity = trial_state.fugacity(trial_phase_idx, compIdx);
-                const auto reference_fugacity
-                    = reference_state.fugacity(reference_phase_idx, compIdx);
+                const auto& reference_fugacity = reference_fugacities[compIdx];
                 substitution_factor[compIdx] = is_vapour_trial
                     ? reference_fugacity / trial_fugacity / trial_sum
                     : trial_fugacity / reference_fugacity * trial_sum;
