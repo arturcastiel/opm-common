@@ -27,6 +27,7 @@
  * and warm starts; C1/nC20 with volume shifts (H1); and the SPE5 oil of the
  * dense-map benchmark, at states that take the Newton fallback in
  * (x, y, L) and at the one state of the 1000 x 1000 map where both fail.
+ * The derivative pass against PTFlash::solve() on Evaluations.
  */
 #include "config.h"
 
@@ -37,6 +38,7 @@
 #include <opm/material/constraintsolvers/PTFlashKernel.hpp>
 #include <opm/material/constraintsolvers/PTFlashKernelHost.hpp>
 #include <opm/material/constraintsolvers/PTFlashMethod.hpp>
+#include <opm/material/densead/Evaluation.hpp>
 #include <opm/material/fluidstates/CompositionalFluidState.hpp>
 #include <opm/material/fluidsystems/GenericOilGasWaterFluidSystem.hpp>
 
@@ -44,6 +46,7 @@
 
 #include "flashTestFixtures.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <exception>
@@ -151,6 +154,80 @@ Answer<FluidSystem> checkState(double p, double T,
         a.K[c] = kernel.K[c];
     }
     return a;
+}
+
+/*!
+ * PTFlash::solve() on Evaluations with p and z_0 .. z_{N-2} as variables
+ * (z_{N-1} = 1 - the others) against the kernel's derivative pass in the
+ * same directions; returns whether the state is two-phase.
+ */
+template <class FluidSystem>
+bool checkDerivatives(double p, double T, const std::array<double, FluidSystem::numComponents>& z, EOSType eos)
+{
+    constexpr int N = FluidSystem::numComponents;
+    using Eval = Opm::DenseAd::Evaluation<double, N>;
+    Opm::CompositionalFluidState<Eval, FluidSystem> fs;
+    const Eval pe = Eval::createVariable(p, 0);
+    for (unsigned ph = 0; ph < FluidSystem::numPhases; ++ph) {
+        fs.setPressure(ph, pe);
+    }
+    fs.setTemperature(Eval(T));
+    Eval last = 1.0;
+    for (int c = 0; c < N - 1; ++c) {
+        const Eval zc = Eval::createVariable(z[c], c + 1);
+        fs.setMoleFraction(c, zc);
+        last -= zc;
+    }
+    fs.setMoleFraction(N - 1, last);
+    K::Vec<double, N> zk, k0;
+    for (int c = 0; c < N; ++c) {
+        fs.setKvalue(c, fs.wilsonK_(c));
+        zk[c] = Opm::getValue(fs.moleFraction(c));
+        k0[c] = Opm::getValue(fs.K(c));
+    }
+    fs.setLvalue(-1.0);
+    bool single = false;
+    bool ok = true;
+    try {
+        single = Opm::PTFlash<double, FluidSystem>::solve(fs, Opm::PTFlashMethod::SsiNewton, 1e-8, eos, 0);
+    }
+    catch (const std::exception&) {
+        ok = false;
+    }
+
+    K::Vec<K::Vec<double, N + 1>, N> directions;
+    for (int k = 0; k < N; ++k) {
+        directions[k] = K::filled<double, N + 1>(0.0);
+    }
+    directions[0][0] = 1.0;
+    for (int c = 0; c < N - 1; ++c) {
+        directions[c + 1][1 + c] = 1.0;
+        directions[c + 1][N] = -1.0;
+    }
+    K::Vec<K::Vec<double, N>, 2 * N + 1> derivatives;
+    const auto params = K::makeParameters<double, FluidSystem>(eos);
+    const auto kernel = K::flash(params, p, T, zk, k0, -1.0, K::Settings<double>{}, directions, derivatives);
+
+    BOOST_TEST_CONTEXT("derivatives at p = " << p << " Pa, T = " << T << " K")
+    {
+        BOOST_CHECK_EQUAL(kernel.status == K::Status::ok, ok);
+        if (!ok || kernel.status != K::Status::ok) {
+            return false;
+        }
+        BOOST_CHECK_EQUAL(kernel.singlePhase, single);
+        BOOST_CHECK_SMALL(kernel.L - Opm::getValue(fs.L()), tolerance);
+        const auto close = [](double a, double b) {
+            return std::abs(a - b) <= tolerance * std::max(1.0, std::abs(b));
+        };
+        for (int k = 0; k < N; ++k) {
+            BOOST_CHECK(close(derivatives[2 * N][k], fs.L().derivative(k)));
+            for (int c = 0; c < N; ++c) {
+                BOOST_CHECK(close(derivatives[c][k], fs.moleFraction(FluidSystem::oilPhaseIdx, c).derivative(k)));
+                BOOST_CHECK(close(derivatives[N + c][k], fs.moleFraction(FluidSystem::gasPhaseIdx, c).derivative(k)));
+            }
+        }
+    }
+    return !single;
 }
 
 template <class FluidSystem>
@@ -269,4 +346,26 @@ BOOST_AUTO_TEST_CASE(Spe5NearCritical)
     const auto failed = ptflash<Spe5>(p, T, z, wilson<Spe5>(p, T), -1.0, Opm::PTFlashMethod::SsiNewton,
                                       EOSType::PR);
     BOOST_CHECK(!failed.ok);
+}
+
+BOOST_AUTO_TEST_CASE(DerivativesAgainstSolve)
+{
+    using F2 = Opm::FlashTest::F2FluidSystem<double>;
+    int two_phase = 0;
+    for (const double p : {5e5, 10e5, 30e5, 60e5}) {
+        for (const double T : {250., 300., 350.}) {
+            two_phase += checkDerivatives<F2>(p, T, Opm::FlashTest::f2Z, EOSType::PR);
+        }
+    }
+    using H1 = Opm::FlashTest::H1FluidSystem<double>;
+    for (const double T : {250., 280., 300.}) {
+        two_phase += checkDerivatives<H1>(Opm::FlashTest::h1Pressure, T, Opm::FlashTest::h1Z, EOSType::PR);
+    }
+    const auto gridP = [](int ip) { return 1e5 + (4e7 - 1e5) * ip / 999; };
+    const auto gridT = [](int it) { return 280.0 + 420.0 * it / 999; };
+    const std::array<double, 6> z{0.5, 0.03, 0.07, 0.20, 0.15, 0.05};
+    for (const auto& [ip, it] : std::vector<std::array<int, 2>>{{100, 500}, {500, 500}, {205, 857}, {214, 854}}) {
+        two_phase += checkDerivatives<Spe5>(gridP(ip), gridT(it), z, EOSType::PR);
+    }
+    BOOST_CHECK_GT(two_phase, 3);
 }
