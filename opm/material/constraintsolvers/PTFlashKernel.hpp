@@ -136,13 +136,17 @@ enum class Status : int {
     warmRatiosNoSplit,        //!< warm-start ratios imply no split
     coincidentPhases,         //!< a cold split converged to coincident phases
     retryFailed,              //!< the split after a new stability test failed
-    cubicDegenerate           //!< p = 0 in the cubic solver
+    cubicDegenerate,          //!< p = 0 in the cubic solver
+    //! The composition Newton in (x, y, L) is needed but switched off
+    //! (Settings::compositionNewton, OPM_PTFLASH_KERNEL_NO_COMPOSITION_NEWTON):
+    //! the state is to be flashed again with it.
+    compositionNewtonNeeded
 };
 
 //! Whether PTFlash's catch sites absorb an error of this kind.
 OPM_PTFK bool recoverable(Status s)
 {
-    return s != Status::ok && s != Status::cubicDegenerate;
+    return s != Status::ok && s != Status::cubicDegenerate && s != Status::compositionNewtonNeeded;
 }
 
 //! The work counters of one flash, as FlashStatistics counts them.
@@ -182,6 +186,15 @@ struct Settings
 {
     Method method = Method::SsiNewton;
     Scalar tolerance = 1e-8;
+    /*!
+     * Where the Gibbs-energy Newton gives up, Newton in (x, y, L) takes over
+     * (about 2 states in 100 000 of the SPE5 map). Without it the flash stops
+     * there with Status::compositionNewtonNeeded, for the caller to flash the
+     * state again with it: on a GPU, a short list for a second pass or the
+     * host, and a kernel without the largest stack frame. Compiling with
+     * OPM_PTFLASH_KERNEL_NO_COMPOSITION_NEWTON removes the code.
+     */
+    bool compositionNewton = true;
 };
 
 //! The answer of one flash.
@@ -285,6 +298,7 @@ struct Context
     V<Scalar, N> incomingK; //!< the fluid state's K on entry
     Method method;
     Scalar tolerance;
+    bool compositionNewton;
     Counters& counters;
 };
 
@@ -1553,11 +1567,17 @@ OPM_PTFK Status newtonComposition(Context<Scalar, N>& ctx,
                                   Phases<Scalar, N>& s,
                                   const V<Scalar, N>& z)
 {
-    using C = Constants<Scalar>;
     bool gaveUp = true;
     OPM_PTFK_TRY(gibbsNewton(ctx, K, L, s, z, gaveUp));
     if (!gaveUp) {
         return Status::ok;
+    }
+#if defined(OPM_PTFLASH_KERNEL_NO_COMPOSITION_NEWTON)
+    return Status::compositionNewtonNeeded;
+#else
+    using C = Constants<Scalar>;
+    if (!ctx.compositionNewton) {
+        return Status::compositionNewtonNeeded;
     }
 
     constexpr int n = 2 * N + 1;
@@ -1655,6 +1675,7 @@ OPM_PTFK Status newtonComposition(Context<Scalar, N>& ctx,
     }
     L = lf;
     return Status::ok;
+#endif
 }
 
 //! PTFlash::flash_2ph(): the two-phase compositions by the requested method.
@@ -2244,7 +2265,8 @@ OPM_PTFK Answer<Scalar, N> flash(const Parameters<Scalar, N>& params,
     Answer<Scalar, N> answer;
     answer.K = K;
     answer.L = L;
-    detail::Context<Scalar, N> ctx{params, {}, K, settings.method, settings.tolerance, answer.counters};
+    detail::Context<Scalar, N> ctx{params, {}, K, settings.method, settings.tolerance, settings.compositionNewton,
+                                    answer.counters};
     answer.status = detail::makePure(params, p, T, ctx.pure);
     if (answer.status != Status::ok) {
         return answer;
@@ -2290,7 +2312,8 @@ OPM_PTFK Answer<Scalar, N> flash(const Parameters<Scalar, N>& params,
     for (int r = 0; r < 2 * N + 1; ++r) {
         derivatives[r] = filled<Scalar, Md>(0.);
     }
-    detail::Context<Scalar, N> ctx{params, {}, K, settings.method, settings.tolerance, answer.counters};
+    detail::Context<Scalar, N> ctx{params, {}, K, settings.method, settings.tolerance, settings.compositionNewton,
+                                    answer.counters};
     answer.status = detail::makePure(params, p, T, ctx.pure);
     if (answer.status != Status::ok) {
         return answer;
