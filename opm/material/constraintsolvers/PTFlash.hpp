@@ -2571,10 +2571,11 @@ protected:
      * \f$(\mathbf x, \mathbf y, L)\f$ its mirror
      * \f$(\mathbf y, \mathbf x, 1 - L)\f$ and coincident phases solve them
      * too. A Newton step from a start far from convergence can end on
-     * either. The mirror shows as equilibrium ratios \f$y_i / x_i\f$ whose
-     * logarithms point against those of the start,
-     * \f$\sum_i \ln K^0_i \ln (y_i / x_i) < 0\f$, over the components
-     * present in both phases. Coincident phases are not a mirror; see
+     * either. The mirror shows as a difference of the phase compositions
+     * that points against the start ratios,
+     * \f$\sum_i (K^0_i - 1)(y_i - x_i) < 0\f$ over the components of the
+     * feed: exchanging \f$\mathbf x\f$ and \f$\mathbf y\f$ flips the
+     * sign of the sum. Only meaningful for distinct phases; see
      * phasesCoincide_().
      */
     template <class FlashFluidState, class ComponentVector>
@@ -2582,22 +2583,14 @@ protected:
                                const ComponentVector& start_K,
                                const ComponentVector& z)
     {
-        if (phasesCoincide_(fluid_state)) {
-            return false;
-        }
         Scalar alignment = 0.;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            const Scalar liquid_mole_fraction
-                = Opm::getValue(fluid_state.moleFraction(oilPhaseIdx, compIdx));
-            const Scalar vapour_mole_fraction
-                = Opm::getValue(fluid_state.moleFraction(gasPhaseIdx, compIdx));
-            const Scalar start_ratio = Opm::getValue(start_K[compIdx]);
-            if (!(Opm::getValue(z[compIdx]) > 0.) || !(liquid_mole_fraction > 0.)
-                || !(vapour_mole_fraction > 0.) || !(start_ratio > 0.)) {
+            if (!(Opm::getValue(z[compIdx]) > 0.)) {
                 continue;
             }
-            alignment += std::log(start_ratio)
-                * std::log(vapour_mole_fraction / liquid_mole_fraction);
+            alignment += (Opm::getValue(start_K[compIdx]) - 1.)
+                * (Opm::getValue(fluid_state.moleFraction(gasPhaseIdx, compIdx))
+                   - Opm::getValue(fluid_state.moleFraction(oilPhaseIdx, compIdx)));
         }
         return alignment < 0.;
     }
@@ -3017,11 +3010,9 @@ protected:
         if constexpr (hasFugacityDerivatives_
                       && std::is_same_v<typename FlashFluidState::ValueType, Scalar>) {
             const auto start_L = L;
-            std::optional<NewtonJacobian> gibbs_jacobian;
-            if (gibbs) {
-                gibbs_jacobian = gibbsNewtonComposition_(K, L, fluid_state, z, tolerance,
-                                                         eos_type, verbosity);
-            }
+            auto gibbs_jacobian = gibbs ? gibbsNewtonComposition_(K, L, fluid_state, z, tolerance,
+                                                                  eos_type, verbosity)
+                                        : std::optional<NewtonJacobian>{};
             if (gibbs_jacobian) {
                 const bool coincide = phasesCoincide_(fluid_state);
                 if (!coincide && !isMirrorSplit_(fluid_state, start_K, z)) {
@@ -3227,7 +3218,7 @@ protected:
                             "composition with L = {}",
                             Opm::getValue(liquid_fraction)));
         }
-        if (isMirrorSplit_(newton_state, start_K, z)) {
+        if (isMirrorSplit_(newton_state, start_K, z) && !phasesCoincide_(newton_state)) {
             OPM_THROW_NOLOG(NumericalProblem,
                             fmt::format(" Newton composition update converged to the mirror "
                                         "split, L = {}",
