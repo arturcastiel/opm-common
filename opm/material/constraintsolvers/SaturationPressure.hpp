@@ -358,6 +358,26 @@ private:
         return out;
     }
 
+    // The fugacity coefficients of all components of a phase, from the fluid
+    // system's evaluation of the whole phase where it has one: the same values
+    // as fugacityCoefficient() of each component, with the terms they share,
+    // two logarithms among them, evaluated once.
+    template <class State>
+    static void phaseFugacityCoefficients_(const State& fs,
+                                           const ParameterCache& cache,
+                                           const unsigned phaseIdx,
+                                           CompVec& phi)
+    {
+        if constexpr (requires { FluidSystem::fugacityCoefficients(fs, cache, phaseIdx, phi); }) {
+            FluidSystem::fugacityCoefficients(fs, cache, phaseIdx, phi);
+        }
+        else {
+            for (int c = 0; c < numComponents; ++c) {
+                phi[c] = FluidSystem::fugacityCoefficient(fs, cache, phaseIdx, c);
+            }
+        }
+    }
+
     static bool positiveFinite_(const Scalar value)
     {
         return std::isnormal(value) && !std::signbit(value);
@@ -523,9 +543,9 @@ private:
         ParameterCache knownCache(eosType);
         knownCache.updatePhase(fs, knownPhaseIdx);
         CompVec lnPhiZ;
+        phaseFugacityCoefficients_(fs, knownCache, knownPhaseIdx, lnPhiZ);
         for (int c = 0; c < numComponents; ++c) {
-            lnPhiZ[c] = std::log(
-                FluidSystem::fugacityCoefficient(fs, knownCache, knownPhaseIdx, c));
+            lnPhiZ[c] = std::log(lnPhiZ[c]);
             if (!std::isfinite(lnPhiZ[c])) {
                 return Stability::Indeterminate;
             }
@@ -562,13 +582,14 @@ private:
             Scalar change = 0.0;
             Scalar sumNew = 0.0;
             CompVec d{};
+            CompVec phiY;
+            phaseFugacityCoefficients_(trial, trialCache, knownPhaseIdx, phiY);
             for (int c = 0; c < numComponents; ++c) {
                 if (z[c] <= 0.0) {
                     Y[c] = 0.0;
                     continue;
                 }
-                const Scalar lnPhiY =
-                    std::log(FluidSystem::fugacityCoefficient(trial, trialCache, knownPhaseIdx, c));
+                const Scalar lnPhiY = std::log(phiY[c]);
                 const Scalar Ynew = std::exp(std::log(z[c]) + lnPhiZ[c] - lnPhiY);
                 if (!positiveFinite_(Ynew) || !positiveFinite_(Y[c])) {
                     return Stability::Indeterminate;
@@ -657,13 +678,14 @@ private:
         cache.updatePhase(fs, knownPhase);
         CompVec target{};
         Vector u(0.0);
+        CompVec phiKnown;
+        phaseFugacityCoefficients_(fs, cache, knownPhase, phiKnown);
         for (int c = 0; c < numComponents; ++c) {
             if (z[c] > 0.0) {
                 if (!positiveFinite_(Y[c])) {
                     return false;
                 }
-                target[c] = std::log(z[c])
-                    + std::log(FluidSystem::fugacityCoefficient(fs, cache, knownPhase, c));
+                target[c] = std::log(z[c]) + std::log(phiKnown[c]);
                 u[c] = std::log(Y[c]);
             }
         }
@@ -690,10 +712,11 @@ private:
                 ? ParameterCache::Temperature | ParameterCache::Pressure : ParameterCache::None;
             cache.updatePhase(trial, trialPhase, unchanged);
             trialCacheInitialized = true;
+            CompVec phiTrial;
+            phaseFugacityCoefficients_(trial, cache, trialPhase, phiTrial);
             for (int c = 0; c < numComponents; ++c) {
                 r[c] = z[c] > 0.0
-                    ? v[c] + std::log(FluidSystem::fugacityCoefficient(trial, cache, trialPhase, c))
-                        - target[c]
+                    ? v[c] + std::log(phiTrial[c]) - target[c]
                     : v[c];
                 if (!std::isfinite(r[c])) {
                     return false;
@@ -1365,10 +1388,7 @@ private:
                 // The known phase is fixed throughout the substitution at this pressure.
                 if (inner == 0) {
                     paramCache.updatePhase(fs, knownPhaseIdx);
-                    for (int c = 0; c < numComponents; ++c) {
-                        phiKnown[c] = FluidSystem::fugacityCoefficient(
-                            fs, paramCache, knownPhaseIdx, c);
-                    }
+                    phaseFugacityCoefficients_(fs, paramCache, knownPhaseIdx, phiKnown);
                 }
                 const int unchanged = inner == 0
                     ? ParameterCache::None : ParameterCache::Temperature | ParameterCache::Pressure;
@@ -1377,9 +1397,10 @@ private:
                 Scalar change = 0.0;
                 trivial = true;
                 CompVec d;
+                CompVec phiIncipients;
+                phaseFugacityCoefficients_(fs, paramCache, incipientPhaseIdx, phiIncipients);
                 for (int c = 0; c < numComponents; ++c) {
-                    const Scalar phiIncipient = FluidSystem::fugacityCoefficient(
-                        fs, paramCache, incipientPhaseIdx, c);
+                    const Scalar phiIncipient = phiIncipients[c];
                     const Scalar newK = bubble ? phiKnown[c] / phiIncipient
                                               : phiIncipient / phiKnown[c];
                     if (!positiveFinite_(newK)) {
@@ -1424,9 +1445,10 @@ private:
                     }
                     paramCache.updatePhase(fs, incipientPhaseIdx);
                     trivial = true;
+                    CompVec phiIncipients;
+                    phaseFugacityCoefficients_(fs, paramCache, incipientPhaseIdx, phiIncipients);
                     for (int c = 0; c < numComponents; ++c) {
-                        const Scalar phiIncipient = FluidSystem::fugacityCoefficient(
-                            fs, paramCache, incipientPhaseIdx, c);
+                        const Scalar phiIncipient = phiIncipients[c];
                         const Scalar newK = bubble ? phiKnown[c] / phiIncipient
                                                   : phiIncipient / phiKnown[c];
                         if (!positiveFinite_(newK)) {
