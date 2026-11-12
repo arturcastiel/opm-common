@@ -516,8 +516,34 @@ public:
                            nullptr, nullptr, &shared)
                   .single_phase;
         // The solve leaves those of its last evaluation, which need not be the result.
-        using ParamCache =
-            typename FluidSystem::template ParameterCache<typename FluidState::ValueType>;
+        using ValueType = typename FluidState::ValueType;
+        // A single-phase answer has the feed in both phases, which the flash
+        // has evaluated on both roots where it ran a stability test.
+        if constexpr (std::is_same_v<ValueType, Scalar> && hasTranslatedFugacityCoefficients_) {
+            if (is_single_phase && shared.feed && shared.feed->has_vapour_coefficients) {
+                bool feed_in_both_phases = true;
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    const Scalar z_i = shared.feed->z[compIdx];
+                    feed_in_both_phases = feed_in_both_phases
+                        && fluid_state.moleFraction(oilPhaseIdx, compIdx) == z_i
+                        && fluid_state.moleFraction(gasPhaseIdx, compIdx) == z_i;
+                }
+                if (feed_in_both_phases) {
+                    for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                                    static_cast<unsigned>(gasPhaseIdx)}) {
+                        auto coefficients = phaseIdx == static_cast<unsigned>(oilPhaseIdx)
+                            ? shared.feed->liquid_coefficients : shared.feed->vapour_coefficients;
+                        FluidSystem::template translateFugacityCoefficients<Scalar>(
+                            shared.param_cache, phaseIdx, coefficients);
+                        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                            fluid_state.setFugacityCoefficient(phaseIdx, compIdx, coefficients[compIdx]);
+                        }
+                    }
+                    return is_single_phase;
+                }
+            }
+        }
+        using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
         std::optional<ParamCache> own_cache;
         ParamCache& param_cache = stageCache_(&shared, own_cache, eos_type);
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
@@ -1162,6 +1188,33 @@ protected:
 
     using ScalarParamCache = typename FluidSystem::template ParameterCache<Scalar>;
 
+    //! Whether the fluid system gives its fugacity coefficients as those of
+    //! the equation of state times a factor per component, so that the
+    //! coefficients of an evaluated feed serve every stage of a flash.
+    static constexpr bool hasTranslatedFugacityCoefficients_
+        = requires(const ScalarParamCache& cache, std::array<Scalar, numComponents>& coefficients) {
+              FluidSystem::template translateFugacityCoefficients<Scalar>(cache, 0u, coefficients);
+          };
+
+    /*!
+     * \brief The feed of a flash on the root of each phase label (the
+     *        smallest root for oil, the largest for gas): the molar volumes
+     *        and the coefficients of the equation of state, before any volume
+     *        translation. Flash first, the stability test, the single-phase
+     *        label and the closing update of a single-phase answer all take
+     *        it; see feedEvaluation_().
+     */
+    struct FeedEvaluation
+    {
+        std::array<Scalar, numComponents> z;
+        std::array<Scalar, numComponents> liquid_coefficients;
+        //! Evaluated where the cubic has two roots or a stage asked for both labels.
+        std::array<Scalar, numComponents> vapour_coefficients;
+        bool has_vapour_coefficients;
+        Scalar liquid_volume;
+        Scalar vapour_volume;
+    };
+
     /*!
      * \brief What the stages of one scalar flash share.
      *
@@ -1178,6 +1231,8 @@ protected:
         {}
 
         ScalarParamCache param_cache;
+        //! The feed on both roots, once evaluated.
+        std::optional<FeedEvaluation> feed;
         //! Whether the caller takes the composition Jacobian of a split that
         //! Newton finished (the derivative pass does; a values-only flash
         //! does not, see newtonJacobian_()).
@@ -1468,6 +1523,57 @@ protected:
         return {is_single_phase, newton_jacobian};
     }
 
+    /*!
+     * \brief The feed of the flash on both roots, evaluated once per flash.
+     *
+     * The first stage that needs it evaluates it, on the flash's parameter
+     * cache; the later ones take it, for the same feed. Each gets the values
+     * it would have computed itself from the same inputs (temperature,
+     * pressure, the feed composition and the pure-component parameters).
+     * The coefficients on the vapour root are evaluated where the cubic has
+     * two roots, as the stability test needs them, or where the caller asks
+     * for both labels.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static const FeedEvaluation& feedEvaluation_(FlashShared& shared,
+                                                 const FlashFluidState& fluid_state,
+                                                 const ComponentVector& z,
+                                                 const bool both_labels)
+    {
+        if (shared.feed && (shared.feed->has_vapour_coefficients || !both_labels)) {
+            bool same_feed = true;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                same_feed = same_feed && shared.feed->z[compIdx] == Opm::getValue(z[compIdx]);
+            }
+            if (same_feed) {
+                return *shared.feed;
+            }
+        }
+        using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
+        constexpr int oil = static_cast<int>(oilPhaseIdx);
+        constexpr int gas = static_cast<int>(gasPhaseIdx);
+        FlashFluidState feed_state = fluid_state;
+        setPhaseMoleFractions_(feed_state, oil, z);
+        setPhaseMoleFractions_(feed_state, gas, z);
+        ScalarParamCache& cache = shared.param_cache;
+        cache.updatePhase(feed_state, oil);
+        cache.updatePhase(feed_state, gas);
+        FeedEvaluation& feed = shared.feed.emplace();
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            feed.z[compIdx] = Opm::getValue(z[compIdx]);
+        }
+        feed.liquid_volume = cache.molarVolume(oil);
+        feed.vapour_volume = cache.molarVolume(gas);
+        CubicEOS::computeFugacityCoefficients(feed_state, cache, oil, feed.liquid_coefficients);
+        // A separate liquid root is far smaller than the vapour root, see feedStableRoot_().
+        feed.has_vapour_coefficients
+            = both_labels || feed.liquid_volume < (1.0 - 1e-6) * feed.vapour_volume;
+        if (feed.has_vapour_coefficients) {
+            CubicEOS::computeFugacityCoefficients(feed_state, cache, gas, feed.vapour_coefficients);
+        }
+        return feed;
+    }
+
     //! The stable cubic root of a feed, see feedStableRoot_().
     struct FeedRoot
     {
@@ -1502,7 +1608,7 @@ protected:
         std::optional<ParamCache> own_cache;
         ParamCache& feed_cache = stageCache_(shared, own_cache, eos_type);
         std::array<FlashEval, numComponents> stable_coefficients;
-        return feedStableRoot_(fluid_state, z, feed_cache, stable_coefficients);
+        return feedStableRoot_(fluid_state, z, feed_cache, stable_coefficients, shared);
     }
 
     /*!
@@ -1519,13 +1625,42 @@ protected:
                                     const ComponentVector& z,
                                     ParamCache& feed_cache,
                                     std::array<typename FlashFluidState::ValueType, numComponents>&
-                                        stable_coefficients)
+                                        stable_coefficients,
+                                    FlashShared* shared = nullptr)
     {
         using FlashEval = typename FlashFluidState::ValueType;
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
 
         constexpr int oil = static_cast<int>(oilPhaseIdx);
         constexpr int gas = static_cast<int>(gasPhaseIdx);
+        const auto sum_z_ln_phi = [&](const std::array<FlashEval, numComponents>& phis) {
+            Scalar sum = 0.0;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                if (!(Opm::getValue(z[compIdx]) > 0.)) {
+                    continue;
+                }
+                const auto& phi = phis[compIdx];
+                sum += Opm::getValue(z[compIdx]) * std::log(Opm::getValue(phi));
+            }
+            return sum;
+        };
+        // The feed of a flash, evaluated once for all its stages.
+        if constexpr (std::is_same_v<FlashEval, Scalar>
+                      && std::is_same_v<ParamCache, ScalarParamCache>) {
+            if (shared && &feed_cache == &shared->param_cache) {
+                const FeedEvaluation& feed = feedEvaluation_(*shared, fluid_state, z, false);
+                if (!(feed.liquid_volume < (1.0 - 1e-6) * feed.vapour_volume)) {
+                    stable_coefficients = feed.liquid_coefficients;
+                    return {oil, false, feed.vapour_volume};
+                }
+                const bool vapour_is_stable = sum_z_ln_phi(feed.vapour_coefficients)
+                    < sum_z_ln_phi(feed.liquid_coefficients);
+                stable_coefficients
+                    = vapour_is_stable ? feed.vapour_coefficients : feed.liquid_coefficients;
+                return {vapour_is_stable ? gas : oil, true,
+                        vapour_is_stable ? feed.vapour_volume : feed.liquid_volume};
+            }
+        }
         FlashFluidState feed_state = fluid_state;
         setPhaseMoleFractions_(feed_state, oil, z);
         setPhaseMoleFractions_(feed_state, gas, z);
@@ -1542,17 +1677,6 @@ protected:
             return {oil, false, vapour_volume};
         }
 
-        const auto sum_z_ln_phi = [&](const std::array<FlashEval, numComponents>& phis) {
-            Scalar sum = 0.0;
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                if (!(Opm::getValue(z[compIdx]) > 0.)) {
-                    continue;
-                }
-                const auto& phi = phis[compIdx];
-                sum += Opm::getValue(z[compIdx]) * std::log(Opm::getValue(phi));
-            }
-            return sum;
-        };
         std::array<FlashEval, numComponents> liquid_coefficients;
         CubicEOS::computeFugacityCoefficients(feed_state, feed_cache, gas, stable_coefficients);
         CubicEOS::computeFugacityCoefficients(feed_state, feed_cache, oil, liquid_coefficients);
@@ -1650,20 +1774,44 @@ protected:
                       const EOSType& eos_type,
                       FlashShared* shared = nullptr)
     {
-        using ParamCache =
-            typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        using ValueType = typename FlashFluidState::ValueType;
+        using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
         using PlaneVector = Dune::FieldVector<Scalar, numComponents>;
-        FlashFluidState feed_state = fluid_state;
-        setPhaseMoleFractions_(feed_state, oilPhaseIdx, z);
-        setPhaseMoleFractions_(feed_state, gasPhaseIdx, z);
+        using Coefficients = std::array<ValueType, numComponents>;
         std::optional<PlaneVector> plane;
         Scalar plane_gibbs = 0.0;
         // One cache for both roots: temperature and pressure are fixed.
         std::optional<ParamCache> own_cache;
         ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
+        std::optional<FlashFluidState> feed_state;
+        // The fugacity coefficients of the feed on the root of a phase label:
+        // from the flash's evaluation of the feed where it has one.
+        const auto feed_coefficients = [&](const unsigned phaseIdx) {
+            Coefficients coefficients;
+            if constexpr (std::is_same_v<ValueType, Scalar> && hasTranslatedFugacityCoefficients_) {
+                if (shared) {
+                    const FeedEvaluation& feed = feedEvaluation_(*shared, fluid_state, z, true);
+                    coefficients = phaseIdx == static_cast<unsigned>(oilPhaseIdx)
+                        ? feed.liquid_coefficients : feed.vapour_coefficients;
+                    FluidSystem::template translateFugacityCoefficients<Scalar>(
+                        shared->param_cache, phaseIdx, coefficients);
+                    return coefficients;
+                }
+            }
+            if (!feed_state) {
+                feed_state.emplace(fluid_state);
+                setPhaseMoleFractions_(*feed_state, oilPhaseIdx, z);
+                setPhaseMoleFractions_(*feed_state, gasPhaseIdx, z);
+            }
+            param_cache.updatePhase(*feed_state, phaseIdx);
+            updateFugacityCoefficients_(*feed_state, param_cache, phaseIdx);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                coefficients[compIdx] = feed_state->fugacityCoefficient(phaseIdx, compIdx);
+            }
+            return coefficients;
+        };
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
-            param_cache.updatePhase(feed_state, phaseIdx);
-            updateFugacityCoefficients_(feed_state, param_cache, phaseIdx);
+            const Coefficients coefficients = feed_coefficients(phaseIdx);
             PlaneVector phase_plane(0.0);
             Scalar phase_gibbs = 0.0;
             for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
@@ -1671,7 +1819,7 @@ protected:
                 if (!(z_i > 0.)) {
                     continue;
                 }
-                const Scalar phi = Opm::getValue(feed_state.fugacityCoefficient(phaseIdx, compIdx));
+                const Scalar phi = Opm::getValue(coefficients[compIdx]);
                 if (!(phi > minFugacityCoefficient && phi < maxFugacityCoefficient)) {
                     return std::nullopt;
                 }
@@ -2029,7 +2177,8 @@ protected:
         std::optional<ParamCache> own_cache;
         ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         std::array<typename FlashFluidState::ValueType, numComponents> reference_coefficients;
-        const FeedRoot feed_root = feedStableRoot_(fluid_state, z, param_cache, reference_coefficients);
+        const FeedRoot feed_root
+            = feedStableRoot_(fluid_state, z, param_cache, reference_coefficients, shared);
         const int reference_phase_idx = feed_root.phase_idx;
 
         // Grow a vapour-like trial phase.
