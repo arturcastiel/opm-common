@@ -923,6 +923,10 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
     bool extrapolated = false;
     V<Scalar, N> plain_K = K;
     Scalar tm_before = 0.;
+    V<Scalar, N> reference_fugacity;
+    for (int i = 0; i < N; ++i) {
+        reference_fugacity[i] = pure.p * reference_coefficients[i] * z[i];
+    }
 
     for (int iteration = 0; iteration < C::maxStabilityIterations; ++iteration) {
         ++counters.stabilityIterations;
@@ -948,9 +952,8 @@ OPM_PTFK Status checkStability(const Pure<Scalar, N>& pure,
                 continue;
             }
             const Scalar trial_fugacity = pure.p * trial_phi[i] * trial_composition[i];
-            const Scalar reference_fugacity = pure.p * reference_coefficients[i] * z[i];
-            R[i] = is_vapour_trial ? reference_fugacity / trial_fugacity / trial_sum
-                                   : trial_fugacity / reference_fugacity * trial_sum;
+            R[i] = is_vapour_trial ? reference_fugacity[i] / trial_fugacity / trial_sum
+                                   : trial_fugacity / reference_fugacity[i] * trial_sum;
         }
 
         V<Scalar, N> step = filled<Scalar, N>(0.);
@@ -1468,10 +1471,10 @@ OPM_PTFK Status gibbsNewton(Context<Scalar, N>& ctx,
 
 /*!
  * \brief Solves J dx = r in place of r by LU with partial pivoting, as
- *        Dune::DenseMatrix::solve() for n > 3.
+ *        Dune::DenseMatrix::solve() for n > 3. The factors overwrite A.
  */
 template <class Scalar, int n>
-OPM_PTFK Status luSolve(Vec<Vec<Scalar, n>, n> A, Vec<Scalar, n>& rhs)
+OPM_PTFK Status luSolve(Vec<Vec<Scalar, n>, n>& A, Vec<Scalar, n>& rhs)
 {
     for (int i = 0; i < n; ++i) {
         Scalar pivmax = math::abs(A[i][i]);
