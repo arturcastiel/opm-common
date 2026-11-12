@@ -508,7 +508,9 @@ public:
                                    const EOSType& eos_type,
                                    const int verbosity = 0)
     {
+        // Values only: no composition Jacobian for a derivative pass.
         FlashShared shared(eos_type);
+        shared.newton_jacobian = false;
         const bool is_single_phase
             = flashScalar_(fluid_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity,
                            nullptr, nullptr, &shared)
@@ -1176,6 +1178,10 @@ protected:
         {}
 
         ScalarParamCache param_cache;
+        //! Whether the caller takes the composition Jacobian of a split that
+        //! Newton finished (the derivative pass does; a values-only flash
+        //! does not, see newtonJacobian_()).
+        bool newton_jacobian = true;
     };
 
     //! The parameter cache a stage evaluates with: the flash's, or its own.
@@ -3073,8 +3079,29 @@ protected:
         }
         L = liquid_fraction;
         fluid_state.setLvalue(L);
-        return NewtonJacobian{compositionJacobian_(fluid_state, eos_type),
-                              jacobianState_(fluid_state)};
+        return newtonJacobian_(fluid_state, eos_type, shared);
+    }
+
+    /*!
+     * \brief The composition Jacobian of a split that Newton finished, for
+     *        the derivative pass to reuse.
+     *
+     * A flash whose caller takes no derivatives does not evaluate it: it
+     * gets a zero matrix at a state of NaNs, which matches no state, so the
+     * derivative pass could never take it for its own.
+     */
+    template <class FlashFluidState>
+    static NewtonJacobian newtonJacobian_(const FlashFluidState& fluid_state,
+                                          const EOSType& eos_type,
+                                          const FlashShared* shared)
+    {
+        if (shared && !shared->newton_jacobian) {
+            NewtonJacobian unused;
+            unused.jacobian = 0.;
+            unused.state.fill(std::numeric_limits<Scalar>::quiet_NaN());
+            return unused;
+        }
+        return {compositionJacobian_(fluid_state, eos_type), jacobianState_(fluid_state)};
     }
 
     /*!
@@ -3364,7 +3391,7 @@ protected:
         if constexpr (hasFugacityDerivatives_) {
             // The derivative pass assembles its Jacobian analytically; the
             // one offered for reuse is that one.
-            return {compositionJacobian_(fluid_state, eos_type), jacobianState_(fluid_state)};
+            return newtonJacobian_(fluid_state, eos_type, shared);
         }
         return {jacobian, jacobianState_(fluid_state)};
     }
