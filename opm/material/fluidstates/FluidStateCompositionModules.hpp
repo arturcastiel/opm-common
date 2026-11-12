@@ -134,6 +134,30 @@ public:
     }
 
     /*!
+     * \brief Set the mole fractions of all components in a phase [] and
+     *        update the average molar mass [kg/mol] once, to the values
+     *        that setMoleFraction() for each component in turn leaves
+     */
+    template <class Values>
+    void setMoleFractions(unsigned phaseIdx, const Values& values)
+    {
+        Valgrind::SetUndefined(sumMoleFractions_[phaseIdx]);
+        Valgrind::SetUndefined(averageMolarMass_[phaseIdx]);
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            Valgrind::CheckDefined(values[compIdx]);
+            moleFraction_[phaseIdx][compIdx] = values[compIdx];
+        }
+
+        // re-calculate the mean molar mass
+        sumMoleFractions_[phaseIdx] = 0.0;
+        averageMolarMass_[phaseIdx] = 0.0;
+        for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+            sumMoleFractions_[phaseIdx] += moleFraction_[phaseIdx][compJIdx];
+            averageMolarMass_[phaseIdx] += moleFraction_[phaseIdx][compJIdx]*FluidSystem::molarMass(compJIdx);
+        }
+    }
+
+    /*!
      * \brief Set the total mole fraction of a component
      */
     void setMoleFraction(unsigned compIdx, const ValueType& value)

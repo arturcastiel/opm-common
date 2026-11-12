@@ -332,6 +332,53 @@ BOOST_AUTO_TEST_CASE(BubbleDewRoundTrip)
     }
 }
 
+BOOST_AUTO_TEST_CASE(StartedSearchesFindTheSameBoundary)
+{
+    // A search started from the answer of a nearby composition, as a cell's
+    // previous output, finds the boundary the search from the Wilson estimate
+    // finds, to its convergence tolerance. A start too far away is left to that
+    // search, and so is a missing one.
+    const auto check = [](const bool bubble, const CompVec& before, const CompVec& after) {
+        const auto search = [bubble](const CompVec& z, Scalar& p, CompVec& w) {
+            return bubble ? SatP::bubblePressure(z, temperature, eosType, p, w)
+                          : SatP::dewPressure(z, temperature, eosType, p, w);
+        };
+        const auto started = [bubble](const CompVec& z, const SatP::Start& start,
+                                      Scalar& p, CompVec& w) {
+            return bubble ? SatP::bubblePressure(z, temperature, eosType, start, p, w)
+                          : SatP::dewPressure(z, temperature, eosType, start, p, w);
+        };
+        Scalar p0{};
+        CompVec w0{};
+        BOOST_REQUIRE(search(before, p0, w0));
+        Scalar p1{};
+        CompVec w1{};
+        BOOST_REQUIRE(search(after, p1, w1));
+
+        for (const Scalar factor : {Scalar{1}, Scalar{10}, Scalar{0}}) {
+            Scalar p{};
+            CompVec w{};
+            BOOST_REQUIRE(started(after, SatP::Start{factor * p0, w0}, p, w));
+            BOOST_CHECK_CLOSE(p, p1, 1.0e-6);
+            for (int c = 0; c < numComponents; ++c) {
+                BOOST_CHECK_SMALL(std::abs(w[c] - w1[c]), 1.0e-7);
+            }
+        }
+    };
+    for (const Scalar zMethane : {Scalar{0.30}, Scalar{0.40}, Scalar{0.80}}) {
+        const CompVec liquid{0.0, zMethane, 1.0 - zMethane};
+        check(/*bubble=*/true, liquid, CompVec{0.0, zMethane + 0.002, 0.998 - zMethane});
+        check(/*bubble=*/true, CompVec{0.01, zMethane - 0.01, 1.0 - zMethane}, liquid);
+
+        // The vapour of that bubble point has an upper dew point.
+        Scalar pBubble{};
+        CompVec vapor{};
+        BOOST_REQUIRE(SatP::bubblePressure(liquid, temperature, eosType, pBubble, vapor));
+        const CompVec richer{vapor[0], vapor[1] - 0.001, vapor[2] + 0.001};
+        check(/*bubble=*/false, vapor, richer);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(SinglePrecisionBubbleDewRoundTrip)
 {
     constexpr FloatSatP::CompVec liquid{0.0f, 0.4f, 0.6f};
@@ -491,6 +538,27 @@ BOOST_AUTO_TEST_CASE(PureComponentSaturationPressure)
     CompVec incipient{};
     BOOST_REQUIRE(SatP::dewPressure(liquid, temperature, eosType, pDew, incipient));
     BOOST_CHECK_CLOSE(pDew, pBubble, 1.0e-3);
+}
+
+BOOST_AUTO_TEST_CASE(ScanStopsOutsideItsPressureWindow)
+{
+    // Pure decane at the freezing point of water has a vapour pressure of a
+    // few tens of pascal, below the window of the scan: it is not reported,
+    // and the output is left untouched. At the test temperature, where it
+    // is in the kilopascal range, it is (PureComponentSaturationPressure).
+    const CompVec liquid{0.0, 0.0, 1.0};
+    Scalar press = -1.0;
+    CompVec vapor{};
+    BOOST_CHECK(!SatP::bubblePressure(liquid, 273.15, eosType, press, vapor));
+    BOOST_CHECK_LT(press, 0.0);
+
+    // Carbon dioxide with traces of methane and decane far above its critical
+    // temperature has no dew point. All three searches of dewPressure() give
+    // up at the ends of the window instead of scanning on to pressures of a
+    // fraction of a pascal.
+    const CompVec gas{1.0 - 2.0e-8, 1.0e-8, 1.0e-8};
+    BOOST_CHECK(!SatP::dewPressure(gas, 423.15, eosType, press, vapor));
+    BOOST_CHECK_LT(press, 0.0);
 }
 
 BOOST_AUTO_TEST_CASE(TrivialSolutionIsNotReportedAsADewPoint)

@@ -106,7 +106,9 @@ namespace Opm {
  * Continuation advances in \f$\ln p\f$, carries stationary trial amounts from
  * one pressure to the next, and brackets the sign change of \f$\ln S_Y\f$.
  * A failed scan does not establish that no root exists: near a critical point,
- * the two-phase interval can be narrower than the pressure sampling step.
+ * the two-phase interval can be narrower than the pressure sampling step. A
+ * scan that has found no two-phase trial stops below 10^2 Pa (above 10^9 Pa
+ * for the lower dew point), so a boundary outside that window is not reported.
  * A damped Newton stationary solve completes fixed-pressure substitutions that
  * stall near criticality. During continuation, a failed trial point does not
  * discard an existing bracket: alternate interior points are tried, and a
@@ -135,6 +137,48 @@ class SaturationPressure
 
 public:
     using CompVec = std::array<Scalar, numComponents>;
+
+    /// The start of a search from a nearby state, such as the same cell at
+    /// the previous output: its saturation pressure and the composition of
+    /// its incipient phase.
+    struct Start
+    {
+        Scalar pressure{};
+        CompVec incipient{};
+    };
+
+    /// bubblePressure() from \p start: the search begins at the start's
+    /// pressure, with the equilibrium ratios of its incipient phase, instead
+    /// of at the Wilson estimate. Its answer is taken if it lies within a
+    /// factor 1 +/- maxStartChange_ of the start's pressure; otherwise, or if
+    /// it fails, the search from the Wilson estimate decides.
+    [[nodiscard]] static bool bubblePressure(const CompVec& liquid,
+                                             const Scalar temp,
+                                             const EOSType eosType,
+                                             const Start& start,
+                                             Scalar& press,
+                                             CompVec& vapor)
+    {
+        if (startedSolve_(normalized_(liquid), temp, eosType, Mode::Bubble, start, press, vapor)) {
+            return true;
+        }
+        return bubblePressure(liquid, temp, eosType, press, vapor);
+    }
+
+    /// dewPressure() from \p start, an upper (retrograde) dew point: as the
+    /// bubblePressure() from a start.
+    [[nodiscard]] static bool dewPressure(const CompVec& vapor,
+                                          const Scalar temp,
+                                          const EOSType eosType,
+                                          const Start& start,
+                                          Scalar& press,
+                                          CompVec& liquid)
+    {
+        if (startedSolve_(normalized_(vapor), temp, eosType, Mode::DewUpper, start, press, liquid)) {
+            return true;
+        }
+        return dewPressure(vapor, temp, eosType, press, liquid);
+    }
 
     /// Computes the bubble-point pressure of a liquid with composition \p liquid at
     /// temperature \p temp, along with the equilibrium \p vapor composition.
@@ -285,6 +329,16 @@ private:
     // Step in ln Y used to finite-difference the Jacobian; this perturbs Y
     // relatively rather than by a fixed absolute amount.
     static constexpr Scalar jacobianStep_ = 1.0e-5;
+    // The pressure window [Pa] of a scan that has not found a two-phase
+    // trial: the scan down from above gives up below the lower end, the scan
+    // up from below above the upper end. Without it, a mixture without a
+    // saturation pressure, such as a gas far above its cricondentherm, is
+    // scanned over tens of decades of pressure, and the trials at pressures
+    // of a few pascal converge so slowly that each needs the full
+    // substitution and a Newton completion: such mixtures cost a thousand
+    // times a resolved one.
+    static constexpr Scalar minScanPressure_ = 1.0e2;
+    static constexpr Scalar maxScanPressure_ = 1.0e9;
 
     // Rescale a composition to sum to one. The boundary residual is measured
     // against one, so a composition that sums to 1 + d cannot meet that test
@@ -302,6 +356,26 @@ private:
         std::ranges::transform(z, out.begin(),
                                [sum](const Scalar zi) { return zi / sum; });
         return out;
+    }
+
+    // The fugacity coefficients of all components of a phase, from the fluid
+    // system's evaluation of the whole phase where it has one: the same values
+    // as fugacityCoefficient() of each component, with the terms they share,
+    // two logarithms among them, evaluated once.
+    template <class State>
+    static void phaseFugacityCoefficients_(const State& fs,
+                                           const ParameterCache& cache,
+                                           const unsigned phaseIdx,
+                                           CompVec& phi)
+    {
+        if constexpr (requires { FluidSystem::fugacityCoefficients(fs, cache, phaseIdx, phi); }) {
+            FluidSystem::fugacityCoefficients(fs, cache, phaseIdx, phi);
+        }
+        else {
+            for (int c = 0; c < numComponents; ++c) {
+                phi[c] = FluidSystem::fugacityCoefficient(fs, cache, phaseIdx, c);
+            }
+        }
     }
 
     static bool positiveFinite_(const Scalar value)
@@ -469,9 +543,9 @@ private:
         ParameterCache knownCache(eosType);
         knownCache.updatePhase(fs, knownPhaseIdx);
         CompVec lnPhiZ;
+        phaseFugacityCoefficients_(fs, knownCache, knownPhaseIdx, lnPhiZ);
         for (int c = 0; c < numComponents; ++c) {
-            lnPhiZ[c] = std::log(
-                FluidSystem::fugacityCoefficient(fs, knownCache, knownPhaseIdx, c));
+            lnPhiZ[c] = std::log(lnPhiZ[c]);
             if (!std::isfinite(lnPhiZ[c])) {
                 return Stability::Indeterminate;
             }
@@ -508,13 +582,14 @@ private:
             Scalar change = 0.0;
             Scalar sumNew = 0.0;
             CompVec d{};
+            CompVec phiY;
+            phaseFugacityCoefficients_(trial, trialCache, knownPhaseIdx, phiY);
             for (int c = 0; c < numComponents; ++c) {
                 if (z[c] <= 0.0) {
                     Y[c] = 0.0;
                     continue;
                 }
-                const Scalar lnPhiY =
-                    std::log(FluidSystem::fugacityCoefficient(trial, trialCache, knownPhaseIdx, c));
+                const Scalar lnPhiY = std::log(phiY[c]);
                 const Scalar Ynew = std::exp(std::log(z[c]) + lnPhiZ[c] - lnPhiY);
                 if (!positiveFinite_(Ynew) || !positiveFinite_(Y[c])) {
                     return Stability::Indeterminate;
@@ -603,13 +678,14 @@ private:
         cache.updatePhase(fs, knownPhase);
         CompVec target{};
         Vector u(0.0);
+        CompVec phiKnown;
+        phaseFugacityCoefficients_(fs, cache, knownPhase, phiKnown);
         for (int c = 0; c < numComponents; ++c) {
             if (z[c] > 0.0) {
                 if (!positiveFinite_(Y[c])) {
                     return false;
                 }
-                target[c] = std::log(z[c])
-                    + std::log(FluidSystem::fugacityCoefficient(fs, cache, knownPhase, c));
+                target[c] = std::log(z[c]) + std::log(phiKnown[c]);
                 u[c] = std::log(Y[c]);
             }
         }
@@ -636,10 +712,11 @@ private:
                 ? ParameterCache::Temperature | ParameterCache::Pressure : ParameterCache::None;
             cache.updatePhase(trial, trialPhase, unchanged);
             trialCacheInitialized = true;
+            CompVec phiTrial;
+            phaseFugacityCoefficients_(trial, cache, trialPhase, phiTrial);
             for (int c = 0; c < numComponents; ++c) {
                 r[c] = z[c] > 0.0
-                    ? v[c] + std::log(FluidSystem::fugacityCoefficient(trial, cache, trialPhase, c))
-                        - target[c]
+                    ? v[c] + std::log(phiTrial[c]) - target[c]
                     : v[c];
                 if (!std::isfinite(r[c])) {
                     return false;
@@ -1076,6 +1153,36 @@ private:
         return false;
     }
 
+    // The largest relative change of the saturation pressure from its start
+    // that a started search may report. A boundary further away is left to
+    // the search from the Wilson estimate, which approaches it from the side
+    // its branch prescribes.
+    static constexpr Scalar maxStartChange_ = 0.2;
+
+    /// solve_() from \p start; publishes its answer only if it converged
+    /// within maxStartChange_ of the start's pressure.
+    static bool startedSolve_(const CompVec& z,
+                              const Scalar temp,
+                              const EOSType eosType,
+                              const Mode mode,
+                              const Start& start,
+                              Scalar& press,
+                              CompVec& incipient)
+    {
+        if (!positiveFinite_(start.pressure)) {
+            return false;
+        }
+        Scalar p{};
+        CompVec w{};
+        if (solve_(z, temp, eosType, mode, p, w, &start) != Outcome::Converged
+            || !(std::abs(p - start.pressure) <= maxStartChange_ * start.pressure)) {
+            return false;
+        }
+        press = p;
+        incipient = w;
+        return true;
+    }
+
     /*!
      * \brief Search one bubble- or dew-pressure branch.
      *
@@ -1128,6 +1235,8 @@ private:
      * \param[in] mode Branch and scan direction.
      * \param[out] press Saturation pressure; unchanged unless converged.
      * \param[out] incipient Equilibrium composition of the incipient phase.
+     * \param[in] start Optional start, whose pressure and incipient-phase
+     *                  ratios replace the Wilson estimate.
      * \return Outcome::Converged for a certified boundary, otherwise
      *         Outcome::GaveUp.
      */
@@ -1136,7 +1245,8 @@ private:
                           const EOSType eosType,
                           const Mode mode,
                           Scalar& press,
-                          CompVec& incipient)
+                          CompVec& incipient,
+                          const Start* start = nullptr)
     {
         if (!positiveFinite_(temp)) {
             return Outcome::GaveUp;
@@ -1151,7 +1261,10 @@ private:
         // pressure. The upper dew search starts from the same high estimate as
         // the bubble search.
         Scalar p = 0.0;
-        if (mode == Mode::DewLower) {
+        if (start) {
+            p = start->pressure;
+        }
+        else if (mode == Mode::DewLower) {
             for (int c = 0; c < numComponents; ++c) {
                 p += z[c] / wilsonKp[c];
             }
@@ -1170,6 +1283,16 @@ private:
             return K;
         };
         CompVec K = wilsonK(p);
+        // A start gives the ratios of its incipient phase to the feed, y / x,
+        // where both are present.
+        if (start) {
+            for (int c = 0; c < numComponents; ++c) {
+                const Scalar w = start->incipient[c];
+                if (z[c] > 0.0 && positiveFinite_(w)) {
+                    K[c] = bubble ? w / z[c] : z[c] / w;
+                }
+            }
+        }
 
         // The known phase holds z; the incipient phase composition is derived from K.
         const auto knownPhaseIdx = bubble ? oilPhaseIdx : gasPhaseIdx;
@@ -1228,6 +1351,12 @@ private:
             if (!positiveFinite_(p)) {
                 return Outcome::GaveUp;
             }
+            // A boundary outside the scan window is not reported, unless a
+            // two-phase trial has already been found.
+            if (outer > 0 && !haveIn
+                && (fromAbove ? p < minScanPressure_ : p > maxScanPressure_)) {
+                return Outcome::GaveUp;
+            }
             fs.setPressure(oilPhaseIdx, p);
             fs.setPressure(gasPhaseIdx, p);
 
@@ -1259,10 +1388,7 @@ private:
                 // The known phase is fixed throughout the substitution at this pressure.
                 if (inner == 0) {
                     paramCache.updatePhase(fs, knownPhaseIdx);
-                    for (int c = 0; c < numComponents; ++c) {
-                        phiKnown[c] = FluidSystem::fugacityCoefficient(
-                            fs, paramCache, knownPhaseIdx, c);
-                    }
+                    phaseFugacityCoefficients_(fs, paramCache, knownPhaseIdx, phiKnown);
                 }
                 const int unchanged = inner == 0
                     ? ParameterCache::None : ParameterCache::Temperature | ParameterCache::Pressure;
@@ -1271,9 +1397,10 @@ private:
                 Scalar change = 0.0;
                 trivial = true;
                 CompVec d;
+                CompVec phiIncipients;
+                phaseFugacityCoefficients_(fs, paramCache, incipientPhaseIdx, phiIncipients);
                 for (int c = 0; c < numComponents; ++c) {
-                    const Scalar phiIncipient = FluidSystem::fugacityCoefficient(
-                        fs, paramCache, incipientPhaseIdx, c);
+                    const Scalar phiIncipient = phiIncipients[c];
                     const Scalar newK = bubble ? phiKnown[c] / phiIncipient
                                               : phiIncipient / phiKnown[c];
                     if (!positiveFinite_(newK)) {
@@ -1318,9 +1445,10 @@ private:
                     }
                     paramCache.updatePhase(fs, incipientPhaseIdx);
                     trivial = true;
+                    CompVec phiIncipients;
+                    phaseFugacityCoefficients_(fs, paramCache, incipientPhaseIdx, phiIncipients);
                     for (int c = 0; c < numComponents; ++c) {
-                        const Scalar phiIncipient = FluidSystem::fugacityCoefficient(
-                            fs, paramCache, incipientPhaseIdx, c);
+                        const Scalar phiIncipient = phiIncipients[c];
                         const Scalar newK = bubble ? phiKnown[c] / phiIncipient
                                                   : phiIncipient / phiKnown[c];
                         if (!positiveFinite_(newK)) {

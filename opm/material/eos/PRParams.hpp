@@ -60,6 +60,23 @@ public:
         return omegaA() * tmp * tmp;
     }
 
+    //! \f$\partial \ln \Omega_a / \partial T\f$ of calcOmegaA().
+    static Scalar calcLnOmegaATemperatureDerivative(Scalar temperature, unsigned compIdx, bool modified)
+    {
+        const Scalar criticalTemperature = FluidSystem::criticalTemperature(compIdx);
+        Scalar Tr = temperature / criticalTemperature;
+        Scalar omega = FluidSystem::acentricFactor(compIdx);
+        Scalar f_omega;
+        if (!modified || omega <= 0.49)
+            f_omega = 0.37464 + omega * (1.54226 + omega * (-0.26992));
+        else
+            f_omega = 0.379642 + omega * (1.48503 + omega * (-0.164423 + omega * 0.016666));
+
+        const Scalar sqrtTr = sqrt(Tr);
+        const Scalar tmp = 1 + f_omega*(1 - sqrtTr);
+        return -f_omega / (sqrtTr * criticalTemperature * tmp);
+    }
+
     static Scalar calcOmegaB()
     {
         return Scalar(0.077796074);

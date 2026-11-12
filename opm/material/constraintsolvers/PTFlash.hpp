@@ -55,14 +55,20 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -138,8 +144,78 @@ class PTFlash
     // the Hessian: none, then firstHessianShift times powers of ten.
     static constexpr Scalar firstHessianShift = 1e-4;
     static constexpr int maxHessianShifts = 8;
+    // A predicted change of a ln K beyond this is not trusted, see
+    // predictSplit_().
+    static constexpr Scalar maxPredictedLnKStep = 1.0;
+    // The stability bypass of a single-phase cell from its memory, see
+    // stabilityBypass_(). Where both trials of the last test collapsed onto
+    // the feed: the windows in composition and relative pressure (b over the
+    // tolerance) and in temperature (b times the window, in K), with b the
+    // critical distance of the tested state. Where a trial found a stationary
+    // point above the tangent plane: its distance must exceed the safety
+    // factor times the move, with the relative temperature change weighted.
+    static constexpr Scalar stabilityBypassTolerance = 100;
+    static constexpr Scalar stabilityBypassTemperatureWindow = 0.3;
+    static constexpr Scalar stabilityMarginSafety = 10;
+    static constexpr Scalar stabilityMarginTemperatureWeight = 10;
+    static constexpr Scalar minimumStabilityMargin = 1e-4;
 
 public:
+    /*!
+     * \brief What the caller keeps of a cell's last flash for the next flash
+     *        of the same cell, see solve() with a memory.
+     *
+     * A two-phase answer is kept with its sensitivities: the solution
+     * \f$(\mathbf w, dL)\f$, \f$\mathbf w = d\mathbf y - d\mathbf x\f$, of the
+     * reduced system of setReducedDerivatives_() for a unit change of each of
+     * \f$p\f$, \f$T\f$ and \f$z_j\f$. A single-phase answer of a stability test
+     * is kept with the state of the test and how decisive it was.
+     */
+    struct Memory
+    {
+        bool has_split = false;
+        //! Whether the sensitivities have a temperature column.
+        bool split_has_temperature = false;
+        Scalar pressure = 0.;
+        Scalar temperature = 0.;
+        Scalar liquid_fraction = 0.;
+        std::array<Scalar, numComponents> z{};
+        std::array<Scalar, numComponents> x{};
+        std::array<Scalar, numComponents> y{};
+        std::array<Scalar, numComponents> K{};
+        //! Rows w_0 .. w_{N-1}, dL; columns p, T, z_0 .. z_{N-1}.
+        std::array<std::array<Scalar, numComponents + 2>, numComponents + 1> sensitivity{};
+
+        bool has_stability = false;
+        //! Both trials collapsed onto the feed.
+        bool trials_trivial = false;
+        //! The phase index of the stable root of the feed.
+        int stable_phase_idx = 0;
+        //! The smallest tangent-plane distance of a stationary point a trial
+        //! found away from the feed; infinite if none.
+        Scalar stability_margin = 0.;
+        //! The critical distance of the tested state; negative until needed.
+        Scalar critical_distance = -1.;
+        Scalar stability_pressure = 0.;
+        Scalar stability_temperature = 0.;
+        std::array<Scalar, numComponents> stability_z{};
+    };
+
+    //! What solve() with a memory uses of it.
+    struct MemoryOptions
+    {
+        //! Predict a two-phase warm start from the last two-phase answer.
+        bool predict = false;
+        //! An accepted prediction takes the remembered sensitivities as its
+        //! derivatives instead of the derivative pass.
+        bool reuse = false;
+        //! Skip the stability test of a single-phase cell that was decisively
+        //! stable at its last test and has hardly moved since.
+        bool phase_memory = false;
+        //! Keep a temperature column also for an isothermal flash.
+        bool temperature = false;
+    };
+
     /*!
      * \brief Calculates the fluid state from the global mole fractions of the components and the phase pressures
      *
@@ -151,33 +227,24 @@ public:
                       const EOSType& eos_type,
                       int verbosity = 0)
     {
-        using ScalarFluidState = CompositionalFluidState<Scalar, FluidSystem>;
+        if (memorySettings_().enabled) {
+            return solveFromTable_(fluid_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+        }
         // Solve on a value-only copy; derivatives are reconstructed on the
         // caller's state after the scalar flash has converged.
-        ScalarFluidState scalar_state;
-
-        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            scalar_state.setKvalue(compIdx, Opm::getValue(fluid_state.K(compIdx)));
-            scalar_state.setMoleFraction(compIdx, Opm::getValue(fluid_state.moleFraction(compIdx)));
-        }
-
-        scalar_state.setLvalue(Opm::getValue(fluid_state.L()));
-        scalar_state.setPressure(FluidSystem::oilPhaseIdx,
-                                 Opm::getValue(fluid_state.pressure(FluidSystem::oilPhaseIdx)));
-        scalar_state.setPressure(FluidSystem::gasPhaseIdx,
-                                 Opm::getValue(fluid_state.pressure(FluidSystem::gasPhaseIdx)));
-
-        scalar_state.setTemperature(Opm::getValue(fluid_state.temperature(0)));
+        auto scalar_state = scalarState_(fluid_state);
 
         const auto [is_single_phase, newton_jacobian]
             = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
 
         // Transfer the converged values before reconstructing their derivatives.
-        for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            const auto liquid_mole_fraction = scalar_state.moleFraction(oilPhaseIdx, compIdx);
-            fluid_state.setMoleFraction(oilPhaseIdx, compIdx, liquid_mole_fraction);
-            const auto vapour_mole_fraction = scalar_state.moleFraction(gasPhaseIdx, compIdx);
-            fluid_state.setMoleFraction(gasPhaseIdx, compIdx, vapour_mole_fraction);
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            std::array<typename FluidState::ValueType, numComponents> mole_fractions;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                mole_fractions[compIdx] = scalar_state.moleFraction(phaseIdx, compIdx);
+            }
+            setPhaseMoleFractions_(fluid_state, phaseIdx, mole_fractions);
         }
 
         updateDerivatives_(scalar_state, fluid_state, eos_type, is_single_phase, newton_jacobian);
@@ -195,6 +262,192 @@ public:
 
         return is_single_phase;
     } //end solve
+
+    /*!
+     * \brief solve() with the memory of the cell's last flash.
+     *
+     * - With options.predict, a two-phase warm start whose memory holds a
+     *   two-phase answer is predicted from it by a first-order step in
+     *   \f$(p, T, \mathbf z)\f$ along the remembered sensitivities. The
+     *   prediction is checked as successive substitution checks an iterate:
+     *   Rachford-Rice for L, the fugacities of both phases once, and
+     *   \f$\| f^L / f^V - 1 \| <\f$ flash_tolerance. One that passes is the
+     *   answer; otherwise the flash continues from it, one substitution step
+     *   further. With options.reuse, an accepted prediction takes the
+     *   remembered sensitivities as its derivatives (first-order accurate).
+     * - With options.phase_memory, a cell that comes in single-phase skips
+     *   the stability test where its last test was decisive and the state
+     *   has hardly moved since, see stabilityBypass_().
+     *
+     * \param previous The memory of the cell's last flash, or nothing.
+     * \param next Receives the memory of this flash; may be previous.
+     */
+    template <class FluidState>
+    static bool solve(FluidState& fluid_state,
+                      const Memory* previous,
+                      Memory& next,
+                      const MemoryOptions& options,
+                      PTFlashMethod twoPhaseMethod,
+                      Scalar flash_tolerance,
+                      const EOSType& eos_type,
+                      int verbosity = 0)
+    {
+        // The caller may pass the same memory in and out; otherwise no copy.
+        static constexpr Memory no_memory{};
+        std::optional<Memory> incoming_copy;
+        if (previous == &next) {
+            incoming_copy = *previous;
+        }
+        const Memory& incoming = incoming_copy ? *incoming_copy : (previous ? *previous : no_memory);
+        // Every field of a part is set when its flag is.
+        next.has_split = false;
+        next.has_stability = false;
+        auto scalar_state = scalarState_(fluid_state);
+        auto& tally = memoryTally_();
+        ++tally.flashes;
+
+        std::array<Scalar, numComponents> z;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z[compIdx] = scalar_state.moleFraction(compIdx);
+        }
+
+        // The checked prediction of a two-phase warm start.
+        bool accepted = false;
+        const Scalar incoming_L = scalar_state.L();
+        if (options.predict && incoming.has_split && incoming_L > 0. && incoming_L < 1.) {
+            ++tally.predictions;
+            Dune::FieldVector<Scalar, numComponents> K;
+            Scalar L = 0.;
+            if (predictSplit_(incoming, scalar_state, K, L)) {
+                auto trial = scalar_state;
+                const auto outcome = checkPrediction_(trial, K, L, z, flash_tolerance, eos_type);
+                if (outcome == PredictionOutcome::accepted) {
+                    OPM_FLASH_COUNT(cacheHits);
+                    ++tally.accepted;
+                    accepted = true;
+                    scalar_state = trial;
+                }
+                else if (outcome == PredictionOutcome::continued) {
+                    ++tally.continued;
+                    for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                        scalar_state.setKvalue(compIdx, K[compIdx]);
+                    }
+                    scalar_state.setLvalue(L);
+                }
+                else {
+                    ++tally.outside;
+                }
+            }
+            else {
+                ++tally.outside;
+            }
+        }
+
+        bool is_single_phase = false;
+        std::optional<NewtonJacobian> newton_jacobian;
+        if (!accepted) {
+            auto result = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type,
+                                       verbosity, options.phase_memory ? &incoming : nullptr,
+                                       options.phase_memory ? &next : nullptr);
+            is_single_phase = result.single_phase;
+            newton_jacobian = std::move(result.newton_jacobian);
+        }
+
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            std::array<typename FluidState::ValueType, numComponents> mole_fractions;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                mole_fractions[compIdx] = scalar_state.moleFraction(phaseIdx, compIdx);
+            }
+            setPhaseMoleFractions_(fluid_state, phaseIdx, mole_fractions);
+        }
+        Memory* record = options.predict ? &next : nullptr;
+        if (is_single_phase) {
+            updateDerivativesSinglePhase_(scalar_state, fluid_state);
+        }
+        else if (accepted && options.reuse) {
+            ++tally.reused;
+            applySensitivities_(scalar_state, fluid_state, incoming);
+            next.sensitivity = incoming.sensitivity;
+            next.split_has_temperature = incoming.split_has_temperature;
+        }
+        else if (options.predict && options.temperature && !isThermal) {
+            updateDerivativesTwoPhase_<2>(scalar_state, fluid_state, eos_type, newton_jacobian, record);
+        }
+        else {
+            updateDerivativesTwoPhase_(scalar_state, fluid_state, eos_type, newton_jacobian, record);
+        }
+
+        if (!is_single_phase) {
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const auto& x = fluid_state.moleFraction(oilPhaseIdx, compIdx);
+                if (Opm::getValue(x) > 0.) {
+                    fluid_state.setKvalue(compIdx, fluid_state.moleFraction(gasPhaseIdx, compIdx) / x);
+                }
+            }
+        }
+
+        // Remember a two-phase answer whose phases hold every component.
+        if (options.predict && !is_single_phase) {
+            bool positive = true;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                next.x[compIdx] = scalar_state.moleFraction(oilPhaseIdx, compIdx);
+                next.y[compIdx] = scalar_state.moleFraction(gasPhaseIdx, compIdx);
+                next.K[compIdx] = Opm::getValue(fluid_state.K(compIdx));
+                next.z[compIdx] = z[compIdx];
+                positive = positive && next.x[compIdx] > 0. && next.y[compIdx] > 0.;
+            }
+            next.pressure = scalar_state.pressure(oilPhaseIdx);
+            next.temperature = scalar_state.temperature(0);
+            next.liquid_fraction = scalar_state.L();
+            next.has_split = positive;
+            tally.split_records += positive;
+        }
+        return is_single_phase;
+    }
+
+    /*!
+     * \brief Tallies of solve() with a memory, per thread.
+     */
+    struct MemoryTally
+    {
+        long flashes = 0;
+        long predictions = 0; //!< two-phase warm starts with a remembered answer
+        long accepted = 0;
+        long continued = 0;
+        long outside = 0;
+        long reused = 0;
+        long split_records = 0;
+        long single_phase_in = 0; //!< incoming L of 0 or 1 with a stability record
+        long bypass_trivial = 0;
+        long bypass_margin = 0;
+        long records_trivial = 0;
+        long records_margin = 0;
+        long tests = 0; //!< stability tests that could have left a record
+        long wrong_trivial = 0; //!< bypasses the test contradicts (verify)
+        long wrong_margin = 0;
+
+        ~MemoryTally()
+        {
+            if (!memorySettings_().report || flashes == 0) {
+                return;
+            }
+            std::fprintf(stderr,
+                         "FLASHMEMORY components %d: flashes %ld | predictions %ld accepted %ld "
+                         "continued %ld outside %ld reused %ld split records %ld | single-phase "
+                         "with record %ld bypassed trivial %ld margin %ld | tests %ld "
+                         "records trivial %ld margin %ld | verify: wrong trivial %ld margin %ld\n",
+                         numComponents, flashes, predictions, accepted, continued, outside,
+                         reused, split_records, single_phase_in, bypass_trivial, bypass_margin,
+                         tests, records_trivial, records_margin, wrong_trivial, wrong_margin);
+        }
+    };
+
+    static MemoryTally& memoryTally_()
+    {
+        thread_local MemoryTally tally;
+        return tally;
+    }
 
     /*!
      * \brief Calculates the chemical equilibrium from the component
@@ -259,6 +512,26 @@ public:
 
 protected:
     /*!
+     * \brief Sets the mole fractions of all components of a phase. A fluid
+     *        state with setMoleFractions() updates its mean molar mass once,
+     *        instead of once per component, to the same values.
+     */
+    template <class FlashFluidState, class Values>
+    static void setPhaseMoleFractions_(FlashFluidState& fluid_state,
+                                       unsigned phaseIdx,
+                                       const Values& values)
+    {
+        if constexpr (requires { fluid_state.setMoleFractions(phaseIdx, values); }) {
+            fluid_state.setMoleFractions(phaseIdx, values);
+        }
+        else {
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                fluid_state.setMoleFraction(phaseIdx, compIdx, values[compIdx]);
+            }
+        }
+    }
+
+    /*!
      * \brief Stores the fugacity coefficients of all components of a phase in
      *        the fluid state, from a parameter cache updated for the phase.
      *
@@ -288,6 +561,584 @@ protected:
         }
     }
 
+    //! The value-only copy of the caller's state the scalar flash solves on.
+    template <class FluidState>
+    static CompositionalFluidState<Scalar, FluidSystem> scalarState_(const FluidState& fluid_state)
+    {
+        CompositionalFluidState<Scalar, FluidSystem> scalar_state;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            scalar_state.setKvalue(compIdx, Opm::getValue(fluid_state.K(compIdx)));
+            scalar_state.setMoleFraction(compIdx, Opm::getValue(fluid_state.moleFraction(compIdx)));
+        }
+        scalar_state.setLvalue(Opm::getValue(fluid_state.L()));
+        scalar_state.setPressure(FluidSystem::oilPhaseIdx,
+                                 Opm::getValue(fluid_state.pressure(FluidSystem::oilPhaseIdx)));
+        scalar_state.setPressure(FluidSystem::gasPhaseIdx,
+                                 Opm::getValue(fluid_state.pressure(FluidSystem::gasPhaseIdx)));
+        scalar_state.setTemperature(Opm::getValue(fluid_state.temperature(0)));
+        return scalar_state;
+    }
+
+    /*
+     * Research switch for callers of solve() without a memory, off by
+     * default. The environment variable OPM_FLASH_MEMORY holds a
+     * comma-separated list of the MemoryOptions (predict, reuse, phase,
+     * temperature), report (print the tallies of each thread when it exits),
+     * verify (run the stability test after a bypass all the same, count the
+     * bypasses it contradicts and keep its answer; also read by callers with
+     * their own memory) and slots=<b> (2^b slots per table, default 14).
+     * Without predict or phase, callers of solve() without a memory are not
+     * affected. The memory of each
+     * answer is filed in a per-thread, direct-mapped table under the K and L
+     * the answer hands back, which a warm start from it brings in again.
+     */
+    struct MemorySettings
+    {
+        bool enabled = false;
+        bool report = false;
+        bool verify = false;
+        MemoryOptions options;
+        int slot_bits = 14;
+    };
+
+    static const MemorySettings& memorySettings_()
+    {
+        static const MemorySettings settings = [] {
+            MemorySettings result;
+            const char* value = std::getenv("OPM_FLASH_MEMORY");
+            if (value == nullptr) {
+                return result;
+            }
+            const std::string list(value);
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t end = std::min(list.find(',', start), list.size());
+                const std::string token = list.substr(start, end - start);
+                if (token == "predict") {
+                    result.options.predict = true;
+                }
+                else if (token == "reuse") {
+                    result.options.predict = true;
+                    result.options.reuse = true;
+                }
+                else if (token == "phase") {
+                    result.options.phase_memory = true;
+                }
+                else if (token == "temperature") {
+                    result.options.temperature = true;
+                }
+                else if (token == "report") {
+                    result.report = true;
+                }
+                else if (token == "verify") {
+                    result.verify = true;
+                }
+                else if (token.rfind("slots=", 0) == 0) {
+                    result.slot_bits = std::clamp(std::stoi(token.substr(6)), 4, 24);
+                }
+                start = end + 1;
+            }
+            result.enabled = result.options.predict || result.options.phase_memory;
+            return result;
+        }();
+        return settings;
+    }
+
+    using MemoryKey = std::array<Scalar, numComponents + 1>;
+
+    struct MemorySlot
+    {
+        bool valid = false;
+        MemoryKey key{};
+        Memory memory;
+    };
+
+    static std::vector<MemorySlot>& memoryTable_()
+    {
+        thread_local std::vector<MemorySlot> table(std::size_t{1} << memorySettings_().slot_bits);
+        return table;
+    }
+
+    //! The table slot of K and L, by their bits.
+    static MemorySlot& memorySlot_(const MemoryKey& key)
+    {
+        std::uint64_t hash = 0x9e3779b97f4a7c15ULL;
+        for (const Scalar value : key) {
+            hash ^= std::bit_cast<std::uint64_t>(value) + 0x9e3779b97f4a7c15ULL + (hash << 6)
+                + (hash >> 2);
+            // The finaliser of MurmurHash3.
+            hash ^= hash >> 33;
+            hash *= 0xff51afd7ed558ccdULL;
+            hash ^= hash >> 33;
+        }
+        auto& table = memoryTable_();
+        return table[static_cast<std::size_t>(hash) & (table.size() - 1)];
+    }
+
+    template <class FluidState>
+    static MemoryKey memoryKey_(const FluidState& fluid_state)
+    {
+        MemoryKey key;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            key[compIdx] = Opm::getValue(fluid_state.K(compIdx));
+        }
+        key[numComponents] = Opm::getValue(fluid_state.L());
+        return key;
+    }
+
+    //! solve() with the memory filed under the incoming K and L, see
+    //! memorySettings_().
+    template <class FluidState>
+    static bool solveFromTable_(FluidState& fluid_state,
+                                const PTFlashMethod twoPhaseMethod,
+                                const Scalar flash_tolerance,
+                                const EOSType& eos_type,
+                                const int verbosity)
+    {
+        const MemoryKey incoming_key = memoryKey_(fluid_state);
+        const MemorySlot& incoming_slot = memorySlot_(incoming_key);
+        const bool found = incoming_slot.valid
+            && std::memcmp(incoming_slot.key.data(), incoming_key.data(), sizeof(MemoryKey)) == 0;
+        Memory next;
+        const bool is_single_phase
+            = solve(fluid_state, found ? &incoming_slot.memory : nullptr, next,
+                    memorySettings_().options, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+        if (next.has_split || next.has_stability) {
+            MemorySlot& slot = memorySlot_(memoryKey_(fluid_state));
+            slot.valid = true;
+            slot.key = memoryKey_(fluid_state);
+            slot.memory = next;
+        }
+        return is_single_phase;
+    }
+
+    /*!
+     * \brief The first-order prediction of K and L at the state of
+     *        scalar_state from a remembered two-phase answer:
+     *        \f$(\mathbf w, dL) = S\, d\mathbf s\f$, then
+     *        \f$d\mathbf x = d\mathbf z - (\mathbf x - \mathbf y)\, dL - (1 - L)\, \mathbf w\f$,
+     *        \f$d\mathbf y = d\mathbf z - (\mathbf x - \mathbf y)\, dL + L\, \mathbf w\f$
+     *        and \f$d \ln K_i = dy_i / y_i - dx_i / x_i\f$.
+     *
+     * \return false where the memory has no temperature column and the
+     *         temperature changed, or a ln K would move by more than
+     *         maxPredictedLnKStep
+     */
+    template <class ScalarFluidState, class ScalarVector>
+    static bool predictSplit_(const Memory& memory,
+                              const ScalarFluidState& scalar_state,
+                              ScalarVector& K,
+                              Scalar& L)
+    {
+        std::array<Scalar, numComponents + 2> ds;
+        ds[0] = scalar_state.pressure(oilPhaseIdx) - memory.pressure;
+        ds[1] = scalar_state.temperature(0) - memory.temperature;
+        if (ds[1] != 0. && !memory.split_has_temperature) {
+            return false;
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            ds[2 + compIdx] = scalar_state.moleFraction(compIdx) - memory.z[compIdx];
+        }
+        std::array<Scalar, numComponents + 1> change{};
+        for (unsigned row = 0; row < numComponents + 1; ++row) {
+            for (unsigned col = 0; col < numComponents + 2; ++col) {
+                change[row] += memory.sensitivity[row][col] * ds[col];
+            }
+        }
+        const Scalar dL = change[numComponents];
+        L = memory.liquid_fraction + dL;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const Scalar common = ds[2 + compIdx]
+                - (memory.x[compIdx] - memory.y[compIdx]) * dL;
+            const Scalar dx = common - (1. - memory.liquid_fraction) * change[compIdx];
+            const Scalar dy = common + memory.liquid_fraction * change[compIdx];
+            const Scalar dlnK = dy / memory.y[compIdx] - dx / memory.x[compIdx];
+            if (!std::isfinite(dlnK) || std::abs(dlnK) > maxPredictedLnKStep) {
+                return false;
+            }
+            K[compIdx] = memory.K[compIdx] * std::exp(dlnK);
+        }
+        return true;
+    }
+
+    enum class PredictionOutcome { accepted, continued, outside };
+
+    /*!
+     * \brief Checks predicted equilibrium ratios as successive substitution
+     *        checks an iterate.
+     *
+     * L from Rachford-Rice, x and y from K and L, the fugacity coefficients of
+     * both phases, and the test \f$\| f^L / f^V - 1 \| <\f$ tolerance of
+     * successiveSubstitutionComposition_(). An accepted state also has
+     * physical, distinct phases. Otherwise K takes the substitution step from
+     * the fugacity ratios, as the flash would next.
+     */
+    template <class ScalarFluidState, class ScalarVector, class Composition>
+    static PredictionOutcome checkPrediction_(ScalarFluidState& state,
+                                              ScalarVector& K,
+                                              Scalar& L,
+                                              const Composition& z_values,
+                                              const Scalar tolerance,
+                                              const EOSType& eos_type)
+    {
+        ScalarVector z;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            z[compIdx] = z_values[compIdx];
+            if (!(z[compIdx] > 0.)) {
+                K[compIdx] = 1.;
+            }
+        }
+        try {
+            OPM_FLASH_COUNT(rachfordRiceSolves);
+            L = RachfordRice::solve(K, z, L, 0);
+        }
+        catch (const NumericalProblem&) {
+            return PredictionOutcome::outside;
+        }
+        if (!(L > 0. && L < 1.)) {
+            return PredictionOutcome::outside;
+        }
+        OPM_FLASH_COUNT(ssiIterations);
+        computeLiquidVapor_(state, L, K, z);
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
+            param_cache.updatePhase(state, phaseIdx);
+            updateFugacityCoefficients_(state, param_cache, phaseIdx);
+        }
+        ScalarVector ratio;
+        ScalarVector residual;
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            if (!(z[compIdx] > 0.)) {
+                ratio[compIdx] = 1.;
+                residual[compIdx] = 0.;
+                continue;
+            }
+            ratio[compIdx] = state.fugacity(oilPhaseIdx, compIdx) / state.fugacity(gasPhaseIdx, compIdx);
+            residual[compIdx] = ratio[compIdx] - 1.0;
+        }
+        const Scalar norm = residual.two_norm();
+        if (!std::isfinite(norm)) {
+            return PredictionOutcome::outside;
+        }
+        if (norm < tolerance && phaseCompositionsArePhysical_(state) && !phasesCoincide_(state)) {
+            state.setLvalue(L);
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setKvalue(compIdx, K[compIdx]);
+            }
+            return PredictionOutcome::accepted;
+        }
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            K[compIdx] *= ratio[compIdx];
+        }
+        return PredictionOutcome::continued;
+    }
+
+    /*!
+     * \brief The derivatives of a two-phase result in the caller's variables
+     *        from remembered sensitivities: the chain rule of
+     *        setReducedDerivatives_() with the remembered solution of the
+     *        reduced system instead of a new one.
+     */
+    template <typename FlashFluidStateScalar, typename FluidState>
+    static void applySensitivities_(const FlashFluidStateScalar& fluid_state_scalar,
+                                    FluidState& fluid_state,
+                                    const Memory& memory)
+    {
+        using InputEval = typename FluidState::ValueType;
+        const Scalar liquid_fraction = fluid_state_scalar.L();
+        const Scalar vapour_fraction = 1 - liquid_fraction;
+        std::array<InputEval, numComponents> liquid_composition;
+        std::array<InputEval, numComponents> vapour_composition;
+        std::array<Scalar, numComponents> split; // x - y
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            liquid_composition[compIdx] = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx);
+            vapour_composition[compIdx] = fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
+            split[compIdx] = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx)
+                - fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
+        }
+        InputEval liquid_fraction_with_derivatives = liquid_fraction;
+        const auto& input_pressure = fluid_state.pressure(FluidSystem::oilPhaseIdx);
+        [[maybe_unused]] const auto& input_temperature = fluid_state.temperature(0);
+        constexpr int num_derivatives = InputEval::numVars;
+        for (int idx = 0; idx < num_derivatives; ++idx) {
+            std::array<Scalar, numComponents + 2> state_derivative{};
+            state_derivative[0] = input_pressure.derivative(idx);
+            if constexpr (isThermal) {
+                state_derivative[1] = input_temperature.derivative(idx);
+            }
+            bool varies = state_derivative[0] != 0. || state_derivative[1] != 0.;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state_derivative[2 + compIdx] = fluid_state.moleFraction(compIdx).derivative(idx);
+                varies = varies || state_derivative[2 + compIdx] != 0.;
+            }
+            if (!varies) {
+                continue;
+            }
+            std::array<Scalar, numComponents + 1> change{};
+            for (unsigned row = 0; row < numComponents + 1; ++row) {
+                for (unsigned col = 0; col < numComponents + 2; ++col) {
+                    change[row] += memory.sensitivity[row][col] * state_derivative[col];
+                }
+            }
+            const Scalar liquid_fraction_derivative = change[numComponents];
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar common = state_derivative[2 + compIdx]
+                    - split[compIdx] * liquid_fraction_derivative;
+                liquid_composition[compIdx].setDerivative(
+                    idx, common - vapour_fraction * change[compIdx]);
+                vapour_composition[compIdx].setDerivative(
+                    idx, common + liquid_fraction * change[compIdx]);
+            }
+            liquid_fraction_with_derivatives.setDerivative(idx, liquid_fraction_derivative);
+        }
+        setPhaseMoleFractions_(fluid_state, FluidSystem::oilPhaseIdx, liquid_composition);
+        setPhaseMoleFractions_(fluid_state, FluidSystem::gasPhaseIdx, vapour_composition);
+        fluid_state.setLvalue(liquid_fraction_with_derivatives);
+    }
+
+    /*!
+     * \brief Michelsen's critical-point distance of a feed,
+     *
+     * \f[ b = \lambda_{\min}(\mathbf B), \qquad
+     *     B_{ij} = \delta_{ij} + \sqrt{z_i z_j}\,
+     *              \frac{\partial \ln\varphi_i}{\partial n_j}, \f]
+     *
+     * the curvature of the Gibbs energy of the feed in the scaled mole
+     * numbers \f$2\sqrt{n_i}\f$ on its stable root (Michelsen 1982;
+     * MultiComponentFlash.jl, michelsen_critical_point_measure!). It is one
+     * for an ideal mixture and vanishes at a critical point or on the
+     * spinodal. Where the fluid system gives the analytic derivatives of
+     * \f$\ln\varphi\f$ in the mole fractions, \f$\partial \ln\varphi_i /
+     * \partial n_j = \partial \ln\varphi_i / \partial x_j - \sum_k z_k
+     * \partial \ln\varphi_i / \partial x_k\f$ at \f$n = z\f$; otherwise
+     * automatic differentiation in the mole numbers.
+     */
+    static Scalar criticalDistance_(const Scalar pressure,
+                                    const Scalar temperature,
+                                    const std::array<Scalar, numComponents>& z,
+                                    const EOSType& eos_type,
+                                    const int phase_idx)
+    {
+        if constexpr (hasFugacityDerivatives_) {
+            CompositionalFluidState<Scalar, FluidSystem> state;
+            state.setPressure(oilPhaseIdx, pressure);
+            state.setPressure(gasPhaseIdx, pressure);
+            state.setTemperature(temperature);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                state.setMoleFraction(phase_idx, compIdx, z[compIdx]);
+            }
+            typename FluidSystem::template ParameterCache<Scalar> param_cache(eos_type);
+            param_cache.updatePhase(state, phase_idx);
+            std::array<Scalar, numComponents> coefficients;
+            std::array<std::array<Scalar, numComponents>, numComponents> derivatives;
+            FluidSystem::fugacityCoefficientsAndDerivatives(
+                state, param_cache, static_cast<unsigned>(phase_idx), coefficients, derivatives);
+            Dune::FieldMatrix<Scalar, numComponents, numComponents> curvature(0.);
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                Scalar weighted = 0.;
+                for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                    weighted += z[otherIdx] * derivatives[compIdx][otherIdx];
+                }
+                for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                    curvature[compIdx][otherIdx] = std::sqrt(z[compIdx] * z[otherIdx])
+                        * (derivatives[compIdx][otherIdx] - weighted);
+                }
+            }
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                for (int otherIdx = 0; otherIdx < compIdx; ++otherIdx) {
+                    const Scalar mean
+                        = 0.5 * (curvature[compIdx][otherIdx] + curvature[otherIdx][compIdx]);
+                    curvature[compIdx][otherIdx] = mean;
+                    curvature[otherIdx][compIdx] = mean;
+                }
+                curvature[compIdx][compIdx] += 1.;
+            }
+            return smallestEigenvalue_(curvature);
+        }
+        using DistanceEval = DenseAd::Evaluation<Scalar, numComponents>;
+        using ParamCache = typename FluidSystem::template ParameterCache<DistanceEval>;
+        CompositionalFluidState<DistanceEval, FluidSystem> state;
+        state.setPressure(oilPhaseIdx, pressure);
+        state.setPressure(gasPhaseIdx, pressure);
+        state.setTemperature(temperature);
+        // The mole numbers n = z carry the derivatives; the phase holds n / sum(n).
+        std::array<DistanceEval, numComponents> moles;
+        DistanceEval total_moles = 0.;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            moles[compIdx] = DistanceEval::createVariable(z[compIdx], compIdx);
+            total_moles += moles[compIdx];
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            state.setMoleFraction(phase_idx, compIdx, moles[compIdx] / total_moles);
+        }
+        ParamCache param_cache(eos_type);
+        param_cache.updatePhase(state, phase_idx);
+        Dune::FieldMatrix<Scalar, numComponents, numComponents> curvature(0.);
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const DistanceEval ln_phi
+                = log(FluidSystem::fugacityCoefficient(state, param_cache, phase_idx, compIdx));
+            for (int otherIdx = 0; otherIdx < numComponents; ++otherIdx) {
+                curvature[compIdx][otherIdx]
+                    = std::sqrt(z[compIdx] * z[otherIdx]) * ln_phi.derivative(otherIdx);
+            }
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            for (int otherIdx = 0; otherIdx < compIdx; ++otherIdx) {
+                const Scalar mean
+                    = 0.5 * (curvature[compIdx][otherIdx] + curvature[otherIdx][compIdx]);
+                curvature[compIdx][otherIdx] = mean;
+                curvature[otherIdx][compIdx] = mean;
+            }
+            curvature[compIdx][compIdx] += 1.;
+        }
+        return smallestEigenvalue_(curvature);
+    }
+
+    /*!
+     * \brief The smallest eigenvalue of a small symmetric matrix, by cyclic
+     *        Jacobi rotations.
+     */
+    template <class Matrix>
+    static Scalar smallestEigenvalue_(Matrix a)
+    {
+        constexpr int size = Matrix::rows;
+        for (int sweep = 0; sweep < 50; ++sweep) {
+            Scalar off_diagonal = 0.;
+            Scalar diagonal = 0.;
+            for (int row = 0; row < size; ++row) {
+                diagonal += a[row][row] * a[row][row];
+                for (int col = row + 1; col < size; ++col) {
+                    off_diagonal += a[row][col] * a[row][col];
+                }
+            }
+            if (!(off_diagonal > 1e-30 * diagonal)) {
+                break;
+            }
+            for (int row = 0; row < size; ++row) {
+                for (int col = row + 1; col < size; ++col) {
+                    if (a[row][col] == 0.) {
+                        continue;
+                    }
+                    // The rotation that annihilates a[row][col].
+                    const Scalar theta = (a[col][col] - a[row][row]) / (2. * a[row][col]);
+                    const Scalar t = (theta >= 0. ? 1. : -1.)
+                        / (std::abs(theta) + std::sqrt(theta * theta + 1.));
+                    const Scalar c = 1. / std::sqrt(t * t + 1.);
+                    const Scalar s = t * c;
+                    for (int k = 0; k < size; ++k) {
+                        const Scalar a_kr = a[k][row];
+                        const Scalar a_kc = a[k][col];
+                        a[k][row] = c * a_kr - s * a_kc;
+                        a[k][col] = s * a_kr + c * a_kc;
+                    }
+                    for (int k = 0; k < size; ++k) {
+                        const Scalar a_rk = a[row][k];
+                        const Scalar a_ck = a[col][k];
+                        a[row][k] = c * a_rk - s * a_ck;
+                        a[col][k] = s * a_rk + c * a_ck;
+                    }
+                }
+            }
+        }
+        Scalar smallest = a[0][0];
+        for (int row = 1; row < size; ++row) {
+            smallest = std::min(smallest, a[row][row]);
+        }
+        return smallest;
+    }
+
+    /*!
+     * \brief Whether a cell that comes in single-phase stays single-phase
+     *        without a stability test, from the memory of its last test.
+     *
+     * The memory holds the state of the last test that found the feed stable
+     * and how decisive it was (Rasmussen, Krejbjerg, Michelsen, Bjurstrom,
+     * SPE REE 9 (2006): the shadow region; Michelsen 1982):
+     *
+     * - both trials collapsed onto the feed (outside the shadow region): with
+     *   the critical distance \f$b\f$ of the tested state (criticalDistance_()),
+     *   \f$t\,(|\Delta p| / p + \max_i |\Delta z_i|) + |\Delta T| / w < b\f$
+     *   (T in K), t = stabilityBypassTolerance and
+     *   w = stabilityBypassTemperatureWindow: the windows of the
+     *   critical-distance bypass of MultiComponentFlash.jl, with the moves
+     *   added. As \f$b \le 1\f$, a state outside the window for \f$b = 1\f$
+     *   is rejected before \f$b\f$ is computed, once, at the tested state.
+     * - a trial found a stationary point above the tangent plane (inside the
+     *   shadow region): its tangent-plane distance \f$m = -\ln S\f$, the
+     *   margin, must exceed minimumStabilityMargin and the safety factor
+     *   times the move \f$|\Delta p| / p + \max_i |\Delta z_i| / z_i +
+     *   c_T |\Delta T| / T\f$; to first order a stationary point's distance
+     *   moves by less than the move.
+     *
+     * The tested state does not move on a bypass, so a chain of small steps
+     * cannot drift away from it without a new test. A heuristic, not a
+     * proof.
+     *
+     * \param critical_distance In: that of the memory; out: computed if needed.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static bool stabilityBypass_(const Memory& memory,
+                                 Scalar& critical_distance,
+                                 const FlashFluidState& fluid_state,
+                                 const ComponentVector& z,
+                                 const EOSType& eos_type)
+    {
+        const Scalar pressure = Opm::getValue(fluid_state.pressure(0));
+        const Scalar temperature = Opm::getValue(fluid_state.temperature(0));
+        const Scalar pressure_change = std::abs(pressure - memory.stability_pressure);
+        const Scalar temperature_change = std::abs(temperature - memory.stability_temperature);
+        Scalar composition_change = 0.;
+        Scalar relative_composition_change = 0.;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const Scalar change = std::abs(Opm::getValue(z[compIdx]) - memory.stability_z[compIdx]);
+            composition_change = std::max(composition_change, change);
+            relative_composition_change = std::max(relative_composition_change,
+                                                   change / memory.stability_z[compIdx]);
+        }
+        if (memory.trials_trivial) {
+            // The moves in units of their windows add up: each alone within
+            // its window is not enough.
+            const auto inside = [&](const Scalar distance) {
+                return stabilityBypassTolerance * (pressure_change / pressure + composition_change)
+                    + temperature_change / stabilityBypassTemperatureWindow
+                    < distance;
+            };
+            if (!inside(1.)) {
+                return false;
+            }
+            if (critical_distance < 0.) {
+                const Scalar distance = criticalDistance_(
+                    memory.stability_pressure, memory.stability_temperature, memory.stability_z,
+                    eos_type, memory.stable_phase_idx);
+                critical_distance = std::isfinite(distance) ? distance : 0.;
+            }
+            if (!(critical_distance > 0. && inside(critical_distance))) {
+                return false;
+            }
+            ++memoryTally_().bypass_trivial;
+        }
+        else {
+            const Scalar move = pressure_change / pressure + relative_composition_change
+                + stabilityMarginTemperatureWeight * temperature_change / temperature;
+            if (!(memory.stability_margin > minimumStabilityMargin
+                  && memory.stability_margin > stabilityMarginSafety * move)) {
+                return false;
+            }
+            ++memoryTally_().bypass_margin;
+        }
+        OPM_FLASH_COUNT(cacheHits);
+        return true;
+    }
+
+    //! How a stability test decided, for the memory of a cell.
+    struct StabilityOutcome
+    {
+        bool trials_trivial = false;
+        //! The smallest -ln S of a trial that did not collapse; infinite if none.
+        Scalar margin = std::numeric_limits<Scalar>::infinity();
+    };
+
     static constexpr std::size_t numFlashUnknowns = numMisciblePhases * numMiscibleComponents + 1;
     // x, y and L, then both phase pressures and the temperature.
     using JacobianState = std::array<Scalar, numFlashUnknowns + 3>;
@@ -315,7 +1166,9 @@ protected:
                                           PTFlashMethod twoPhaseMethod,
                                           const Scalar flash_tolerance,
                                           const EOSType& eos_type,
-                                          const int verbosity)
+                                          const int verbosity,
+                                          const Memory* phase_memory = nullptr,
+                                          Memory* next_memory = nullptr)
     {
         std::optional<NewtonJacobian> newton_jacobian;
         // The stable feed root of the last stability test.
@@ -335,18 +1188,45 @@ protected:
         // Here, a cold start means there is no usable previous two-phase split
         // (L is outside (0, 1)); a warm start reuses previous K and L values.
         const bool is_cold_start = L_scalar <= 0 || L_scalar >= 1;
+        // A single-phase cell that was decisively stable at its last test and
+        // has hardly moved since stays single-phase without a test.
+        Scalar critical_distance = -1.;
+        bool stability_bypassed = false;
+        if (phase_memory && phase_memory->has_stability && (L_scalar == 0. || L_scalar == 1.)) {
+            ++memoryTally_().single_phase_in;
+            critical_distance = phase_memory->critical_distance;
+            stability_bypassed = stabilityBypass_(*phase_memory, critical_distance, fluid_state,
+                                                  z_scalar, eos_type);
+        }
+        // The research check (OPM_FLASH_MEMORY=verify): run the test after a
+        // bypass all the same, count the bypasses it contradicts and keep its
+        // answer; the memory is kept as after a bypass.
+        const bool keep_stability_memory = stability_bypassed;
+        const bool verify_bypass = stability_bypassed && memorySettings_().verify;
+        if (verify_bypass) {
+            stability_bypassed = false;
+        }
         // A cold start first tries the split itself; one that lowers the
         // Gibbs energy below the feed's makes the stability test unnecessary.
-        const bool split_from_flash_first = is_cold_start
+        const bool split_from_flash_first = is_cold_start && !stability_bypassed
             && flashFirst_(K_scalar, L_scalar, newton_jacobian, fluid_state, z_scalar,
                            twoPhaseMethod, flash_tolerance, eos_type, verbosity);
-        if (is_cold_start && !split_from_flash_first) {
+        StabilityOutcome stability_outcome;
+        bool stable_by_test = false;
+        if (is_cold_start && !stability_bypassed && !split_from_flash_first) {
             if (verbosity >= 1) {
                 OpmLog::debug("Perform stability test (L <= 0 or L >= 1)!");
             }
             stable_feed_root = phaseStabilityTest_(
-                is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
+                is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity,
+                next_memory ? &stability_outcome : nullptr);
+            stable_by_test = is_single_phase;
+            if (verify_bypass && !is_single_phase) {
+                auto& tally = memoryTally_();
+                ++(phase_memory->trials_trivial ? tally.wrong_trivial : tally.wrong_margin);
+            }
         }
+        is_single_phase = is_single_phase || stability_bypassed;
         if (verbosity >= 1) {
             OpmLog::debug(fmt::format("Inputs after stability test are K = [{}], L = [{}], z = [{}], P = {}, and T = {}",
                                      fmt::join(K_scalar, " "), L_scalar, fmt::join(z_scalar, " "),
@@ -460,10 +1340,8 @@ protected:
         }
         if (is_single_phase) {
             newton_jacobian.reset();
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z_scalar[compIdx]);
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z_scalar[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, z_scalar);
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, z_scalar);
             if (!is_negative_flash) {
                 // A feed whose cubic has a liquid and a vapour root is labelled
                 // by the root with the lower Gibbs energy. A single root larger
@@ -496,6 +1374,37 @@ protected:
             }
         }
         fluid_state.setLvalue(L_scalar);
+
+        // The memory of a decisive stability test, kept while bypasses rely on it.
+        if (next_memory) {
+            Memory& next = *next_memory;
+            auto& tally = memoryTally_();
+            if (keep_stability_memory && is_single_phase) {
+                next.has_stability = true;
+                next.trials_trivial = phase_memory->trials_trivial;
+                next.stable_phase_idx = phase_memory->stable_phase_idx;
+                next.stability_margin = phase_memory->stability_margin;
+                next.critical_distance = critical_distance;
+                next.stability_pressure = phase_memory->stability_pressure;
+                next.stability_temperature = phase_memory->stability_temperature;
+                next.stability_z = phase_memory->stability_z;
+            }
+            else if (stable_by_test) {
+                ++tally.tests;
+                next.has_stability = true;
+                next.trials_trivial = stability_outcome.trials_trivial;
+                next.stable_phase_idx = stable_feed_root->phase_idx;
+                next.stability_margin = stability_outcome.margin;
+                next.critical_distance = -1.;
+                next.stability_pressure = fluid_state.pressure(oilPhaseIdx);
+                next.stability_temperature = fluid_state.temperature(0);
+                for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    next.stability_z[compIdx] = z_scalar[compIdx];
+                }
+                tally.records_trivial += stability_outcome.trials_trivial;
+                tally.records_margin += !stability_outcome.trials_trivial;
+            }
+        }
         return {is_single_phase, newton_jacobian};
     }
 
@@ -556,10 +1465,8 @@ protected:
         constexpr int oil = static_cast<int>(oilPhaseIdx);
         constexpr int gas = static_cast<int>(gasPhaseIdx);
         FlashFluidState feed_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            feed_state.setMoleFraction(oil, compIdx, z[compIdx]);
-            feed_state.setMoleFraction(gas, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(feed_state, oil, z);
+        setPhaseMoleFractions_(feed_state, gas, z);
         // One cache holds both phases, which share the pure-component parameters.
         feed_cache.updatePhase(feed_state, oil);
         feed_cache.updatePhase(feed_state, gas);
@@ -684,10 +1591,8 @@ protected:
             typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
         using PlaneVector = Dune::FieldVector<Scalar, numComponents>;
         FlashFluidState feed_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            feed_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
-            feed_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(feed_state, oilPhaseIdx, z);
+        setPhaseMoleFractions_(feed_state, gasPhaseIdx, z);
         std::optional<PlaneVector> plane;
         Scalar plane_gibbs = 0.0;
         // One cache for both roots: temperature and pressure are fixed.
@@ -862,6 +1767,15 @@ protected:
                     K = trial_K;
                     L = trial_L;
                     newton_jacobian = std::move(jacobian);
+                    // Substitution from Wilson's ratios reaches a stationary
+                    // point below the feed, not necessarily the stable split:
+                    // where the liquid is unstable, the split from the
+                    // stability test of the feed replaces it if its Gibbs
+                    // energy is lower.
+                    if (!liquidPhaseIsStable_(fluid_state, incoming_state, eos_type, verbosity)) {
+                        replaceByLowerSplit_(K, L, newton_jacobian, fluid_state, incoming_state, z,
+                                             twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+                    }
                     return true;
                 }
             }
@@ -872,6 +1786,133 @@ protected:
         }
         fluid_state = incoming_state;
         return false;
+    }
+
+    /*!
+     * \brief The Gibbs energy of a split relative to RT,
+     *        \f$\sum_\alpha n_\alpha \sum_i w_{\alpha i} \ln (w_{\alpha i} \varphi_{\alpha i})\f$,
+     *        with \f$n\f$ = L for the liquid and 1 - L for the vapour.
+     */
+    template <class FlashFluidState>
+    static Scalar splitGibbsEnergy_(FlashFluidState& fluid_state,
+                                    const Scalar L,
+                                    const EOSType& eos_type)
+    {
+        using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
+        ParamCache param_cache(eos_type);
+        Scalar energy = 0.0;
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx), static_cast<unsigned>(gasPhaseIdx)}) {
+            OPM_FLASH_COUNT(eosUpdates);
+            param_cache.updatePhase(fluid_state, phaseIdx);
+            updateFugacityCoefficients_(fluid_state, param_cache, phaseIdx);
+            const Scalar amount = phaseIdx == static_cast<unsigned>(oilPhaseIdx) ? L : 1.0 - L;
+            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const Scalar w = Opm::getValue(fluid_state.moleFraction(phaseIdx, compIdx));
+                if (w > 0.) {
+                    const Scalar phi = Opm::getValue(fluid_state.fugacityCoefficient(phaseIdx, compIdx));
+                    energy += amount * w * std::log(w * phi);
+                }
+            }
+        }
+        return energy;
+    }
+
+    /*!
+     * \brief The split from the stability test of the feed in place of a
+     *        given one (K, L, the fluid state and the Newton Jacobian) when
+     *        its Gibbs energy is lower. The given split is kept when the test
+     *        finds the feed stable or its split fails.
+     */
+    template <class FlashFluidState, class ComponentVector>
+    static void replaceByLowerSplit_(ComponentVector& K,
+                                     typename FlashFluidState::ValueType& L,
+                                     std::optional<NewtonJacobian>& newton_jacobian,
+                                     FlashFluidState& fluid_state,
+                                     const FlashFluidState& incoming_state,
+                                     const ComponentVector& z,
+                                     const PTFlashMethod twoPhaseMethod,
+                                     const Scalar flash_tolerance,
+                                     const EOSType& eos_type,
+                                     const int verbosity)
+    {
+        FlashFluidState other_state = incoming_state;
+        ComponentVector other_K;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            other_K[compIdx] = incoming_state.K(compIdx);
+        }
+        bool feed_is_stable = false;
+        phaseStabilityTest_(feed_is_stable, other_K, other_state, z, eos_type, verbosity);
+        if (feed_is_stable) {
+            return;
+        }
+        try {
+            OPM_FLASH_COUNT(rachfordRiceSolves);
+            typename FlashFluidState::ValueType other_L = RachfordRice::solve(other_K, z, 0);
+            if (!(other_L > 0. && other_L < 1.)) {
+                return;
+            }
+            auto other_jacobian = flash_2ph(z, twoPhaseMethod, other_K, other_L, other_state,
+                                            flash_tolerance, eos_type, verbosity);
+            const Scalar other_fraction = Opm::getValue(other_L);
+            if (!(other_fraction > 0. && other_fraction < 1.) || phasesCoincide_(other_state)) {
+                return;
+            }
+            FlashFluidState given_state = fluid_state;
+            if (splitGibbsEnergy_(other_state, other_fraction, eos_type)
+                < splitGibbsEnergy_(given_state, Opm::getValue(L), eos_type) - stabilityTolerance) {
+                K = other_K;
+                L = other_L;
+                newton_jacobian = std::move(other_jacobian);
+                fluid_state = other_state;
+            }
+        }
+        catch (const NumericalProblem&) {
+        }
+        catch (const Dune::FMatrixError&) {
+        }
+    }
+
+    /*!
+     * \brief Whether a liquid-like trial phase grown from the liquid of a
+     *        converged split, with the ratios of the incoming state, finds
+     *        it stable.
+     *
+     * A split below the Gibbs energy of the feed proves the feed unstable,
+     * but the split that substitution reaches from Wilson's ratios is only a
+     * stationary point: where the feed can split in more than one way (two
+     * liquids, or a vapour with either liquid), it can be one with a higher
+     * Gibbs energy than the stable split. The phases of the stable split
+     * share a tangent plane that no composition lies below, so a liquid that
+     * is unstable marks a split that may not be the stable one (or a feed
+     * with three phases). The split from Wilson's ratios is a vapour and a
+     * light liquid, and the phase it misses is a denser liquid, which the
+     * liquid-like trial finds; a vapour-like trial adds nothing on the
+     * stress test of random fluids (bench/stress3.cpp) and costs as much.
+     */
+    template <class FlashFluidState>
+    static bool liquidPhaseIsStable_(const FlashFluidState& fluid_state,
+                                     const FlashFluidState& incoming_state,
+                                     const EOSType& eos_type,
+                                     const int verbosity)
+    {
+        FlashFluidState liquid_state = fluid_state;
+        Dune::FieldVector<Scalar, numComponents> liquid, trial_K;
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            liquid[compIdx] = Opm::getValue(fluid_state.moleFraction(oilPhaseIdx, compIdx));
+            trial_K[compIdx] = Opm::getValue(incoming_state.K(compIdx));
+        }
+        using ValueType = typename FlashFluidState::ValueType;
+        using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
+        ParamCache param_cache(eos_type);
+        std::array<ValueType, numComponents> reference_coefficients;
+        const FeedRoot root = feedStableRoot_(liquid_state, liquid, param_cache, reference_coefficients);
+        bool is_trivial = false;
+        Dune::FieldVector<Scalar, numComponents> trial_composition;
+        ValueType trial_sum = 0.0;
+        checkStability_(liquid_state, is_trivial, trial_K, trial_composition, trial_sum, liquid,
+                        /*is_vapour_trial=*/false, root.phase_idx, reference_coefficients, param_cache,
+                        verbosity);
+        return is_trivial || trial_sum < 1.0 + stabilityTolerance;
     }
 
     /*!
@@ -889,10 +1930,13 @@ protected:
      * \param z The mixture composition.
      * \param eos_type The equation of state.
      * \param verbosity Level of debug logging.
+     * \param[out] outcome If given, whether both trials collapsed onto the
+     *        feed, and the smallest tangent-plane distance of the others.
      * \return The stable cubic root of the feed, which labels a stable one.
      */
     template <class FlashFluidState, class ComponentVector>
-    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity)
+    static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity,
+                                        StabilityOutcome* outcome = nullptr)
     {
         OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
@@ -949,12 +1993,20 @@ protected:
 
         // Neither trial phase found a negative tangent-plane distance.
         isStable = liquid_trial_finds_no_instability && vapour_trial_finds_no_instability;
+        if (outcome != nullptr) {
+            outcome->trials_trivial = liquid_trial_is_trivial && vapour_trial_is_trivial;
+            outcome->margin = std::numeric_limits<Scalar>::infinity();
+            if (!liquid_trial_is_trivial) {
+                outcome->margin = std::min(outcome->margin, -std::log(Opm::getValue(liquid_trial_sum)));
+            }
+            if (!vapour_trial_is_trivial) {
+                outcome->margin = std::min(outcome->margin, -std::log(Opm::getValue(vapour_trial_sum)));
+            }
+        }
         if (isStable) {
             // A single phase has the feed composition under either phase label.
-            for (int compIdx=0; compIdx<numComponents; ++compIdx){
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, z[compIdx]);
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, z[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, z);
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, z);
         }
         // The two stationary trial compositions seed the equilibrium ratios.
         else {
@@ -972,7 +2024,7 @@ protected:
             // collapse the split. The feed is then the other phase. The trial
             // is the vapour if it is richer than the feed in the components
             // with the larger starting ratios, else the liquid.
-            if (trivialSolutionMeasure_(K) < trivialSolutionTolerance) {
+            if (isTrivialSolution_(K)) {
                 const auto& trial_composition = vapour_trial_sum > liquid_trial_sum
                     ? vapour_trial_composition : liquid_trial_composition;
                 Scalar lightness = 0.;
@@ -1008,6 +2060,29 @@ protected:
             measure += log_ratio * log_ratio;
         }
         return measure;
+    }
+
+    /*!
+     * \brief Whether trivialSolutionMeasure_() is below
+     *        trivialSolutionTolerance.
+     *
+     * A single ratio outside [0.99, 1.01] puts the measure above
+     * \f$\ln^2 1.01 > 9.9 \cdot 10^{-5}\f$, and so above the tolerance; the
+     * logarithms are taken only where all ratios are inside. The answer is
+     * that of the measure.
+     */
+    template <class ComponentVector>
+    static bool isTrivialSolution_(const ComponentVector& equilibrium_ratios)
+    {
+        static_assert(trivialSolutionTolerance < 9.9e-5,
+                      "the band [0.99, 1.01] must lie inside the trivial-solution tolerance");
+        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+            const Scalar equilibrium_ratio = Opm::getValue(equilibrium_ratios[compIdx]);
+            if (!(equilibrium_ratio >= 0.99 && equilibrium_ratio <= 1.01)) {
+                return false;
+            }
+        }
+        return trivialSolutionMeasure_(equilibrium_ratios) < trivialSolutionTolerance;
     }
 
     /*!
@@ -1078,9 +2153,7 @@ protected:
         using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
         FlashFluidState reference_state = fluid_state;
-        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
-        }
+        setPhaseMoleFractions_(reference_state, reference_phase_idx, z);
         ParamCache param_cache(eos_type);
         param_cache.updatePhase(reference_state, reference_phase_idx);
         std::array<FlashEval, numComponents> reference_coefficients;
@@ -1135,8 +2208,8 @@ protected:
         }
 
         // The reference phase is the feed on its stable root throughout.
+        setPhaseMoleFractions_(reference_state, reference_phase_idx, z);
         for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            reference_state.setMoleFraction(reference_phase_idx, compIdx, z[compIdx]);
             reference_state.setFugacityCoefficient(
                 reference_phase_idx, compIdx, reference_coefficients[compIdx]);
         }
@@ -1163,8 +2236,8 @@ protected:
                 trial_composition.begin(), trial_composition.end(), FlashEval(0.0));
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 trial_composition[compIdx] /= trial_sum;
-                trial_state.setMoleFraction(trial_phase_idx, compIdx, trial_composition[compIdx]);
             }
+            setPhaseMoleFractions_(trial_state, trial_phase_idx, trial_composition);
 
             trial_param_cache.updatePhase(trial_state, trial_phase_idx);
 
@@ -1193,15 +2266,21 @@ protected:
             }
 
             // The plain steps in ln K and the modified tangent-plane distance.
+            // Only the extrapolation uses them: the last three plain steps
+            // and tm before it, and tm of the step after it. The first plain
+            // steps after an extrapolation skip their logarithms.
             ComponentVector step(0.);
             FieldType tm = 1. - trial_sum;
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                if (!(Opm::getValue(z[compIdx]) > 0.)) {
-                    continue;
+            if (extrapolated || plain_steps + 3 >= stabilityAccelerationInterval) {
+                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+                    if (!(Opm::getValue(z[compIdx]) > 0.)) {
+                        continue;
+                    }
+                    step[compIdx] = log(substitution_factor[compIdx]);
+                    const FieldType mole_number = trial_sum * trial_composition[compIdx];
+                    tm += is_vapour_trial ? -mole_number * step[compIdx]
+                                          : mole_number * step[compIdx];
                 }
-                step[compIdx] = log(substitution_factor[compIdx]);
-                const FieldType mole_number = trial_sum * trial_composition[compIdx];
-                tm += is_vapour_trial ? -mole_number * step[compIdx] : mole_number * step[compIdx];
             }
             if (extrapolated) {
                 extrapolated = false;
@@ -1224,16 +2303,15 @@ protected:
                 const auto substitution_error = Opm::getValue(substitution_factor[compIdx]) - 1.0;
                 substitution_residual += substitution_error * substitution_error;
             }
-            const Scalar trivial_residual = trivialSolutionMeasure_(K);
 
             // Print iteration info
             if (verbosity >= 3) {
-                OpmLog::debug(fmt::format(
-                    "{:>10}{:>16}{:>16}", iteration, trivial_residual, substitution_residual));
+                OpmLog::debug(fmt::format("{:>10}{:>16}{:>16}", iteration,
+                                          trivialSolutionMeasure_(K), substitution_residual));
             }
 
             // Check convergence
-            isTrivial = (trivial_residual < trivialSolutionTolerance);
+            isTrivial = isTrivialSolution_(K);
             if (isTrivial || substitution_residual < substitutionTolerance) {
                 return;
             }
@@ -1283,10 +2361,8 @@ protected:
         x /= sumx;
         y /= sumy;
 
-        for (int compIdx=0; compIdx<numComponents; ++compIdx){
-            fluid_state.setMoleFraction(oilPhaseIdx, compIdx, x[compIdx]);
-            fluid_state.setMoleFraction(gasPhaseIdx, compIdx, y[compIdx]);
-        }
+        setPhaseMoleFractions_(fluid_state, oilPhaseIdx, x);
+        setPhaseMoleFractions_(fluid_state, gasPhaseIdx, y);
     }
 
     /*!
@@ -1338,6 +2414,34 @@ protected:
 
         case PTFlashMethod::SsiNewton:
             converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, true, flash_tolerance, eos_type, verbosity);
+            if (converged) {
+                // Substitution stops just below the tolerance, so an answer
+                // started next to the solution (a warm start) keeps an error
+                // of the size of the tolerance, and the simulator's Newton
+                // sees it. Newton from there takes the one step that squares
+                // that error (and gives the derivative pass its Jacobian).
+                // Newton may change K, L and the fluid state before it
+                // throws, so a failed step returns the substitution answer.
+                const auto K_substitution = K_scalar;
+                const auto L_substitution = L_scalar;
+                const auto fluid_state_substitution = fluid_state_scalar;
+                const auto keep_substitution_answer = [&]() {
+                    K_scalar = K_substitution;
+                    L_scalar = L_substitution;
+                    fluid_state_scalar = fluid_state_substitution;
+                };
+                try {
+                    newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar,
+                                                         z_scalar, flash_tolerance, eos_type,
+                                                         verbosity);
+                }
+                catch (const NumericalProblem&) {
+                    keep_substitution_answer();
+                }
+                catch (const Dune::FMatrixError&) {
+                    keep_substitution_answer();
+                }
+            }
             if (!converged) {
                 // In this method Newton is an accelerator, not the
                 // guarantee: when its composition update fails to converge —
@@ -1455,8 +2559,7 @@ protected:
             ++active_components;
             equilibrium_ratios[compIdx] = vapour_mole_fraction / liquid_mole_fraction;
         }
-        return active_components >= 2
-            && trivialSolutionMeasure_(equilibrium_ratios) < trivialSolutionTolerance;
+        return active_components >= 2 && isTrivialSolution_(equilibrium_ratios);
     }
 
     //! Whether the fluid system gives, with the fugacity coefficients of a
@@ -1470,6 +2573,31 @@ protected:
               FluidSystem::fugacityCoefficientsAndDerivatives(
                   fluid_state, param_cache, 0u, coefficients, derivatives);
           };
+
+    //! Whether the fluid system also gives the pressure derivatives of the
+    //! logarithms of the fugacity coefficients; see analyticFugacityJacobians_().
+    static constexpr bool hasFugacityPressureDerivatives_
+        = requires(const CompositionalFluidState<Scalar, FluidSystem>& fluid_state,
+                   const typename FluidSystem::template ParameterCache<Scalar>& param_cache,
+                   std::array<Scalar, numComponents>& coefficients,
+                   std::array<std::array<Scalar, numComponents>, numComponents>& derivatives) {
+              FluidSystem::fugacityCoefficientsAndDerivatives(
+                  fluid_state, param_cache, 0u, coefficients, derivatives, coefficients);
+          };
+    //! ... and the temperature derivatives.
+    static constexpr bool hasFugacityTemperatureDerivatives_
+        = requires(const CompositionalFluidState<Scalar, FluidSystem>& fluid_state,
+                   const typename FluidSystem::template ParameterCache<Scalar>& param_cache,
+                   std::array<Scalar, numComponents>& coefficients,
+                   std::array<std::array<Scalar, numComponents>, numComponents>& derivatives) {
+              FluidSystem::fugacityCoefficientsAndDerivatives(
+                  fluid_state, param_cache, 0u, coefficients, derivatives, coefficients,
+                  coefficients);
+          };
+    //! Whether the fluid system gives the derivatives in the state variables
+    //! of the flash: pressure [and temperature].
+    static constexpr bool hasFugacityStateDerivatives_
+        = isThermal ? hasFugacityTemperatureDerivatives_ : hasFugacityPressureDerivatives_;
 
     /*!
      * \brief Solves \f$(H + s\,\mathrm{diag}(d))\,\Delta = r\f$ for the
@@ -1629,10 +2757,8 @@ protected:
                 liquid_composition[present[a]] = (feed[a] - vapour[a]) / liquid_moles;
                 vapour_composition[present[a]] = vapour[a] / vapour_moles;
             }
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fluid_state.setMoleFraction(oilPhaseIdx, compIdx, liquid_composition[compIdx]);
-                fluid_state.setMoleFraction(gasPhaseIdx, compIdx, vapour_composition[compIdx]);
-            }
+            setPhaseMoleFractions_(fluid_state, oilPhaseIdx, liquid_composition);
+            setPhaseMoleFractions_(fluid_state, gasPhaseIdx, vapour_composition);
             liquid_fraction = liquid_moles / (liquid_moles + vapour_moles);
         };
 
@@ -2126,53 +3252,26 @@ protected:
                                  const EOSType& eos_type)
     {
         constexpr std::size_t liquid_fraction_idx = numFlashUnknowns - 1;
-        using Vector = std::array<Scalar, numComponents>;
-        using Matrix = std::array<Vector, numComponents>;
-        CompositionalFluidState<Scalar, FluidSystem> state;
-        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
-                                        static_cast<unsigned>(gasPhaseIdx)}) {
-            state.setPressure(phaseIdx, Opm::getValue(fluid_state_scalar.pressure(phaseIdx)));
-            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                state.setMoleFraction(
-                    phaseIdx, compIdx,
-                    Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx)));
-            }
-        }
-        state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
+        ComponentMatrix liquid_jacobian;
+        ComponentMatrix vapour_jacobian;
+        analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian);
         const Scalar liquid_fraction = Opm::getValue(fluid_state_scalar.L());
-        const Scalar pref = state.pressure(oilPhaseIdx);
 
         Dune::FieldMatrix<Scalar, numFlashUnknowns, numFlashUnknowns> jacobian(0.);
-        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
-        ParamCache param_cache(eos_type);
-        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
-                                        static_cast<unsigned>(gasPhaseIdx)}) {
-            param_cache.updatePhase(state, phaseIdx);
-            Vector coefficients;
-            Matrix derivatives;
-            FluidSystem::fugacityCoefficientsAndDerivatives(
-                state, param_cache, phaseIdx, coefficients, derivatives);
-            // d(f_i / p_ref)/dw_j of the phase, w its mole fractions; the
-            // vapour fugacity enters the residual with a minus sign.
-            const bool liquid = phaseIdx == static_cast<unsigned>(oilPhaseIdx);
-            const Scalar sign = liquid ? 1. : -1.;
-            const unsigned offset = liquid ? 0 : numComponents;
-            const Scalar pressure_ratio = state.pressure(phaseIdx) / pref;
-            for (unsigned i = 0; i < numComponents; ++i) {
-                const Scalar scaled = sign * pressure_ratio * coefficients[i];
-                const Scalar w = state.moleFraction(phaseIdx, i);
-                for (unsigned j = 0; j < numComponents; ++j) {
-                    jacobian[numComponents + i][offset + j] = scaled * w * derivatives[i][j];
-                }
-                jacobian[numComponents + i][offset + i] += scaled;
+        for (unsigned i = 0; i < numComponents; ++i) {
+            // The vapour fugacity enters the residual with a minus sign.
+            for (unsigned j = 0; j < numComponents; ++j) {
+                jacobian[numComponents + i][j] = liquid_jacobian[i][j];
+                jacobian[numComponents + i][numComponents + j] = -vapour_jacobian[i][j];
             }
         }
         for (unsigned i = 0; i < numComponents; ++i) {
             // z_i - L x_i - (1 - L) y_i, as -z_i + L x_i + (1 - L) y_i
             jacobian[i][i] = liquid_fraction;
             jacobian[i][numComponents + i] = 1. - liquid_fraction;
-            jacobian[i][liquid_fraction_idx] = state.moleFraction(oilPhaseIdx, i)
-                - state.moleFraction(gasPhaseIdx, i);
+            jacobian[i][liquid_fraction_idx]
+                = Opm::getValue(fluid_state_scalar.moleFraction(oilPhaseIdx, i))
+                - Opm::getValue(fluid_state_scalar.moleFraction(gasPhaseIdx, i));
             // sum x - sum y
             jacobian[liquid_fraction_idx][i] = 1.;
             jacobian[liquid_fraction_idx][numComponents + i] = -1.;
@@ -2274,6 +3373,119 @@ protected:
     using FugacityStateColumns = Dune::FieldMatrix<Scalar, numComponents, numStateColumns>;
 
     /*!
+     * \brief The composition blocks of fugacityDerivatives_() on values, from
+     *        the analytic composition derivatives of the fugacity
+     *        coefficients of the fluid system:
+     *        \f$A^L = \partial (f^L / p) / \partial \mathbf x\f$ and
+     *        \f$A^V = \partial (f^V / p) / \partial \mathbf y\f$, with
+     *        \f$\partial (f_i / p) / \partial w_j = (p_\alpha / p)\, \phi_i
+     *        (\delta_{ij} + w_i\, \partial \ln\phi_i / \partial w_j)\f$
+     *        for the mole fractions \f$\mathbf w\f$ of phase \f$\alpha\f$.
+     *
+     * With \p fugacity_state, for both phases at one pressure and a fluid
+     * system that gives the pressure [and temperature] derivatives of
+     * \f$\ln\phi\f$, also the state columns of fugacityDerivatives_(),
+     * \f$G = \partial ((f^L - f^V) / p) / \partial (p, T)\f$ with
+     * \f$\partial f_i / \partial p = w_i \phi_i (1 + p\, \partial \ln\phi_i / \partial p)\f$
+     * and \f$\partial f_i / \partial T = w_i \phi_i\, p\, \partial \ln\phi_i / \partial T\f$.
+     */
+    template <typename FlashFluidStateScalar>
+    static void analyticFugacityJacobians_(const FlashFluidStateScalar& fluid_state_scalar,
+                                           const EOSType& eos_type,
+                                           ComponentMatrix& liquid_jacobian,
+                                           ComponentMatrix& vapour_jacobian,
+                                           FugacityStateColumns* fugacity_state = nullptr)
+    {
+        using Vector = std::array<Scalar, numComponents>;
+        using Matrix = std::array<Vector, numComponents>;
+        CompositionalFluidState<Scalar, FluidSystem> state;
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            state.setPressure(phaseIdx, Opm::getValue(fluid_state_scalar.pressure(phaseIdx)));
+            Vector mole_fractions;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                mole_fractions[compIdx]
+                    = Opm::getValue(fluid_state_scalar.moleFraction(phaseIdx, compIdx));
+            }
+            setPhaseMoleFractions_(state, phaseIdx, mole_fractions);
+        }
+        state.setTemperature(Opm::getValue(fluid_state_scalar.temperature(0)));
+        const Scalar pref = state.pressure(oilPhaseIdx);
+
+        using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+        ParamCache param_cache(eos_type);
+        for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
+                                        static_cast<unsigned>(gasPhaseIdx)}) {
+            param_cache.updatePhase(state, phaseIdx);
+            Vector coefficients;
+            Matrix derivatives;
+            Vector pressure_derivatives;
+            [[maybe_unused]] Vector temperature_derivatives;
+            if constexpr (hasFugacityStateDerivatives_) {
+                if (fugacity_state) {
+                    if constexpr (isThermal) {
+                        FluidSystem::fugacityCoefficientsAndDerivatives(
+                            state, param_cache, phaseIdx, coefficients, derivatives,
+                            pressure_derivatives, temperature_derivatives);
+                    }
+                    else {
+                        FluidSystem::fugacityCoefficientsAndDerivatives(
+                            state, param_cache, phaseIdx, coefficients, derivatives,
+                            pressure_derivatives);
+                    }
+                }
+                else {
+                    FluidSystem::fugacityCoefficientsAndDerivatives(
+                        state, param_cache, phaseIdx, coefficients, derivatives);
+                }
+            }
+            else {
+                FluidSystem::fugacityCoefficientsAndDerivatives(
+                    state, param_cache, phaseIdx, coefficients, derivatives);
+            }
+            const bool liquid = phaseIdx == static_cast<unsigned>(oilPhaseIdx);
+            ComponentMatrix& jacobian = liquid ? liquid_jacobian : vapour_jacobian;
+            const Scalar pressure_ratio = state.pressure(phaseIdx) / pref;
+            for (unsigned i = 0; i < numComponents; ++i) {
+                const Scalar scaled = pressure_ratio * coefficients[i];
+                const Scalar w = state.moleFraction(phaseIdx, i);
+                for (unsigned j = 0; j < numComponents; ++j) {
+                    jacobian[i][j] = scaled * w * derivatives[i][j];
+                }
+                jacobian[i][i] += scaled;
+            }
+            if constexpr (hasFugacityStateDerivatives_) {
+                if (fugacity_state) {
+                    for (unsigned i = 0; i < numComponents; ++i) {
+                        const Scalar w = state.moleFraction(phaseIdx, i);
+                        const Scalar column = w * coefficients[i]
+                            * (1.0 + pref * pressure_derivatives[i]) / pref;
+                        (*fugacity_state)[i][0] = liquid ? column : (*fugacity_state)[i][0] - column;
+                        if constexpr (isThermal) {
+                            const Scalar temperature_column
+                                = w * coefficients[i] * temperature_derivatives[i];
+                            (*fugacity_state)[i][1] = liquid
+                                ? temperature_column
+                                : (*fugacity_state)[i][1] - temperature_column;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //! Whether analyticFugacityJacobians_() gives the state column too.
+    template <typename FlashFluidStateScalar>
+    static bool hasAnalyticStateColumn_(const FlashFluidStateScalar& fluid_state_scalar)
+    {
+        if constexpr (hasFugacityStateDerivatives_) {
+            return Opm::getValue(fluid_state_scalar.pressure(oilPhaseIdx))
+                == Opm::getValue(fluid_state_scalar.pressure(gasPhaseIdx));
+        }
+        return false;
+    }
+
+    /*!
      * \brief The fugacity rows of the Jacobians of the flash residuals at a
      *        converged scalar state: \f$G = \partial ((f^L - f^V) / p) /
      *        \partial (p, T)\f$, and with \p withComposition also
@@ -2287,37 +3499,39 @@ protected:
      * again with the N + 1 [N + 2] of the state Jacobian. The entries are
      * those assembleNewton_() gives, to the last bit.
      */
-    template <bool withComposition, typename FlashFluidStateScalar>
+    template <bool withComposition, int stateColumns = numStateColumns, typename FlashFluidStateScalar>
     static void fugacityDerivatives_(const FlashFluidStateScalar& fluid_state_scalar,
                                      const EOSType& eos_type,
                                      ComponentMatrix& liquid_jacobian,
                                      ComponentMatrix& vapour_jacobian,
-                                     FugacityStateColumns& fugacity_state)
+                                     Dune::FieldMatrix<Scalar, numComponents, stateColumns>& fugacity_state)
     {
         constexpr int num_composition_vars = withComposition ? numComponents : 0;
-        using Eval = DenseAd::Evaluation<Scalar, num_composition_vars + numStateColumns>;
+        using Eval = DenseAd::Evaluation<Scalar, num_composition_vars + stateColumns>;
         CompositionalFluidState<Eval, FluidSystem> state;
         const Scalar pressure = fluid_state_scalar.pressure(FluidSystem::oilPhaseIdx);
         const Eval pressure_variable = Eval::createVariable(pressure, num_composition_vars);
         state.setPressure(FluidSystem::oilPhaseIdx, pressure_variable);
         state.setPressure(FluidSystem::gasPhaseIdx, pressure_variable);
-        if constexpr (isThermal) {
+        if constexpr (stateColumns == 2) {
             state.setTemperature(
                 Eval::createVariable(fluid_state_scalar.temperature(0), num_composition_vars + 1));
         }
         else {
             state.setTemperature(Eval(fluid_state_scalar.temperature(0)));
         }
+        std::array<Eval, numComponents> liquid_composition;
+        std::array<Eval, numComponents> vapour_composition;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            Eval liquid_mole_fraction = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx);
-            Eval vapour_mole_fraction = fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
+            liquid_composition[compIdx] = fluid_state_scalar.moleFraction(oilPhaseIdx, compIdx);
+            vapour_composition[compIdx] = fluid_state_scalar.moleFraction(gasPhaseIdx, compIdx);
             if constexpr (withComposition) {
-                liquid_mole_fraction.setDerivative(compIdx, 1.0);
-                vapour_mole_fraction.setDerivative(compIdx, 1.0);
+                liquid_composition[compIdx].setDerivative(compIdx, 1.0);
+                vapour_composition[compIdx].setDerivative(compIdx, 1.0);
             }
-            state.setMoleFraction(FluidSystem::oilPhaseIdx, compIdx, liquid_mole_fraction);
-            state.setMoleFraction(FluidSystem::gasPhaseIdx, compIdx, vapour_mole_fraction);
         }
+        setPhaseMoleFractions_(state, FluidSystem::oilPhaseIdx, liquid_composition);
+        setPhaseMoleFractions_(state, FluidSystem::gasPhaseIdx, vapour_composition);
         using ParamCache = typename FluidSystem::template ParameterCache<Eval>;
         ParamCache param_cache(eos_type);
         for (unsigned phase_idx = 0; phase_idx < numMisciblePhases; ++phase_idx) {
@@ -2328,7 +3542,7 @@ protected:
             const Eval liquid_fugacity = state.fugacity(FluidSystem::oilPhaseIdx, row);
             const Eval vapour_fugacity = state.fugacity(FluidSystem::gasPhaseIdx, row);
             const Eval fugacity_difference = (liquid_fugacity - vapour_fugacity) / pressure;
-            for (int col = 0; col < numStateColumns; ++col) {
+            for (int col = 0; col < stateColumns; ++col) {
                 fugacity_state[row][col]
                     = fugacity_difference.derivative(num_composition_vars + col);
             }
@@ -2367,13 +3581,19 @@ protected:
      *   = \begin{pmatrix} (A^L - A^V)\, d\mathbf z + G\, d(p, T) \\ 0 \end{pmatrix}: \f]
      * the solution of the full system, from a factorisation of order
      * \f$N + 1\f$ instead of \f$2N + 1\f$.
+     *
+     * With a record, the factorisation also gives the solution for a unit
+     * change of each of \f$p\f$, [\f$T\f$,] and \f$z_j\f$, the sensitivities a
+     * Memory keeps. A temperature column beyond the caller's (stateColumns
+     * of two for an isothermal flash) only enters the record.
      */
-    template <typename FlashFluidStateScalar, typename FluidState>
+    template <int stateColumns = numStateColumns, typename FlashFluidStateScalar, typename FluidState>
     static void setReducedDerivatives_(const FlashFluidStateScalar& fluid_state_scalar,
                                        FluidState& fluid_state,
                                        const ComponentMatrix& liquid_jacobian,
                                        const ComponentMatrix& vapour_jacobian,
-                                       const FugacityStateColumns& fugacity_state)
+                                       const Dune::FieldMatrix<Scalar, numComponents, stateColumns>& fugacity_state,
+                                       Memory* record = nullptr)
     {
         using InputEval = typename FluidState::ValueType;
         constexpr int num_reduced = numComponents + 1;
@@ -2401,6 +3621,34 @@ protected:
         reduced[numComponents][numComponents] = 0.0;
         std::array<int, num_reduced> pivots;
         luFactor_(reduced, pivots);
+
+        if (record != nullptr) {
+            // Columns p, T, z_0 .. z_{N-1}; no temperature column without one.
+            record->split_has_temperature = stateColumns == 2;
+            for (unsigned col = 0; col < numComponents + 2; ++col) {
+                Dune::FieldVector<Scalar, num_reduced> rhs(0.0);
+                if (col < 2) {
+                    if (static_cast<int>(col) >= stateColumns) {
+                        for (unsigned row = 0; row < num_reduced; ++row) {
+                            record->sensitivity[row][col] = 0.0;
+                        }
+                        continue;
+                    }
+                    for (unsigned row = 0; row < numComponents; ++row) {
+                        rhs[row] = fugacity_state[row][col];
+                    }
+                }
+                else {
+                    for (unsigned row = 0; row < numComponents; ++row) {
+                        rhs[row] = difference[row][col - 2];
+                    }
+                }
+                luSolve_(reduced, pivots, rhs);
+                for (unsigned row = 0; row < num_reduced; ++row) {
+                    record->sensitivity[row][col] = rhs[row];
+                }
+            }
+        }
 
         std::array<InputEval, numComponents> liquid_composition;
         std::array<InputEval, numComponents> vapour_composition;
@@ -2459,12 +3707,8 @@ protected:
             liquid_fraction_with_derivatives.setDerivative(idx, liquid_fraction_derivative);
         }
 
-        for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            fluid_state.setMoleFraction(
-                FluidSystem::oilPhaseIdx, compIdx, liquid_composition[compIdx]);
-            fluid_state.setMoleFraction(
-                FluidSystem::gasPhaseIdx, compIdx, vapour_composition[compIdx]);
-        }
+        setPhaseMoleFractions_(fluid_state, FluidSystem::oilPhaseIdx, liquid_composition);
+        setPhaseMoleFractions_(fluid_state, FluidSystem::gasPhaseIdx, vapour_composition);
         fluid_state.setLvalue(liquid_fraction_with_derivatives);
     }
 
@@ -2483,18 +3727,39 @@ protected:
      * gives those of \f$\mathbf u\f$. A Newton solve that converged at exactly
      * this state already assembled \f$\partial F / \partial \mathbf u\f$.
      */
-    template <typename FlashFluidStateScalar, typename FluidState>
+    template <int stateColumns = numStateColumns, typename FlashFluidStateScalar, typename FluidState>
     static void updateDerivativesTwoPhase_(const FlashFluidStateScalar& fluid_state_scalar,
                                            FluidState& fluid_state,
                                            const EOSType& eos_type,
-                                           const std::optional<NewtonJacobian>& newton_jacobian)
+                                           const std::optional<NewtonJacobian>& newton_jacobian,
+                                           Memory* record = nullptr)
     {
+        static_assert(stateColumns >= numStateColumns && stateColumns <= 2);
         ComponentMatrix liquid_jacobian;
         ComponentMatrix vapour_jacobian;
-        FugacityStateColumns fugacity_state;
+        Dune::FieldMatrix<Scalar, numComponents, stateColumns> fugacity_state;
+        // The fluid system gives the caller's state columns in closed form; a
+        // temperature column beyond them (stateColumns of two for an
+        // isothermal flash, for a record only) needs automatic differentiation.
+        constexpr bool analytic_state_columns
+            = hasFugacityStateDerivatives_ && stateColumns == numStateColumns;
         if (newton_jacobian && newton_jacobian->state == jacobianState_(fluid_state_scalar)) {
             // Newton assembled the fugacity rows of dF/du at this state; only
             // those of dF/ds remain.
+            bool analytic_column = false;
+            if constexpr (analytic_state_columns) {
+                if (hasAnalyticStateColumn_(fluid_state_scalar)) {
+                    ComponentMatrix unused_liquid;
+                    ComponentMatrix unused_vapour;
+                    analyticFugacityJacobians_(fluid_state_scalar, eos_type, unused_liquid,
+                                               unused_vapour, &fugacity_state);
+                    analytic_column = true;
+                }
+            }
+            if (!analytic_column) {
+                fugacityDerivatives_<false, stateColumns>(
+                    fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+            }
             const auto& jacobian = newton_jacobian->jacobian;
             for (unsigned row = 0; row < numComponents; ++row) {
                 for (unsigned col = 0; col < numComponents; ++col) {
@@ -2502,15 +3767,32 @@ protected:
                     vapour_jacobian[row][col] = -jacobian[numComponents + row][numComponents + col];
                 }
             }
-            fugacityDerivatives_<false>(
-                fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+        }
+        else if constexpr (hasFugacityDerivatives_) {
+            // The fugacity rows of dF/du on values; only those of dF/ds need
+            // automatic differentiation.
+            bool analytic_column = false;
+            if constexpr (analytic_state_columns) {
+                if (hasAnalyticStateColumn_(fluid_state_scalar)) {
+                    // And the column of dF/ds too.
+                    analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
+                                               vapour_jacobian, &fugacity_state);
+                    analytic_column = true;
+                }
+            }
+            if (!analytic_column) {
+                analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
+                                           vapour_jacobian);
+                fugacityDerivatives_<false, stateColumns>(
+                    fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
+            }
         }
         else {
-            fugacityDerivatives_<true>(
+            fugacityDerivatives_<true, stateColumns>(
                 fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
         }
-        setReducedDerivatives_(
-            fluid_state_scalar, fluid_state, liquid_jacobian, vapour_jacobian, fugacity_state);
+        setReducedDerivatives_<stateColumns>(fluid_state_scalar, fluid_state, liquid_jacobian,
+                                             vapour_jacobian, fugacity_state, record);
     } //end updateDerivativesTwoPhase
 
     /*!
@@ -2586,10 +3868,12 @@ protected:
         InputEval liquid_fraction = fluid_state_scalar.L();
 
         // A single phase uses the overall composition under both phase labels.
+        std::array<InputEval, numComponents> overall_composition;
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-            fluid_state.setMoleFraction(FluidSystem::oilPhaseIdx, compIdx, fluid_state.moleFraction(compIdx) );
-            fluid_state.setMoleFraction(FluidSystem::gasPhaseIdx, compIdx, fluid_state.moleFraction(compIdx) );
+            overall_composition[compIdx] = fluid_state.moleFraction(compIdx);
         }
+        setPhaseMoleFractions_(fluid_state, FluidSystem::oilPhaseIdx, overall_composition);
+        setPhaseMoleFractions_(fluid_state, FluidSystem::gasPhaseIdx, overall_composition);
         fluid_state.setLvalue(liquid_fraction);
     } //end updateDerivativesSinglePhase
 
@@ -2854,15 +4138,19 @@ protected:
                 // The hand-over to Newton, see substitutionStepsBeforeNewton.
                 if (run_newton_afterwards) {
                     const Scalar residual = Opm::getValue(fugacity_residual.two_norm());
-                    const Scalar rate = iteration > 0 ? residual / previous_residual : Scalar{1.};
-                    const Scalar predicted_steps = rate > 0. && rate < 1.
-                        ? std::log(flash_tolerance / residual) / std::log(rate)
-                        : std::numeric_limits<Scalar>::infinity();
-                    previous_residual = residual;
-                    if (!(predicted_steps <= maxPredictedSubstitutionSteps)
-                        && iteration + 1 >= substitutionStepsBeforeNewton) {
-                        break;
+                    // The prediction decides from substitutionStepsBeforeNewton
+                    // steps on; before, its logarithms are not needed.
+                    if (iteration + 1 >= substitutionStepsBeforeNewton) {
+                        const Scalar rate
+                            = iteration > 0 ? residual / previous_residual : Scalar{1.};
+                        const Scalar predicted_steps = rate > 0. && rate < 1.
+                            ? std::log(flash_tolerance / residual) / std::log(rate)
+                            : std::numeric_limits<Scalar>::infinity();
+                        if (!(predicted_steps <= maxPredictedSubstitutionSteps)) {
+                            break;
+                        }
                     }
+                    previous_residual = residual;
                 }
 
                 steps = {step, steps[0], steps[1]};

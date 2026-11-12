@@ -28,6 +28,7 @@
 #include <opm/material/common/Valgrind.hpp>
 
 #include <array>
+#include <cmath>
 #include <type_traits>
 
 namespace Opm
@@ -137,6 +138,84 @@ public:
                                                           Coefficients& fugCoeffs,
                                                           Derivatives& lnPhiDerivatives)
     {
+        Coefficients* noStateDerivatives = nullptr;
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    noStateDerivatives, noStateDerivatives);
+    }
+
+    /*!
+     * \brief computeFugacityCoefficientsAndDerivatives(), and the derivatives
+     *        of the logarithms in pressure at fixed temperature and phase
+     *        composition.
+     *
+     * \f$A_{ij}\f$, \f$B_i\f$ and so \f$A\f$ and \f$B\f$ are proportional to
+     * pressure, so \f$\partial A / \partial p = A / p\f$,
+     * \f$\partial B / \partial p = B / p\f$, and only \f$Z\f$ and the
+     * logarithms move:
+     *
+     * \f[ \frac{\partial \ln\phi_i}{\partial p}
+     *   = \frac{B_i}{B} Z_p - \frac{Z_p - B_p}{Z - B}
+     *   + \frac{A}{(m_1 - m_2) B}
+     *     \left(\frac{Z_p + m_2 B_p}{Z + m_2 B} - \frac{Z_p + m_1 B_p}{Z + m_1 B}\right)
+     *     \left(\frac{2 \sum_j x_j A_{ij}}{A} - \frac{B_i}{B}\right), \f]
+     *
+     * with \f$Z_p\f$ from the cubic, or \f$Z / p\f$ where the molar volume is
+     * at its floor. A coefficient at its limits has no derivative.
+     *
+     * \param lnPhiPressureDerivatives Receives \f$\partial \ln\phi_i / \partial p\f$ at i.
+     */
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void computeFugacityCoefficientsAndDerivatives(const FluidState& fs,
+                                                          const Params& params,
+                                                          unsigned phaseIdx,
+                                                          Coefficients& fugCoeffs,
+                                                          Derivatives& lnPhiDerivatives,
+                                                          Coefficients& lnPhiPressureDerivatives)
+    {
+        Coefficients* noTemperatureDerivatives = nullptr;
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    &lnPhiPressureDerivatives, noTemperatureDerivatives);
+    }
+
+    /*!
+     * \brief computeFugacityCoefficientsAndDerivatives() with the pressure
+     *        derivatives, and the derivatives of the logarithms in temperature
+     *        at fixed pressure and phase composition.
+     *
+     * With \f$a_i = \partial \ln A_i / \partial T\f$ of the parameter cache,
+     * \f$\partial A_{ij} / \partial T = A_{ij} (a_i + a_j) / 2\f$, so
+     * \f$A_T = \sum_i x_i a_i S_i\f$ and
+     * \f$\partial S_i / \partial T = (a_i S_i + \sum_j A_{ij} x_j a_j) / 2\f$
+     * with \f$S_i = \sum_j A_{ij} x_j\f$; \f$B\f$ and every \f$B_i\f$ are
+     * proportional to \f$1 / T\f$. \f$Z_T\f$ follows from the cubic, or is
+     * \f$-Z / T\f$ where the molar volume is at its floor. A coefficient at
+     * its limits has no derivative.
+     *
+     * \param lnPhiTemperatureDerivatives Receives \f$\partial \ln\phi_i / \partial T\f$ at i.
+     */
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void computeFugacityCoefficientsAndDerivatives(const FluidState& fs,
+                                                          const Params& params,
+                                                          unsigned phaseIdx,
+                                                          Coefficients& fugCoeffs,
+                                                          Derivatives& lnPhiDerivatives,
+                                                          Coefficients& lnPhiPressureDerivatives,
+                                                          Coefficients& lnPhiTemperatureDerivatives)
+    {
+        coefficientsAndDerivatives_(fs, params, phaseIdx, fugCoeffs, lnPhiDerivatives,
+                                    &lnPhiPressureDerivatives, &lnPhiTemperatureDerivatives);
+    }
+
+private:
+    template <class FluidState, class Params, class Coefficients, class Derivatives>
+    static void coefficientsAndDerivatives_(const FluidState& fs,
+                                            const Params& params,
+                                            unsigned phaseIdx,
+                                            Coefficients& fugCoeffs,
+                                            Derivatives& lnPhiDerivatives,
+                                            Coefficients* lnPhiPressureDerivatives,
+                                            Coefficients* lnPhiTemperatureDerivatives)
+    {
         using LhsEval = typename FluidState::ValueType;
         static_assert(std::is_floating_point_v<LhsEval>,
                       "The derivatives are those of a value-only evaluation");
@@ -201,15 +280,67 @@ public:
                     + perS * S[compIdx];
             }
         }
+        if (lnPhiPressureDerivatives) {
+            const LhsEval p = fs.pressure(phaseIdx);
+            const LhsEval Ap = A / p;
+            const LhsEval Bp = B / p;
+            const LhsEval Zp = volumeAtFloor ? Z / p : -(FA * Ap + FB * Bp) / FZ;
+            const LhsEval LambdaP = (Zp + m2 * Bp) / P2 - (Zp + m1 * Bp) / P1;
+            const LhsEval common = -(Zp - Bp) / ZB;
+            const LhsEval betaP = A * invB * LambdaP / Delta;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                (*lnPhiPressureDerivatives)[compIdx] = common
+                    + params.Bi(phaseIdx, compIdx) * invB * Zp + betaP * gamma[compIdx];
+            }
+        }
+        if (lnPhiTemperatureDerivatives) {
+            const LhsEval T = fs.temperature(phaseIdx);
+            std::array<LhsEval, numComponents> a;
+            std::array<LhsEval, numComponents> xa; // x_j a_j
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                a[compIdx] = params.lnAiTemperatureDerivative(phaseIdx, compIdx);
+                xa[compIdx] = fs.moleFraction(phaseIdx, compIdx) * a[compIdx];
+            }
+            LhsEval AT = 0.0;
+            std::array<LhsEval, numComponents> ST;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                LhsEval weighted = 0.0;
+                for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
+                    weighted += params.aCache(phaseIdx, compIdx, compJIdx) * xa[compJIdx];
+                }
+                ST[compIdx] = 0.5 * (a[compIdx] * S[compIdx] + weighted);
+                AT += xa[compIdx] * S[compIdx];
+            }
+            const LhsEval BT = -B / T;
+            const LhsEval ZT = volumeAtFloor ? -Z / T : -(FA * AT + FB * BT) / FZ;
+            const LhsEval LambdaT = (ZT + m2 * BT) / P2 - (ZT + m1 * BT) / P1;
+            const LhsEval common = -(ZT - BT) / ZB;
+            const LhsEval betaT
+                = ((AT * invB - A * BT * invB * invB) * Lambda + A * invB * LambdaT) / Delta;
+            for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
+                const LhsEval gammaT = 2 * (ST[compIdx] * invA - S[compIdx] * AT * invA * invA);
+                (*lnPhiTemperatureDerivatives)[compIdx] = common
+                    + params.Bi(phaseIdx, compIdx) * invB * ZT + betaT * gamma[compIdx]
+                    + beta * gammaT;
+            }
+        }
         for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
             if (!(fugCoeffs[compIdx] < maxFugacityCoefficient)
                 || !(fugCoeffs[compIdx] > minFugacityCoefficient)) {
                 for (unsigned compJIdx = 0; compJIdx < numComponents; ++compJIdx) {
                     lnPhiDerivatives[compIdx][compJIdx] = 0.0;
                 }
+                if (lnPhiPressureDerivatives) {
+                    (*lnPhiPressureDerivatives)[compIdx] = 0.0;
+                }
+                if (lnPhiTemperatureDerivatives) {
+                    (*lnPhiTemperatureDerivatives)[compIdx] = 0.0;
+                }
             }
         }
     }
+
+public:
 
     /*!
      * \brief The molar volume of a phase from the cubic in \f$Z\f$.
@@ -263,7 +394,7 @@ public:
         Evaluation Z[3] = {0.0, 0.0, 0.0};
         // Only the root of the phase is used: the largest for the vapour,
         // the smallest for the liquid.
-        int numSol = cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+        const int numSol = extremeRootWithDerivatives_(Z, a1, a2, a3, a4, isGasPhase);
 
         // pick correct root
         const Evaluation RT_p = R * T / p;
@@ -290,6 +421,46 @@ public:
     }
 
 private:
+    /*!
+     * \brief cubicExtremeRoot() of the EOS cubic, with the derivatives of
+     *        the root from the cubic itself.
+     *
+     * The root is found on values, which gives the value cubicExtremeRoot()
+     * gives on the evaluations. Its derivatives follow from the implicit
+     * function theorem: \f$F(Z) = Z^3 + a_2 Z^2 + a_3 Z + a_4 = 0\f$ gives
+     * \f$dZ = -(Z^2\,da_2 + Z\,da_3 + da_4) / F'(Z)\f$, the derivatives of
+     * the closed-form root to round-off, without carrying them through its
+     * roots and trigonometric functions. At a double root, where
+     * \f$F'(Z) = 0\f$, the closed form decides.
+     */
+    template <class Evaluation>
+    static int extremeRootWithDerivatives_(Evaluation* Z,
+                                           const Evaluation& a1,
+                                           const Evaluation& a2,
+                                           const Evaluation& a3,
+                                           const Evaluation& a4,
+                                           const bool isGasPhase)
+    {
+        if constexpr (std::is_floating_point_v<Evaluation>) {
+            return cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+        }
+        else {
+            using Value = std::remove_cv_t<std::remove_reference_t<decltype(getValue(a1))>>;
+            Value roots[3] = {0.0, 0.0, 0.0};
+            const int numSol = cubicExtremeRoot(roots, getValue(a1), getValue(a2),
+                                                getValue(a3), getValue(a4), isGasPhase);
+            const int rootIdx = (numSol == 3 && isGasPhase) ? 2 : 0;
+            const Value root = roots[rootIdx];
+            const Value slope = (3 * root + 2 * getValue(a2)) * root + getValue(a3);
+            if (getValue(a1) != 1.0 || !(slope != 0.0) || !std::isfinite(slope)) {
+                return cubicExtremeRoot(Z, a1, a2, a3, a4, isGasPhase);
+            }
+            Z[rootIdx] = (root * root * a2 + root * a3 + a4) * (-1 / slope);
+            Z[rootIdx].setValue(root);
+            return numSol;
+        }
+    }
+
     //! The terms of \f$\ln \phi_i\f$ shared by all components of a phase.
     template <class LhsEval>
     struct PhaseFugacityTerms
