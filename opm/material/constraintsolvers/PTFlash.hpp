@@ -235,6 +235,12 @@ public:
         // parameter cache.
         auto scalar_state = scalarState_(fluid_state);
         FlashShared shared(eos_type);
+        // A derivative pass that evaluates the answer analytically with its
+        // state columns gets the composition blocks from that evaluation:
+        // the flash need not evaluate them at the end of Newton.
+        if constexpr (hasFugacityStateDerivatives_) {
+            shared.newton_jacobian = !hasAnalyticStateColumn_(scalar_state);
+        }
 
         const auto [is_single_phase, newton_jacobian]
             = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity,
