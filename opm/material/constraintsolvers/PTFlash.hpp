@@ -131,14 +131,6 @@ class PTFlash
     static constexpr Scalar stabilityEscapeFactor = 8;
     static constexpr Scalar stabilityEscapeGrowth = 8;
     static constexpr Scalar maxStabilityEscapeFactor = 1e6;
-    // Where an escape would start and the Hessian of tm is positive
-    // definite, the trial takes Newton steps instead, each changing no
-    // ln W_i by more than maxStabilityNewtonStep, see stabilityNewtonStep_().
-    static constexpr Scalar maxStabilityNewtonStep = 1.0;
-    // A Newton step that does not lower tm is shortened up to
-    // maxStabilityNewtonBacktracks times, to the minimum of the parabola
-    // through tm at both ends and its slope at the start.
-    static constexpr int maxStabilityNewtonBacktracks = 3;
     // Substitution steps a cold start takes on the split before the
     // stability test, see flashFirst_(): without a phase below the tangent
     // plane of the feed, and in all.
@@ -2249,28 +2241,6 @@ protected:
         bool escaped = false;
         bool overshot = false;
         FieldType escape_factor = stabilityEscapeFactor;
-        // newton: the last extrapolation was a Newton step from the point
-        // before; newton_mode: one lowered tm, so every point takes one;
-        // newton_failed: one did not, and the trial does not try again.
-        bool newton = false;
-        bool newton_mode = false;
-        bool newton_failed = false;
-        // The Newton step: its starting point, its relative increments of
-        // sqrt(W), the slope of tm along it there, the fraction taken, and
-        // the backtracks made.
-        ComponentVector newton_base_K = K;
-        ComponentVector newton_increment(0.);
-        FieldType newton_slope = 0.;
-        FieldType newton_fraction = 1.;
-        int newton_backtracks = 0;
-        const auto set_newton_point = [&]() {
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                const FieldType root_growth = 1. + newton_fraction * newton_increment[compIdx];
-                const FieldType growth = root_growth * root_growth;
-                K[compIdx] = is_vapour_trial ? newton_base_K[compIdx] * growth
-                                             : newton_base_K[compIdx] / growth;
-            }
-        };
 
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
@@ -2321,7 +2291,7 @@ protected:
             // steps after an extrapolation skip their logarithms.
             ComponentVector step(0.);
             FieldType tm = 1. - trial_sum;
-            if (extrapolated || newton_mode || plain_steps + 3 >= stabilityAccelerationInterval) {
+            if (extrapolated || plain_steps + 3 >= stabilityAccelerationInterval) {
                 for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
                     if (!(Opm::getValue(z[compIdx]) > 0.)) {
                         continue;
@@ -2335,32 +2305,13 @@ protected:
             // A point an escape moved to is off the path of the plain steps:
             // its S is not near a stationary value even where its residual is
             // small, so it decides nothing but a trivial solution.
-            const bool escape_point = extrapolated && escaping && !newton;
+            const bool escape_point = extrapolated && escaping;
             if (extrapolated) {
                 extrapolated = false;
                 if (!(tm < tm_before) || !std::isfinite(Opm::getValue(tm))) {
                     // Continue from the plain step instead.
                     K = plain_K;
                     plain_steps = 0;
-                    if (newton) {
-                        if (newton_backtracks < maxStabilityNewtonBacktracks
-                            && std::isfinite(Opm::getValue(tm))) {
-                            ++newton_backtracks;
-                            const FieldType t = newton_fraction;
-                            const FieldType curvature = tm - tm_before - newton_slope * t;
-                            FieldType shortened = curvature > 0.
-                                ? -newton_slope * t * t / (2. * curvature) : 0.5 * t;
-                            shortened = std::clamp(shortened, FieldType{0.1} * t, FieldType{0.5} * t);
-                            newton_fraction = shortened;
-                            set_newton_point();
-                            extrapolated = true;
-                            continue;
-                        }
-                        newton = false;
-                        newton_mode = false;
-                        newton_failed = true;
-                        continue;
-                    }
                     overshot = !escaping;
                     if (escaping) {
                         escape_factor = std::max(escape_factor / stabilityEscapeGrowth,
@@ -2369,15 +2320,13 @@ protected:
                     continue;
                 }
                 overshot = false;
-                newton_mode = newton;
-                if (escaping && !newton) {
+                if (escaping) {
                     escaped = true;
                     escape_factor = std::min(escape_factor * stabilityEscapeGrowth,
                                              FieldType{maxStabilityEscapeFactor});
                 }
             }
 
-            const ComponentVector evaluated_K = K;
             for (int compIdx=0; compIdx<numComponents; ++compIdx){
                 K[compIdx] *= substitution_factor[compIdx];
             }
@@ -2402,40 +2351,6 @@ protected:
                 return;
             }
 
-            // A Newton step from the evaluated point, kept if it lowers tm.
-            const auto take_newton_step = [&]() {
-                if (!stabilityNewtonStep_(trial_state, trial_param_cache, trial_phase_idx,
-                                          trial_composition, step, z, is_vapour_trial,
-                                          newton_increment)) {
-                    return false;
-                }
-                // d tm / d fraction = sum_i W_i g_i 2 increment_i at the start.
-                newton_slope = 0.;
-                for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                    const FieldType g = is_vapour_trial ? -step[compIdx] : step[compIdx];
-                    newton_slope += 2. * trial_sum * trial_composition[compIdx] * g
-                        * newton_increment[compIdx];
-                }
-                if (!(newton_slope < 0.)) {
-                    return false;
-                }
-                plain_K = K;
-                tm_before = tm;
-                newton_base_K = evaluated_K;
-                newton_backtracks = 0;
-                newton_fraction = 1.;
-                set_newton_point();
-                extrapolated = true;
-                newton = true;
-                plain_steps = 0;
-                return true;
-            };
-            if (newton_mode && take_newton_step()) {
-                continue;
-            }
-            newton = false;
-            newton_mode = false;
-
             steps = {step, steps[0], steps[1]};
             ++plain_steps;
             ComponentVector extrapolation;
@@ -2454,10 +2369,6 @@ protected:
             escaping = along > 0. && !(newest_squared < slowest * along)
                 && (escaped || overshot
                     || newest_squared < maxStabilityEscapeStep * maxStabilityEscapeStep);
-            if (escaping && !newton_failed && take_newton_step()) {
-                escaping = false;
-                continue;
-            }
             if (!escaping) {
                 escaped = false;
                 escape_factor = stabilityEscapeFactor;
@@ -2481,132 +2392,6 @@ protected:
         }
         OPM_THROW_NOLOG(NumericalProblem, " Stability test did not converge");
     }//end checkStability
-
-    /*!
-     * \brief A second-order step of a stability trial.
-     *
-     * In the variables \f$\alpha_i = 2\sqrt{W_i}\f$ the modified tangent-plane
-     * distance \f$tm\f$ of checkStability_() has the gradient
-     * \f$\sqrt{W_i}\,g_i\f$, with \f$g_i = \ln W_i + \ln\varphi_i - d_i\f$, and,
-     * up to a term \f$\delta_{ij} g_i / 2\f$ that vanishes at a stationary
-     * point, the Hessian
-     *
-     * \f[ H_{ij} = \delta_{ij} + \sqrt{w_i w_j}\, n
-     *              \frac{\partial \ln\varphi_i}{\partial n_j}, \f]
-     *
-     * the identity for an ideal mixture, where the step is a substitution
-     * step (M.L. Michelsen, Fluid Phase Equilib. 9 (1982) 1-19). The step
-     * solves \f$H\,\Delta\alpha = -\sqrt{W}\,g\f$ and is shortened to change
-     * no \f$\ln W_i\f$ by more than maxStabilityNewtonStep. The composition
-     * derivatives are CubicEOS's analytic ones.
-     *
-     * \param trial_state The trial phase at the evaluated point.
-     * \param cache The parameter cache, updated for the trial phase.
-     * \param phase_idx The trial phase.
-     * \param w The normalised trial composition.
-     * \param log_ratio The plain step \f$\ln R_i\f$ of the point: \f$-g_i\f$ for
-     *        a vapour-like trial, \f$g_i\f$ for a liquid-like one.
-     * \param z The feed; an absent component does not move.
-     * \param[out] increment The relative increments \f$\Delta\alpha_i / \alpha_i\f$
-     *        of the shortened step: \f$W_i^{new} = W_i (1 + increment_i)^2\f$.
-     * \return false where \f$H\f$ is not positive definite or the step is not
-     *         finite; the trial then continues without it
-     */
-    template <class FlashFluidState, class ParamCache, class ComponentVector>
-    static bool stabilityNewtonStep_(const FlashFluidState& trial_state,
-                                     const ParamCache& cache,
-                                     const int phase_idx,
-                                     const ComponentVector& w,
-                                     const ComponentVector& log_ratio,
-                                     const ComponentVector& z,
-                                     const bool is_vapour_trial,
-                                     ComponentVector& increment)
-    {
-        using FlashEval = typename FlashFluidState::ValueType;
-        if constexpr (!std::is_floating_point_v<FlashEval>) {
-            return false;
-        }
-        else {
-            using CubicEOS = typename Opm::CubicEOS<Scalar, FluidSystem>;
-            constexpr int n = numComponents;
-            std::array<Scalar, n> coefficients;
-            std::array<std::array<Scalar, n>, n> D;
-            CubicEOS::computeFugacityCoefficientsAndDerivatives(trial_state, cache, phase_idx,
-                                                                coefficients, D);
-            // n d ln phi_i / d n_j = D_ij - sum_k w_k D_ik, then H.
-            std::array<Scalar, n> root_w, rhs;
-            for (int i = 0; i < n; ++i) {
-                const bool present = Opm::getValue(z[i]) > 0.;
-                root_w[i] = present ? std::sqrt(Opm::getValue(w[i])) : 0.;
-                const Scalar g = is_vapour_trial ? -Opm::getValue(log_ratio[i])
-                                                 : Opm::getValue(log_ratio[i]);
-                rhs[i] = present ? -root_w[i] * g : 0.;
-            }
-            std::array<std::array<Scalar, n>, n> H;
-            for (int i = 0; i < n; ++i) {
-                Scalar mean = 0.;
-                for (int k = 0; k < n; ++k) {
-                    mean += Opm::getValue(w[k]) * D[i][k];
-                }
-                for (int j = 0; j < n; ++j) {
-                    H[i][j] = (i == j ? 1. : 0.) + root_w[i] * root_w[j] * (D[i][j] - mean);
-                }
-            }
-            // L D L^T of the symmetric part, then the solve.
-            std::array<std::array<Scalar, n>, n> L{};
-            std::array<Scalar, n> diagonal;
-            for (int j = 0; j < n; ++j) {
-                Scalar d = H[j][j];
-                for (int k = 0; k < j; ++k) {
-                    d -= L[j][k] * L[j][k] * diagonal[k];
-                }
-                if (!(d > 1e-12)) {
-                    return false;
-                }
-                diagonal[j] = d;
-                for (int i = j + 1; i < n; ++i) {
-                    Scalar entry = 0.5 * (H[i][j] + H[j][i]);
-                    for (int k = 0; k < j; ++k) {
-                        entry -= L[i][k] * L[j][k] * diagonal[k];
-                    }
-                    L[i][j] = entry / d;
-                }
-            }
-            for (int i = 0; i < n; ++i) {
-                for (int k = 0; k < i; ++k) {
-                    rhs[i] -= L[i][k] * rhs[k];
-                }
-            }
-            for (int i = n - 1; i >= 0; --i) {
-                rhs[i] /= diagonal[i];
-                for (int k = i + 1; k < n; ++k) {
-                    rhs[i] -= L[k][i] * rhs[k];
-                }
-            }
-            // sqrt(W_i^new / W_i) = 1 + t_i with t_i = Delta alpha_i / alpha_i,
-            // shortened so that |ln W_i^new - ln W_i| <= maxStabilityNewtonStep.
-            const Scalar max_root_growth = std::exp(0.5 * maxStabilityNewtonStep);
-            const Scalar min_root_growth = std::exp(-0.5 * maxStabilityNewtonStep);
-            Scalar shortening = 1.;
-            std::array<Scalar, n> t;
-            for (int i = 0; i < n; ++i) {
-                t[i] = root_w[i] > 0. ? 0.5 * rhs[i] / root_w[i] : 0.;
-                if (!std::isfinite(t[i])) {
-                    return false;
-                }
-                if (t[i] > max_root_growth - 1.) {
-                    shortening = std::min(shortening, (max_root_growth - 1.) / t[i]);
-                }
-                else if (t[i] < min_root_growth - 1.) {
-                    shortening = std::min(shortening, (min_root_growth - 1.) / t[i]);
-                }
-            }
-            for (int i = 0; i < n; ++i) {
-                increment[i] = shortening * t[i];
-            }
-            return true;
-        }
-    }
 
     /*!
      * \brief The phase compositions from the equilibrium ratios and the

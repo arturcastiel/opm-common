@@ -156,14 +156,3 @@ BOOST_AUTO_TEST_CASE(NearStationaryTrialsAreShort)
         checkShortStableFlash(state, 300);
     }
 }
-
-BOOST_AUTO_TEST_CASE(NewtonStepsFinishSlowTrials)
-{
-    // Trials that the forward extrapolation alone brings to the trivial
-    // solution in 141-152 steps of the stability test; Newton steps on tm
-    // finish them in 50-53.
-    for (const auto& state : std::array<MapState, 3>{{{242, 833, 0.0}, {210, 859, 0.0},
-                                                      {240, 835, 0.0}}}) {
-        checkShortStableFlash(state, 100);
-    }
-}
