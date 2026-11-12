@@ -367,10 +367,20 @@ public:
 
         bool is_single_phase = false;
         std::optional<NewtonJacobian> newton_jacobian;
+        // One parameter cache for the flash and its derivative pass. A pass
+        // with only analytic state columns evaluates the answer with its
+        // composition blocks itself, see solve() without a memory; one with
+        // an extra temperature column takes them from Newton.
+        const bool temperature_column = options.predict && options.temperature && !isThermal;
+        FlashShared shared(eos_type);
+        if constexpr (hasFugacityStateDerivatives_) {
+            shared.newton_jacobian
+                = temperature_column || !hasAnalyticStateColumn_(scalar_state);
+        }
         if (!accepted) {
             auto result = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type,
                                        verbosity, options.phase_memory ? &incoming : nullptr,
-                                       options.phase_memory ? &next : nullptr);
+                                       options.phase_memory ? &next : nullptr, &shared);
             is_single_phase = result.single_phase;
             newton_jacobian = std::move(result.newton_jacobian);
         }
@@ -393,11 +403,13 @@ public:
             next.sensitivity = incoming.sensitivity;
             next.split_has_temperature = incoming.split_has_temperature;
         }
-        else if (options.predict && options.temperature && !isThermal) {
-            updateDerivativesTwoPhase_<2>(scalar_state, fluid_state, eos_type, newton_jacobian, record);
+        else if (temperature_column) {
+            updateDerivativesTwoPhase_<2>(scalar_state, fluid_state, eos_type, newton_jacobian, record,
+                                          &shared);
         }
         else {
-            updateDerivativesTwoPhase_(scalar_state, fluid_state, eos_type, newton_jacobian, record);
+            updateDerivativesTwoPhase_(scalar_state, fluid_state, eos_type, newton_jacobian, record,
+                                       &shared);
         }
 
         if (!is_single_phase) {
