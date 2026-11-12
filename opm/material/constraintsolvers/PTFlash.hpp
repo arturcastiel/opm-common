@@ -231,11 +231,14 @@ public:
             return solveFromTable_(fluid_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
         }
         // Solve on a value-only copy; derivatives are reconstructed on the
-        // caller's state after the scalar flash has converged.
+        // caller's state after the scalar flash has converged, on the same
+        // parameter cache.
         auto scalar_state = scalarState_(fluid_state);
+        FlashShared shared(eos_type);
 
         const auto [is_single_phase, newton_jacobian]
-            = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+            = flashScalar_(scalar_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity,
+                           nullptr, nullptr, &shared);
 
         // Transfer the converged values before reconstructing their derivatives.
         for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
@@ -247,7 +250,8 @@ public:
             setPhaseMoleFractions_(fluid_state, phaseIdx, mole_fractions);
         }
 
-        updateDerivatives_(scalar_state, fluid_state, eos_type, is_single_phase, newton_jacobian);
+        updateDerivatives_(scalar_state, fluid_state, eos_type, is_single_phase, newton_jacobian,
+                           &shared);
 
         // The equilibrium ratios of a two-phase answer are y / x: a warm
         // start of the next flash from this state starts from them.
@@ -3599,10 +3603,12 @@ protected:
                                    FluidState& fluid_state,
                                    const EOSType& eos_type,
                                    bool is_single_phase,
-                                   const std::optional<NewtonJacobian>& newton_jacobian)
+                                   const std::optional<NewtonJacobian>& newton_jacobian,
+                                   FlashShared* shared = nullptr)
     {
         if (!is_single_phase) {
-            updateDerivativesTwoPhase_(fluid_state_scalar, fluid_state, eos_type, newton_jacobian);
+            updateDerivativesTwoPhase_(fluid_state_scalar, fluid_state, eos_type, newton_jacobian,
+                                       nullptr, shared);
         } else {
             updateDerivativesSinglePhase_(fluid_state_scalar, fluid_state);
         }
@@ -3635,7 +3641,8 @@ protected:
                                            const EOSType& eos_type,
                                            ComponentMatrix& liquid_jacobian,
                                            ComponentMatrix& vapour_jacobian,
-                                           FugacityStateColumns* fugacity_state = nullptr)
+                                           FugacityStateColumns* fugacity_state = nullptr,
+                                           FlashShared* shared = nullptr)
     {
         using Vector = std::array<Scalar, numComponents>;
         using Matrix = std::array<Vector, numComponents>;
@@ -3654,7 +3661,8 @@ protected:
         const Scalar pref = state.pressure(oilPhaseIdx);
 
         using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx),
                                         static_cast<unsigned>(gasPhaseIdx)}) {
             param_cache.updatePhase(state, phaseIdx);
@@ -3973,7 +3981,8 @@ protected:
                                            FluidState& fluid_state,
                                            const EOSType& eos_type,
                                            const std::optional<NewtonJacobian>& newton_jacobian,
-                                           Memory* record = nullptr)
+                                           Memory* record = nullptr,
+                                           FlashShared* shared = nullptr)
     {
         static_assert(stateColumns >= numStateColumns && stateColumns <= 2);
         ComponentMatrix liquid_jacobian;
@@ -3993,7 +4002,7 @@ protected:
                     ComponentMatrix unused_liquid;
                     ComponentMatrix unused_vapour;
                     analyticFugacityJacobians_(fluid_state_scalar, eos_type, unused_liquid,
-                                               unused_vapour, &fugacity_state);
+                                               unused_vapour, &fugacity_state, shared);
                     analytic_column = true;
                 }
             }
@@ -4017,13 +4026,13 @@ protected:
                 if (hasAnalyticStateColumn_(fluid_state_scalar)) {
                     // And the column of dF/ds too.
                     analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
-                                               vapour_jacobian, &fugacity_state);
+                                               vapour_jacobian, &fugacity_state, shared);
                     analytic_column = true;
                 }
             }
             if (!analytic_column) {
                 analyticFugacityJacobians_(fluid_state_scalar, eos_type, liquid_jacobian,
-                                           vapour_jacobian);
+                                           vapour_jacobian, nullptr, shared);
                 fugacityDerivatives_<false, stateColumns>(
                     fluid_state_scalar, eos_type, liquid_jacobian, vapour_jacobian, fugacity_state);
             }
