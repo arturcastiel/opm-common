@@ -26,7 +26,8 @@
  * Fluids: the ternary CO2/C1/nC10 (F2) with every two-phase method, cold
  * and warm starts; C1/nC20 with volume shifts (H1); and the SPE5 oil of the
  * dense-map benchmark, at states that take the Newton fallback in
- * (x, y, L) and at the one state of the 1000 x 1000 map where both fail.
+ * (x, y, L), and at the near-critical state of the 1000 x 1000 map that
+ * phase 3 failed and the composition Newton's mirror test now solves.
  * The derivative pass against PTFlash::solve() on Evaluations.
  */
 #include "config.h"
@@ -331,21 +332,24 @@ BOOST_AUTO_TEST_CASE(Spe5NearCritical)
     const auto gridT = [](int it) { return 280.0 + 420.0 * it / 999; };
     const std::array<double, 6> z{0.5, 0.03, 0.07, 0.20, 0.15, 0.05};
     // (ip, it): ordinary states, two-phase states whose Gibbs-energy Newton
-    // gives up (the Newton in (x, y, L) finishes), and the failure of both.
+    // gives up (the Newton in (x, y, L) finishes), and the state where the
+    // Gibbs-energy Newton ended on the mirror split.
     const std::vector<std::array<int, 2>> states{
         {0, 0}, {100, 500}, {500, 500}, {999, 999}, {250, 700}, {205, 857}, // ordinary
         {198, 860}, {214, 854}, {243, 828}, {252, 815},                     // Newton fallback
-        {205, 858}};                                                        // both fail
+        {205, 858}};                                                        // mirror, solved
     for (const auto& [ip, it] : states) {
         const double p = gridP(ip);
         const double T = gridT(it);
         checkState<Spe5>(p, T, z, wilson<Spe5>(p, T), -1.0, Opm::PTFlashMethod::SsiNewton, EOSType::PR);
     }
+    // Both solve the state phase 3 failed, with the same two-phase split.
     const double p = gridP(205);
     const double T = gridT(858);
-    const auto failed = ptflash<Spe5>(p, T, z, wilson<Spe5>(p, T), -1.0, Opm::PTFlashMethod::SsiNewton,
-                                      EOSType::PR);
-    BOOST_CHECK(!failed.ok);
+    const auto solved = checkState<Spe5>(p, T, z, wilson<Spe5>(p, T), -1.0, Opm::PTFlashMethod::SsiNewton,
+                                         EOSType::PR);
+    BOOST_CHECK(solved.ok);
+    BOOST_CHECK(!solved.single);
 
     // Without the composition Newton, a state that needs it is handed back,
     // and one that does not is flashed as before.
