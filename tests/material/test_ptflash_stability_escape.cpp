@@ -102,50 +102,68 @@ struct MapState
     Scalar L; // the label of the single phase
 };
 
+// A cold flash of the SPE5 feed at a map state: single phase with the label
+// state.L, after one stability test of fewer than max_steps steps.
+void checkShortStableFlash(const MapState& state, const long max_steps)
+{
+    const std::array<Scalar, numComponents> z{0.5, 0.03, 0.07, 0.20, 0.15, 0.05};
+    const Scalar p = 1e5 + (4e7 - 1e5) * state.ip / 999;
+    const Scalar T = 280.0 + 420.0 * state.it / 999;
+    BOOST_TEST_CONTEXT("p " << p << " Pa, T " << T << " K")
+    {
+        FluidState fs;
+        for (unsigned phaseIdx = 0; phaseIdx < FluidSystem::numPhases; ++phaseIdx) {
+            fs.setPressure(phaseIdx, p);
+        }
+        fs.setTemperature(T);
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fs.setMoleFraction(compIdx, z[compIdx]);
+        }
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            fs.setKvalue(compIdx, fs.wilsonK_(compIdx));
+        }
+        fs.setLvalue(-1.0);
+
+        auto& statistics = Opm::FlashStatistics::get();
+        statistics.reset();
+        const bool single
+            = PtFlash::flash_solve_scalar(fs, Opm::PTFlashMethod::SsiNewton, 1e-8, EOSType::PR, 0);
+
+        BOOST_CHECK(single);
+        BOOST_CHECK_EQUAL(fs.L(), state.L);
+        for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
+            BOOST_CHECK_EQUAL(fs.moleFraction(FluidSystem::oilPhaseIdx, compIdx), z[compIdx]);
+            BOOST_CHECK_EQUAL(fs.moleFraction(FluidSystem::gasPhaseIdx, compIdx), z[compIdx]);
+        }
+        // One stability test, both trials together, in fewer than max_steps steps.
+        BOOST_CHECK_EQUAL(statistics.stabilityTests, 1);
+        BOOST_CHECK_LT(statistics.stabilityIterations, max_steps);
+    }
+}
+
 } // anonymous namespace
 
 BOOST_GLOBAL_FIXTURE(Fixture);
 
 BOOST_AUTO_TEST_CASE(NearStationaryTrialsAreShort)
 {
-    const std::array<Scalar, numComponents> z{0.5, 0.03, 0.07, 0.20, 0.15, 0.05};
     // Slow vapour-like trials (2,219, 1,745, 1,325 and 1,008 steps of plain
     // substitution with extrapolation), a slow liquid-like one (1,120), and a
     // supercritical liquid (1,035).
-    const std::array<MapState, 6> states{{{243, 831, 0.0}, {234, 839, 0.0}, {268, 807, 0.0},
-                                          {233, 840, 0.0}, {206, 861, 0.0}, {378, 673, 1.0}}};
-    for (const auto& state : states) {
-        const Scalar p = 1e5 + (4e7 - 1e5) * state.ip / 999;
-        const Scalar T = 280.0 + 420.0 * state.it / 999;
-        BOOST_TEST_CONTEXT("p " << p << " Pa, T " << T << " K")
-        {
-            FluidState fs;
-            for (unsigned phaseIdx = 0; phaseIdx < FluidSystem::numPhases; ++phaseIdx) {
-                fs.setPressure(phaseIdx, p);
-            }
-            fs.setTemperature(T);
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fs.setMoleFraction(compIdx, z[compIdx]);
-            }
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                fs.setKvalue(compIdx, fs.wilsonK_(compIdx));
-            }
-            fs.setLvalue(-1.0);
+    for (const auto& state : std::array<MapState, 6>{{{243, 831, 0.0}, {234, 839, 0.0},
+                                                      {268, 807, 0.0}, {233, 840, 0.0},
+                                                      {206, 861, 0.0}, {378, 673, 1.0}}}) {
+        checkShortStableFlash(state, 300);
+    }
+}
 
-            auto& statistics = Opm::FlashStatistics::get();
-            statistics.reset();
-            const bool single
-                = PtFlash::flash_solve_scalar(fs, Opm::PTFlashMethod::SsiNewton, 1e-8, EOSType::PR, 0);
-
-            BOOST_CHECK(single);
-            BOOST_CHECK_EQUAL(fs.L(), state.L);
-            for (int compIdx = 0; compIdx < numComponents; ++compIdx) {
-                BOOST_CHECK_EQUAL(fs.moleFraction(FluidSystem::oilPhaseIdx, compIdx), z[compIdx]);
-                BOOST_CHECK_EQUAL(fs.moleFraction(FluidSystem::gasPhaseIdx, compIdx), z[compIdx]);
-            }
-            // One stability test, both trials together, in a few hundred steps.
-            BOOST_CHECK_EQUAL(statistics.stabilityTests, 1);
-            BOOST_CHECK_LT(statistics.stabilityIterations, 300);
-        }
+BOOST_AUTO_TEST_CASE(NewtonStepsFinishSlowTrials)
+{
+    // Trials that the forward extrapolation alone brings to the trivial
+    // solution in 141-152 steps of the stability test; Newton steps on tm
+    // finish them in 50-53.
+    for (const auto& state : std::array<MapState, 3>{{{242, 833, 0.0}, {210, 859, 0.0},
+                                                      {240, 835, 0.0}}}) {
+        checkShortStableFlash(state, 100);
     }
 }
