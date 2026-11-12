@@ -119,6 +119,18 @@ class PTFlash
     // may make, see checkStability_().
     static constexpr int stabilityAccelerationInterval = 5;
     static constexpr Scalar maxStabilityExtrapolation = 1.0;
+    // A trial whose plain steps stop shrinking while they are this small
+    // passes a near-stationary point, and is extrapolated forward along its
+    // step: first by stabilityEscapeFactor steps, then by
+    // stabilityEscapeGrowth times as many after each one that lowers tm,
+    // see checkStability_(). So is one whose steps shrink by less than
+    // stabilityEscapeContraction per step after an extrapolation of the
+    // remaining steps overshot.
+    static constexpr Scalar maxStabilityEscapeStep = 1e-3;
+    static constexpr Scalar stabilityEscapeContraction = 0.01;
+    static constexpr Scalar stabilityEscapeFactor = 8;
+    static constexpr Scalar stabilityEscapeGrowth = 8;
+    static constexpr Scalar maxStabilityEscapeFactor = 1e6;
     // Substitution steps a cold start takes on the split before the
     // stability test, see flashFirst_(): without a phase below the tangent
     // plane of the feed, and in all.
@@ -2221,6 +2233,14 @@ protected:
         bool extrapolated = false;
         ComponentVector plain_K = K;
         FieldType tm_before = 0.;
+        // The forward extrapolation of a trial whose steps do not shrink.
+        // escaping: the last extrapolation was one; escaped: one lowered tm
+        // and the steps have not shrunk since; overshot: the last
+        // extrapolation of the remaining steps did not lower tm.
+        bool escaping = false;
+        bool escaped = false;
+        bool overshot = false;
+        FieldType escape_factor = stabilityEscapeFactor;
 
         // Grow the trial phase out of the mixture and find a stationary point
         // of the tangent-plane-distance function.
@@ -2282,13 +2302,28 @@ protected:
                                           : mole_number * step[compIdx];
                 }
             }
+            // A point an escape moved to is off the path of the plain steps:
+            // its S is not near a stationary value even where its residual is
+            // small, so it decides nothing but a trivial solution.
+            const bool escape_point = extrapolated && escaping;
             if (extrapolated) {
                 extrapolated = false;
                 if (!(tm < tm_before) || !std::isfinite(Opm::getValue(tm))) {
                     // Continue from the plain step instead.
                     K = plain_K;
                     plain_steps = 0;
+                    overshot = !escaping;
+                    if (escaping) {
+                        escape_factor = std::max(escape_factor / stabilityEscapeGrowth,
+                                                 FieldType{stabilityEscapeFactor});
+                    }
                     continue;
+                }
+                overshot = false;
+                if (escaping) {
+                    escaped = true;
+                    escape_factor = std::min(escape_factor * stabilityEscapeGrowth,
+                                             FieldType{maxStabilityEscapeFactor});
                 }
             }
 
@@ -2312,15 +2347,36 @@ protected:
 
             // Check convergence
             isTrivial = isTrivialSolution_(K);
-            if (isTrivial || substitution_residual < substitutionTolerance) {
+            if (isTrivial || (substitution_residual < substitutionTolerance && !escape_point)) {
                 return;
             }
 
             steps = {step, steps[0], steps[1]};
             ++plain_steps;
             ComponentVector extrapolation;
-            if (plain_steps >= stabilityAccelerationInterval
-                && extrapolateSubstitution_(steps, extrapolation)) {
+            if (plain_steps < stabilityAccelerationInterval) {
+                continue;
+            }
+            // Steps that do not shrink, s_n . s_n >= s_n . s_{n-1} > 0, have
+            // no fixed point to sum towards: near a stationary point that
+            // repels the iteration, or in the bottleneck where one has just
+            // vanished, they grow by a factor close to one for hundreds of
+            // steps. tm decreases along them, so the trial moves on along
+            // its step instead, by a growing factor while tm keeps dropping.
+            const FieldType newest_squared = steps[0] * steps[0];
+            const FieldType along = steps[0] * steps[1];
+            const FieldType slowest = overshot || escaped ? 1. - stabilityEscapeContraction : 1.;
+            escaping = along > 0. && !(newest_squared < slowest * along)
+                && (escaped || newest_squared < maxStabilityEscapeStep * maxStabilityEscapeStep);
+            if (!escaping) {
+                escaped = false;
+                escape_factor = stabilityEscapeFactor;
+            }
+            else {
+                extrapolation = steps[0];
+                extrapolation *= escape_factor;
+            }
+            if (escaping || extrapolateSubstitution_(steps, extrapolation)) {
                 plain_K = K;
                 tm_before = tm;
                 const FieldType largest = extrapolation.infinity_norm();
