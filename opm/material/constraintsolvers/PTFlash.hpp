@@ -508,13 +508,16 @@ public:
                                    const EOSType& eos_type,
                                    const int verbosity = 0)
     {
+        FlashShared shared(eos_type);
         const bool is_single_phase
-            = flashScalar_(fluid_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity)
+            = flashScalar_(fluid_state, twoPhaseMethod, flash_tolerance, eos_type, verbosity,
+                           nullptr, nullptr, &shared)
                   .single_phase;
         // The solve leaves those of its last evaluation, which need not be the result.
         using ParamCache =
             typename FluidSystem::template ParameterCache<typename FluidState::ValueType>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(&shared, own_cache, eos_type);
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
             param_cache.updatePhase(fluid_state, phaseIdx);
             updateFugacityCoefficients_(fluid_state, param_cache, phaseIdx);
@@ -1155,6 +1158,40 @@ protected:
     // x, y and L, then both phase pressures and the temperature.
     using JacobianState = std::array<Scalar, numFlashUnknowns + 3>;
 
+    using ScalarParamCache = typename FluidSystem::template ParameterCache<Scalar>;
+
+    /*!
+     * \brief What the stages of one scalar flash share.
+     *
+     * Temperature and pressure are fixed within a flash, so one parameter
+     * cache serves all its stages: the pure-component parameters
+     * \f$A_i\f$, \f$B_i\f$ and \f$A_{ij}\f$ are computed once per flash,
+     * and every stage updates the phases it evaluates before it reads
+     * them. A stage called on its own makes its own cache.
+     */
+    struct FlashShared
+    {
+        explicit FlashShared(const EOSType& eos_type)
+            : param_cache(eos_type)
+        {}
+
+        ScalarParamCache param_cache;
+    };
+
+    //! The parameter cache a stage evaluates with: the flash's, or its own.
+    template <class ParamCache>
+    static ParamCache& stageCache_(FlashShared* shared,
+                                   std::optional<ParamCache>& own,
+                                   const EOSType& eos_type)
+    {
+        if constexpr (std::is_same_v<ParamCache, ScalarParamCache>) {
+            if (shared) {
+                return shared->param_cache;
+            }
+        }
+        return own.emplace(eos_type);
+    }
+
     //! The composition Jacobian dF/d(x, y, L) where newtonComposition_()
     //! converged, and the state it was assembled at.
     struct NewtonJacobian
@@ -1180,8 +1217,11 @@ protected:
                                           const EOSType& eos_type,
                                           const int verbosity,
                                           const Memory* phase_memory = nullptr,
-                                          Memory* next_memory = nullptr)
+                                          Memory* next_memory = nullptr,
+                                          FlashShared* shared = nullptr)
     {
+        std::optional<FlashShared> own_shared;
+        FlashShared& flash = shared ? *shared : own_shared.emplace(eos_type);
         std::optional<NewtonJacobian> newton_jacobian;
         // The stable feed root of the last stability test.
         std::optional<FeedRoot> stable_feed_root;
@@ -1222,7 +1262,7 @@ protected:
         // Gibbs energy below the feed's makes the stability test unnecessary.
         const bool split_from_flash_first = is_cold_start && !stability_bypassed
             && flashFirst_(K_scalar, L_scalar, newton_jacobian, fluid_state, z_scalar,
-                           twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+                           twoPhaseMethod, flash_tolerance, eos_type, verbosity, &flash);
         StabilityOutcome stability_outcome;
         bool stable_by_test = false;
         if (is_cold_start && !stability_bypassed && !split_from_flash_first) {
@@ -1231,7 +1271,7 @@ protected:
             }
             stable_feed_root = phaseStabilityTest_(
                 is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity,
-                next_memory ? &stability_outcome : nullptr);
+                next_memory ? &stability_outcome : nullptr, &flash);
             stable_by_test = is_single_phase;
             if (verify_bypass && !is_single_phase) {
                 auto& tally = memoryTally_();
@@ -1264,7 +1304,8 @@ protected:
                                                     "split (L = {})", L_scalar));
                     }
                     newton_jacobian = flash_2ph(z_scalar, twoPhaseMethod, K_scalar, L_scalar,
-                                                fluid_state, flash_tolerance, eos_type, verbosity);
+                                                fluid_state, flash_tolerance, eos_type, verbosity,
+                                                &flash);
                     return true;
                 }
                 catch (const NumericalProblem& error) {
@@ -1328,7 +1369,8 @@ protected:
                     K_scalar[compIdx] = fluid_state.wilsonK_(compIdx);
                 }
                 stable_feed_root = phaseStabilityTest_(
-                    is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity);
+                    is_single_phase, K_scalar, fluid_state, z_scalar, eos_type, verbosity,
+                    nullptr, &flash);
                 if (!is_single_phase) {
                     OPM_FLASH_COUNT(splitRetries);
                     is_warm_split = false;
@@ -1361,7 +1403,7 @@ protected:
                 // smaller one is labelled by Li's correlation.
                 // The stability test that found the feed stable has its root.
                 const auto [stable_phase_idx, has_two_roots, molar_volume] = stable_feed_root
-                    ? *stable_feed_root : feedStableRoot_(fluid_state, z_scalar, eos_type);
+                    ? *stable_feed_root : feedStableRoot_(fluid_state, z_scalar, eos_type, &flash);
                 if (has_two_roots) {
                     L_scalar = stable_phase_idx == static_cast<int>(oilPhaseIdx) ? 1.0 : 0.0;
                     if (verbosity >= 1) {
@@ -1446,11 +1488,13 @@ protected:
     template <class FlashFluidState, class ComponentVector>
     static FeedRoot feedStableRoot_(const FlashFluidState& fluid_state,
                                     const ComponentVector& z,
-                                    const EOSType& eos_type)
+                                    const EOSType& eos_type,
+                                    FlashShared* shared = nullptr)
     {
         using FlashEval = typename FlashFluidState::ValueType;
         using ParamCache = typename FluidSystem::template ParameterCache<FlashEval>;
-        ParamCache feed_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& feed_cache = stageCache_(shared, own_cache, eos_type);
         std::array<FlashEval, numComponents> stable_coefficients;
         return feedStableRoot_(fluid_state, z, feed_cache, stable_coefficients);
     }
@@ -1597,7 +1641,8 @@ protected:
     static std::optional<Dune::FieldVector<Scalar, numComponents>>
     feedTangentPlane_(const FlashFluidState& fluid_state,
                       const ComponentVector& z,
-                      const EOSType& eos_type)
+                      const EOSType& eos_type,
+                      FlashShared* shared = nullptr)
     {
         using ParamCache =
             typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
@@ -1608,7 +1653,8 @@ protected:
         std::optional<PlaneVector> plane;
         Scalar plane_gibbs = 0.0;
         // One cache for both roots: temperature and pressure are fixed.
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         for (unsigned phaseIdx = 0; phaseIdx < numMisciblePhases; ++phaseIdx) {
             param_cache.updatePhase(feed_state, phaseIdx);
             updateFugacityCoefficients_(feed_state, param_cache, phaseIdx);
@@ -1680,7 +1726,8 @@ protected:
                             const PTFlashMethod twoPhaseMethod,
                             const Scalar flash_tolerance,
                             const EOSType& eos_type,
-                            const int verbosity)
+                            const int verbosity,
+                            FlashShared* shared = nullptr)
     {
         using ValueType = typename FlashFluidState::ValueType;
         using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
@@ -1699,7 +1746,8 @@ protected:
         std::optional<Dune::FieldVector<Scalar, numComponents>> feed_plane;
         bool feed_is_unstable = false;
         // One cache for all trial steps: temperature and pressure are fixed.
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         for (int iteration = 0; iteration < flashFirstMaxIterations; ++iteration) {
             try {
                 OPM_FLASH_COUNT(rachfordRiceSolves);
@@ -1727,7 +1775,7 @@ protected:
                 break;
             }
             if (!feed_plane) {
-                feed_plane = feedTangentPlane_(incoming_state, z, eos_type);
+                feed_plane = feedTangentPlane_(incoming_state, z, eos_type, shared);
                 if (!feed_plane) {
                     break;
                 }
@@ -1772,7 +1820,7 @@ protected:
             }
             try {
                 auto jacobian = flash_2ph(z, twoPhaseMethod, trial_K, trial_L, fluid_state,
-                                          flash_tolerance, eos_type, verbosity);
+                                          flash_tolerance, eos_type, verbosity, shared);
                 const Scalar liquid_fraction = Opm::getValue(trial_L);
                 if (liquid_fraction > 0. && liquid_fraction < 1.
                     && !phasesCoincide_(fluid_state)) {
@@ -1784,9 +1832,11 @@ protected:
                     // where the liquid is unstable, the split from the
                     // stability test of the feed replaces it if its Gibbs
                     // energy is lower.
-                    if (!liquidPhaseIsStable_(fluid_state, incoming_state, eos_type, verbosity)) {
+                    if (!liquidPhaseIsStable_(fluid_state, incoming_state, eos_type, verbosity,
+                                              shared)) {
                         replaceByLowerSplit_(K, L, newton_jacobian, fluid_state, incoming_state, z,
-                                             twoPhaseMethod, flash_tolerance, eos_type, verbosity);
+                                             twoPhaseMethod, flash_tolerance, eos_type, verbosity,
+                                             shared);
                     }
                     return true;
                 }
@@ -1808,10 +1858,12 @@ protected:
     template <class FlashFluidState>
     static Scalar splitGibbsEnergy_(FlashFluidState& fluid_state,
                                     const Scalar L,
-                                    const EOSType& eos_type)
+                                    const EOSType& eos_type,
+                                    FlashShared* shared = nullptr)
     {
         using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         Scalar energy = 0.0;
         for (const unsigned phaseIdx : {static_cast<unsigned>(oilPhaseIdx), static_cast<unsigned>(gasPhaseIdx)}) {
             OPM_FLASH_COUNT(eosUpdates);
@@ -1845,7 +1897,8 @@ protected:
                                      const PTFlashMethod twoPhaseMethod,
                                      const Scalar flash_tolerance,
                                      const EOSType& eos_type,
-                                     const int verbosity)
+                                     const int verbosity,
+                                     FlashShared* shared = nullptr)
     {
         FlashFluidState other_state = incoming_state;
         ComponentVector other_K;
@@ -1853,7 +1906,8 @@ protected:
             other_K[compIdx] = incoming_state.K(compIdx);
         }
         bool feed_is_stable = false;
-        phaseStabilityTest_(feed_is_stable, other_K, other_state, z, eos_type, verbosity);
+        phaseStabilityTest_(feed_is_stable, other_K, other_state, z, eos_type, verbosity, nullptr,
+                            shared);
         if (feed_is_stable) {
             return;
         }
@@ -1864,14 +1918,15 @@ protected:
                 return;
             }
             auto other_jacobian = flash_2ph(z, twoPhaseMethod, other_K, other_L, other_state,
-                                            flash_tolerance, eos_type, verbosity);
+                                            flash_tolerance, eos_type, verbosity, shared);
             const Scalar other_fraction = Opm::getValue(other_L);
             if (!(other_fraction > 0. && other_fraction < 1.) || phasesCoincide_(other_state)) {
                 return;
             }
             FlashFluidState given_state = fluid_state;
-            if (splitGibbsEnergy_(other_state, other_fraction, eos_type)
-                < splitGibbsEnergy_(given_state, Opm::getValue(L), eos_type) - stabilityTolerance) {
+            if (splitGibbsEnergy_(other_state, other_fraction, eos_type, shared)
+                < splitGibbsEnergy_(given_state, Opm::getValue(L), eos_type, shared)
+                    - stabilityTolerance) {
                 K = other_K;
                 L = other_L;
                 newton_jacobian = std::move(other_jacobian);
@@ -1905,7 +1960,8 @@ protected:
     static bool liquidPhaseIsStable_(const FlashFluidState& fluid_state,
                                      const FlashFluidState& incoming_state,
                                      const EOSType& eos_type,
-                                     const int verbosity)
+                                     const int verbosity,
+                                     FlashShared* shared = nullptr)
     {
         FlashFluidState liquid_state = fluid_state;
         Dune::FieldVector<Scalar, numComponents> liquid, trial_K;
@@ -1915,7 +1971,8 @@ protected:
         }
         using ValueType = typename FlashFluidState::ValueType;
         using ParamCache = typename FluidSystem::template ParameterCache<ValueType>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         std::array<ValueType, numComponents> reference_coefficients;
         const FeedRoot root = feedStableRoot_(liquid_state, liquid, param_cache, reference_coefficients);
         bool is_trivial = false;
@@ -1948,7 +2005,8 @@ protected:
      */
     template <class FlashFluidState, class ComponentVector>
     static FeedRoot phaseStabilityTest_(bool& isStable, ComponentVector& K, FlashFluidState& fluid_state, const ComponentVector& z, const EOSType& eos_type, int verbosity,
-                                        StabilityOutcome* outcome = nullptr)
+                                        StabilityOutcome* outcome = nullptr,
+                                        FlashShared* shared = nullptr)
     {
         OPM_FLASH_COUNT(stabilityTests);
         bool liquid_trial_is_trivial, vapour_trial_is_trivial;
@@ -1962,7 +2020,8 @@ protected:
         // trials: temperature and pressure are fixed.
         using ParamCache =
             typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         std::array<typename FlashFluidState::ValueType, numComponents> reference_coefficients;
         const FeedRoot feed_root = feedStableRoot_(fluid_state, z, param_cache, reference_coefficients);
         const int reference_phase_idx = feed_root.phase_idx;
@@ -2435,7 +2494,8 @@ protected:
                           FluidState& fluid_state_scalar,
                           const Scalar flash_tolerance,
                           const EOSType& eos_type,
-                          int verbosity = 0) -> std::optional<NewtonJacobian> {
+                          int verbosity = 0,
+                          FlashShared* shared = nullptr) -> std::optional<NewtonJacobian> {
         if (verbosity >= 1) {
             OpmLog::debug(fmt::format("Cell is two-phase! Solve Rachford-Rice with initial K = [{}]",
                                      fmt::join(K_scalar, " ")));
@@ -2450,7 +2510,7 @@ protected:
                 OpmLog::debug("Calculate composition using Newton.");
             }
             newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar,
-                                                 flash_tolerance, eos_type, verbosity);
+                                                 flash_tolerance, eos_type, verbosity, shared);
             converged = true;
             break;
 
@@ -2458,7 +2518,8 @@ protected:
             if (verbosity >= 1) {
                 OpmLog::debug("Calculate composition using Successive Substitution.");
             }
-            converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity);
+            converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity,
+                                                           /*extrapolate=*/false, shared);
             break;
 
         case PTFlashMethod::SsiAccelerated:
@@ -2466,11 +2527,12 @@ protected:
                 OpmLog::debug("Calculate composition using extrapolated Successive Substitution.");
             }
             converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity,
-                                                           /*extrapolate=*/true);
+                                                           /*extrapolate=*/true, shared);
             break;
 
         case PTFlashMethod::SsiNewton:
-            converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, true, flash_tolerance, eos_type, verbosity);
+            converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, true, flash_tolerance, eos_type, verbosity,
+                                                           /*extrapolate=*/false, shared);
             if (converged) {
                 // Substitution stops just below the tolerance, so an answer
                 // started next to the solution (a warm start) keeps an error
@@ -2490,7 +2552,7 @@ protected:
                 try {
                     newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar,
                                                          z_scalar, flash_tolerance, eos_type,
-                                                         verbosity);
+                                                         verbosity, shared);
                 }
                 catch (const NumericalProblem&) {
                     keep_substitution_answer();
@@ -2518,12 +2580,12 @@ protected:
                             "switching back to successive substitution.", error.what()));
                     }
                     converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, false, flash_tolerance, eos_type, verbosity,
-                                                                   /*extrapolate=*/true);
+                                                                   /*extrapolate=*/true, shared);
                 };
                 try {
                     newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar,
                                                          z_scalar, flash_tolerance, eos_type,
-                                                         verbosity);
+                                                         verbosity, shared);
                     converged = true;
                 }
                 catch (const NumericalProblem& error) {
@@ -2796,7 +2858,8 @@ protected:
                                                                  const ComponentVector& z,
                                                                  const Scalar tolerance,
                                                                  const EOSType& eos_type,
-                                                                 const int verbosity)
+                                                                 const int verbosity,
+                                                                 FlashShared* shared = nullptr)
     {
         using Vector = std::array<Scalar, numComponents>;
         using Matrix = std::array<Vector, numComponents>;
@@ -2860,7 +2923,8 @@ protected:
         }
 
         using ParamCache = typename FluidSystem::template ParameterCache<Scalar>;
-        ParamCache param_cache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& param_cache = stageCache_(shared, own_cache, eos_type);
         const Scalar pressure = Opm::getValue(fluid_state.pressure(oilPhaseIdx));
         Matrix liquid_derivatives{};
         Matrix vapour_derivatives{};
@@ -3054,6 +3118,7 @@ protected:
                                    const Scalar tolerance,
                                    const EOSType& eos_type,
                                    int verbosity,
+                                   FlashShared* shared = nullptr,
                                    const bool gibbs = true) -> NewtonJacobian
     {
         constexpr std::size_t num_equations = numMisciblePhases * numMiscibleComponents + 1;
@@ -3068,7 +3133,7 @@ protected:
                       && std::is_same_v<typename FlashFluidState::ValueType, Scalar>) {
             const auto start_L = L;
             auto gibbs_jacobian = gibbs ? gibbsNewtonComposition_(K, L, fluid_state, z, tolerance,
-                                                                  eos_type, verbosity)
+                                                                  eos_type, verbosity, shared)
                                         : std::optional<NewtonJacobian>{};
             if (gibbs_jacobian) {
                 const bool coincide = phasesCoincide_(fluid_state);
@@ -3090,7 +3155,7 @@ protected:
                     L = start_L;
                     try {
                         return newtonComposition_(K, L, fluid_state, z, tolerance, eos_type,
-                                                  verbosity, /*gibbs=*/false);
+                                                  verbosity, shared, /*gibbs=*/false);
                     }
                     catch (const NumericalProblem&) {
                     }
@@ -4140,7 +4205,8 @@ protected:
                                                    const Scalar flash_tolerance,
                                                    const EOSType& eos_type,
                                                    const int verbosity,
-                                                   const bool extrapolate = false)
+                                                   const bool extrapolate = false,
+                                                   FlashShared* shared = nullptr)
     {
         // Limit conditioning passes before Newton; standalone substitution runs
         // longer. With the extrapolation, the limit only stops a split that
@@ -4184,7 +4250,8 @@ protected:
         // One parameter cache for all steps: temperature and pressure are
         // fixed, so it computes the pure-component parameters once.
         using ParamCache = typename FluidSystem::template ParameterCache<typename FlashFluidState::ValueType>;
-        ParamCache paramCache(eos_type);
+        std::optional<ParamCache> own_cache;
+        ParamCache& paramCache = stageCache_(shared, own_cache, eos_type);
         Scalar previous_residual = 0.;
         for (int iteration = 0; iteration < max_iterations; ++iteration) {
             OPM_FLASH_COUNT(ssiIterations);
