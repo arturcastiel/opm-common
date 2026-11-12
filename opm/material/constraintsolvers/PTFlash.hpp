@@ -2984,11 +2984,14 @@ protected:
      * Jacobian returned belongs to the converged state.
      *
      * Newton finishes the split its start points to. A Gibbs-energy Newton
-     * that ends on coincident phases or on the mirror split, see
-     * isMirrorSplit_(), has left it and is replaced by the composition Newton
-     * from the same ratios. A composition Newton that ends on the mirror
-     * throws; coincident phases are returned to the caller, which classifies
-     * them.
+     * that ends on the mirror split, see isMirrorSplit_(), has left it and is
+     * replaced by the composition Newton from the same ratios. One that ends
+     * on coincident phases gets a second try by the composition Newton from
+     * the same ratios; where that fails, the coincident phases go to the
+     * caller, which classifies them. A composition Newton that ends on the
+     * mirror throws.
+     *
+     * \param gibbs Whether the Gibbs-energy Newton may solve the split.
      *
      * \throws NumericalProblem when Newton does not converge, or converges to
      *         the mirror split.
@@ -3000,7 +3003,8 @@ protected:
                                    const ComponentVector& z,
                                    const Scalar tolerance,
                                    const EOSType& eos_type,
-                                   int verbosity) -> NewtonJacobian
+                                   int verbosity,
+                                   const bool gibbs = true) -> NewtonJacobian
     {
         constexpr std::size_t num_equations = numMisciblePhases * numMiscibleComponents + 1;
         constexpr std::size_t num_unknowns = numMisciblePhases * numMiscibleComponents + 1;
@@ -3013,15 +3017,41 @@ protected:
         if constexpr (hasFugacityDerivatives_
                       && std::is_same_v<typename FlashFluidState::ValueType, Scalar>) {
             const auto start_L = L;
-            if (auto gibbs_jacobian = gibbsNewtonComposition_(
-                    K, L, fluid_state, z, tolerance, eos_type, verbosity)) {
-                if (!phasesCoincide_(fluid_state) && !isMirrorSplit_(fluid_state, start_K, z)) {
+            std::optional<NewtonJacobian> gibbs_jacobian;
+            if (gibbs) {
+                gibbs_jacobian = gibbsNewtonComposition_(K, L, fluid_state, z, tolerance,
+                                                         eos_type, verbosity);
+            }
+            if (gibbs_jacobian) {
+                const bool coincide = phasesCoincide_(fluid_state);
+                if (!coincide && !isMirrorSplit_(fluid_state, start_K, z)) {
                     return *std::move(gibbs_jacobian);
                 }
                 if (verbosity >= 1) {
-                    OpmLog::debug(" The Gibbs-energy Newton converged to coincident phases or "
-                                  "to the mirror split; Newton in (x, y, L) restarts from the "
-                                  "same ratios.");
+                    OpmLog::debug(fmt::format(" The Gibbs-energy Newton converged to {}; Newton "
+                                              "in (x, y, L) restarts from the same ratios.",
+                                              coincide ? "coincident phases" : "the mirror split"));
+                }
+                if (coincide) {
+                    // A second try; where it fails, the caller classifies the
+                    // coincident phases as without it.
+                    const auto gibbs_K = K;
+                    const auto gibbs_L = L;
+                    const auto gibbs_state = fluid_state;
+                    K = start_K;
+                    L = start_L;
+                    try {
+                        return newtonComposition_(K, L, fluid_state, z, tolerance, eos_type,
+                                                  verbosity, /*gibbs=*/false);
+                    }
+                    catch (const NumericalProblem&) {
+                    }
+                    catch (const Dune::FMatrixError&) {
+                    }
+                    K = gibbs_K;
+                    L = gibbs_L;
+                    fluid_state = gibbs_state;
+                    return *std::move(gibbs_jacobian);
                 }
                 K = start_K;
                 L = start_L;
