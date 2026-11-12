@@ -2414,6 +2414,34 @@ protected:
 
         case PTFlashMethod::SsiNewton:
             converged = successiveSubstitutionComposition_(K_scalar, L_scalar, fluid_state_scalar, z_scalar, true, flash_tolerance, eos_type, verbosity);
+            if (converged) {
+                // Substitution stops just below the tolerance, so an answer
+                // started next to the solution (a warm start) keeps an error
+                // of the size of the tolerance, and the simulator's Newton
+                // sees it. Newton from there takes the one step that squares
+                // that error (and gives the derivative pass its Jacobian).
+                // Newton may change K, L and the fluid state before it
+                // throws, so a failed step returns the substitution answer.
+                const auto K_substitution = K_scalar;
+                const auto L_substitution = L_scalar;
+                const auto fluid_state_substitution = fluid_state_scalar;
+                const auto keep_substitution_answer = [&]() {
+                    K_scalar = K_substitution;
+                    L_scalar = L_substitution;
+                    fluid_state_scalar = fluid_state_substitution;
+                };
+                try {
+                    newton_jacobian = newtonComposition_(K_scalar, L_scalar, fluid_state_scalar,
+                                                         z_scalar, flash_tolerance, eos_type,
+                                                         verbosity);
+                }
+                catch (const NumericalProblem&) {
+                    keep_substitution_answer();
+                }
+                catch (const Dune::FMatrixError&) {
+                    keep_substitution_answer();
+                }
+            }
             if (!converged) {
                 // In this method Newton is an accelerator, not the
                 // guarantee: when its composition update fails to converge —
