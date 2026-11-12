@@ -38,6 +38,7 @@
 
 #include <array>
 #include <cmath>
+#include <type_traits>
 
 #include <fmt/format.h>
 
@@ -120,10 +121,18 @@ public:
         // Update Aij
         updateACache_();
 
-        // The SSHIFT factor of the fugacity coefficients, exp(-s_i B_i).
+        // The SSHIFT factor of the fugacity coefficients, exp(-s_i B_i); on
+        // values, exactly one without a shift.
         if constexpr (requires { FluidSystem::volumeShift(0u); }) {
             for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
-                translation_[compIdx] = exp(-FluidSystem::volumeShift(compIdx) * Bi(compIdx));
+                const auto shift = FluidSystem::volumeShift(compIdx);
+                if constexpr (std::is_floating_point_v<Scalar>) {
+                    if (shift == 0) {
+                        translation_[compIdx] = 1.0;
+                        continue;
+                    }
+                }
+                translation_[compIdx] = exp(-shift * Bi(compIdx));
             }
         }
 
