@@ -525,6 +525,20 @@ namespace Opm {
             assert(phaseIdx < numPhases);
 
             CubicEOS::computeFugacityCoefficients(fluidState, paramCache, phaseIdx, fugCoeffs);
+            translateFugacityCoefficients<LhsEval>(paramCache, phaseIdx, fugCoeffs);
+        }
+
+        /*!
+         * \brief fugacityCoefficients() of an oil or gas phase from the
+         *        coefficients of the equation of state
+         *        (CubicEOS::computeFugacityCoefficients()), by the volume
+         *        translation factor of each component.
+         */
+        template <class LhsEval, class Coefficients, class ParamCacheEval>
+        static void translateFugacityCoefficients(const ParameterCache<ParamCacheEval>& paramCache,
+                                                  unsigned phaseIdx,
+                                                  Coefficients& fugCoeffs)
+        {
             for (unsigned compIdx = 0; compIdx < numComponents; ++compIdx) {
                 const auto translation = paramCache.volumeTranslationFactor(phaseIdx, compIdx);
                 fugCoeffs[compIdx] = decay<LhsEval>(fugCoeffs[compIdx] * translation);
