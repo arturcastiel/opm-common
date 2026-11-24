@@ -39,6 +39,7 @@
 #include <opm/input/eclipse/Schedule/Well/TrackOrderingTSP.hpp>
 #include <opm/input/eclipse/Schedule/Well/WDFAC.hpp>
 
+#include <opm/input/eclipse/Units/Dimension.hpp>
 #include <opm/input/eclipse/Units/Units.hpp>
 
 #include <opm/input/eclipse/Deck/DeckRecord.hpp>
@@ -49,18 +50,18 @@
 #include <opm/input/eclipse/Parser/ParserKeywords/C.hpp>
 #include <opm/input/eclipse/Parser/ParserKeywords/W.hpp>
 
-#include <opm/input/eclipse/Schedule/Well/GridIndependentWellKeywordHandlers.hpp>
-
 #include <external/resinsight/LibCore/cvfVector3.h>
 #include <external/resinsight/ReservoirDataModel/RigHexIntersectionTools.h>
 #include <external/resinsight/ReservoirDataModel/RigWellLogExtractionTools.h>
 #include <external/resinsight/ReservoirDataModel/RigWellLogExtractor.h>
+#include <external/resinsight/ReservoirDataModel/RigWellPath.h>
 
 #include "../WellTraj/RigEclipseWellLogExtractor.hpp"
 #include "WellTrajInfo.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <iterator>
@@ -324,6 +325,46 @@ Connection ({},{},{}) (direction '{}') for well {} ignored because
         return connection_factor;
     }
 
+    void initWellPathGeometry(external::cvf::ref<external::RigWellPath>& wellPathGeometry,
+                              const std::array<std::vector<double>, 3>&  coords,
+                              const std::vector<double>&                 mds,
+                              std::optional<double>                      top_opt = std::nullopt,
+                              std::optional<double>                      bot_opt = std::nullopt)
+    {
+        const double top = top_opt.value_or(mds.front());
+        const double bot = bot_opt.value_or(mds.back());
+
+        assert((mds.front() <= top) && (top <= bot) && (bot <= mds.back()));
+
+        std::vector<external::cvf::Vec3d> points;
+        std::vector<double> measured_depths;
+
+        points.reserve(coords[0].size());
+        measured_depths.reserve(coords[0].size());
+
+        // Calculate the x,y,z coordinates of the begin and end of the interval
+        external::cvf::Vec3d p_top, p_bot;
+        for (std::size_t i = 0; i < 3; ++i) {
+            p_top[i] = Opm::linearInterpolation(mds, coords[i], top);
+            p_bot[i] = Opm::linearInterpolation(mds, coords[i], bot);
+        }
+
+        points.push_back(p_top);
+        measured_depths.push_back(top);
+
+        for (std::size_t i = 0; i < coords[0].size(); ++i) {
+            if ((mds[i] > top) && (mds[i] < bot)) {
+                points.push_back(external::cvf::Vec3d(coords[0][i], coords[1][i], coords[2][i]));
+                measured_depths.push_back(mds[i]);
+            }
+        }
+
+        points.push_back(p_bot);
+        measured_depths.push_back(bot);
+
+        wellPathGeometry->setWellPathPoints(points, measured_depths);
+    }
+
     // The (I,J,K) location of the first active cell that a trajectory
     // enters, if it enters any.
     std::optional<std::array<int, 3>>
@@ -333,7 +374,7 @@ Connection ({},{},{}) (direction '{}') for well {} ignored because
                     external::RigEclipseGridSearchData&       gridSearchData)
     {
         external::cvf::ref<external::RigWellPath> path { new external::RigWellPath };
-        Opm::initWellPathGeometry(path, coords, mds);
+        initWellPathGeometry(path, coords, mds);
 
         const auto* ecl_grid = grid.get_grid();
 
@@ -846,6 +887,30 @@ The cell ({},{},{}) in well {} is not active and the connection will be ignored)
             };
         }
 
+        const auto& perf_top = record.getItem<Kw::PERF_TOP>();
+        const auto& perf_bot = record.getItem<Kw::PERF_BOT>();
+        const auto interval = Connection::PerforationInterval {
+            .branch = branch,
+            .top = perf_top.getSIDouble(0),
+            .bottom = perf_bot.getSIDouble(0),
+        };
+        const auto& mds = this->md.at(branch);
+
+        if (! ((mds.front() <= interval.top) && (interval.top <= interval.bottom) &&
+               (interval.bottom <= mds.back())))
+        {
+            const auto& length = perf_top.getActiveDimensions().front();
+            throw OpmInputError {
+                fmt::format("The perforation interval from {:g} to {:g} of branch {} of well {} "
+                            "is not contained in the branch's trajectory, which covers measured "
+                            "depths {:g} to {:g}.",
+                            length.convertSiToRaw(interval.top), length.convertSiToRaw(interval.bottom),
+                            branch, wname, length.convertSiToRaw(mds.front()),
+                            length.convertSiToRaw(mds.back())),
+                location
+            };
+        }
+
         // When WELSPECS defaults the well head's I/J location, it is that
         // of the first active cell entered by the main branch's trajectory,
         // irrespective of the perforation intervals and record order.
@@ -858,9 +923,6 @@ The cell ({},{},{}) in well {} is not active and the connection will be ignored)
                 if (this->headJ < 0) { this->headJ = (*head)[1]; }
             }
         }
-
-        const auto& perf_top = record.getItem<Kw::PERF_TOP>();
-        const auto& perf_bot = record.getItem<Kw::PERF_BOT>();
 
         const auto& CFItem = record.getItem<Kw::CONNECTION_TRANSMISSIBILITY_FACTOR>();
         const auto& diameterItem = record.getItem<Kw::DIAMETER>();
@@ -907,19 +969,12 @@ The cell ({},{},{}) in well {} is not active and the connection will be ignored)
         if ((ctf_kind == Connection::CTFKind::DeckValue) &&
             ! ((deck_CF > 0.0) && (deck_Kh > 0.0)))
         {
-            auto msg = fmt::format(R"(Problem with COMPTRAJ keyword
-In {} line {}
-CF and Kh items for well {} must both be specified or both defaulted/negative)",
-                                   location.filename, location.lineno, wname);
-
-            throw std::logic_error(msg);
+            throw OpmInputError {
+                fmt::format("CF and Kh items for well {} must both be specified "
+                            "or both defaulted/negative", wname),
+                location
+            };
         }
-
-        const auto interval = Connection::PerforationInterval {
-            .branch = branch,
-            .top = perf_top.getSIDouble(0),
-            .bottom = perf_bot.getSIDouble(0),
-        };
 
         // A record repeating the perforation interval of an earlier one
         // replaces all of that interval's contributions, including those to
@@ -933,7 +988,7 @@ CF and Kh items for well {} must both be specified or both defaulted/negative)",
 
         // Calulate the x,y,z coordinates of the begin and end of a perforation
         initWellPathGeometry(wellTraj.wellPathGeometry,
-                             this->coord.at(branch), this->md.at(branch),
+                             this->coord.at(branch), mds,
                              interval.top, interval.bottom);
 
         external::cvf::ref<external::RigEclipseWellLogExtractor> e {
